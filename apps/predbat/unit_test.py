@@ -14,6 +14,7 @@ import sys
 import glob
 import argparse
 import random
+import unittest
 from datetime import timedelta
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -75,6 +76,8 @@ from tests.test_plan_tiebreak import run_plan_tiebreak_tests
 from tests.test_plan_preclip import run_plan_preclip_tests
 from tests.test_export_commitment import run_export_commitment_tests
 from tests.test_import_limit import run_import_limit_tests
+from tests.test_joint_site_native import run_joint_site_native_tests
+from tests import test_joint_site_core
 from tests.test_optimise_export_copy import run_optimise_export_copy_tests
 from tests.test_energydataservice import run_energydataservice_tests
 from tests.test_iboost import run_iboost_smart_tests
@@ -412,6 +415,17 @@ def run_window_cache_tests_isolated(my_predbat):
 def run_import_limit_tests_isolated(my_predbat):
     """Keep diagnostic fixtures independent of the shared suite's configuration and clock."""
     return run_import_limit_tests(create_predbat())
+
+
+def run_joint_site_native_tests_isolated(my_predbat):
+    """Keep the shadow planner's synthetic forecasts out of the shared suite state."""
+    return run_joint_site_native_tests(create_predbat())
+
+
+def run_joint_site_core_tests(my_predbat):
+    """Include the pure scheduler's independent unittest suite in the standard test command."""
+    suite = unittest.defaultTestLoader.loadTestsFromModule(test_joint_site_core)
+    return not unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful()
 
 
 def create_predbat():
@@ -765,6 +779,8 @@ def main():
         ("plan_preclip", run_plan_preclip_tests, "Plan selection scores the pre-clip plan", True),
         ("export_commitment", run_export_commitment_tests, "Forced-export commitment / anti-flapping tests", False),
         ("import_limit", run_import_limit_tests_isolated, "Whole-site grid import diagnostics (no enforcement)", False),
+        ("joint_site_native", run_joint_site_native_tests_isolated, "Isolated joint planning and native replay (no execution)", False),
+        ("joint_site_core", run_joint_site_core_tests, "Fixed-rate joint EV/battery search and energy balance", False),
         ("optimise_solar", run_optimise_solar_tests, "Optimise export more solar tests", False),
         ("optimise_windows_kernel", run_optimise_all_windows_kernel_tests, "Optimise all windows tests with the C++ kernel", False),
         ("optimise_swap_charge", run_optimise_swap_charge_tests, "Optimise pairwise charge-window swap tests", False),

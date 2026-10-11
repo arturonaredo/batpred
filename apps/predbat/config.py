@@ -2707,6 +2707,8 @@ APPS_SCHEMA = {
     "export_limit": {"type": "sensor_list", "sensor_type": "float", "entries": "num_inverters"},
     # Whole-site diagnostic threshold in W, not a per-inverter limit or a control setting.
     "import_limit": {"type": "float", "zero": True},
+    # Personal fork: isolated joint optimisation and native replay, never execution.
+    "joint_site": {"type": "dict"},
     "inverter_battery_rate_min": {"type": "integer", "zero": False, "entries": "num_inverters"},
     "inverter_reserve_max": {"type": "integer", "zero": False, "entries": "num_inverters"},
     "battery_charge_power_curve": {"type": "int_float_dict", "or_auto": True},

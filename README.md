@@ -1,5 +1,11 @@
 # Predbat
 
+> **Personal development fork:** this branch develops
+> [joint EV/home-battery site planning](docs/joint-site-planning.md), tracked in
+> [upstream issue #5490](https://github.com/springfall2008/batpred/issues/5490).
+> It is experimental, not an upstream release or a live deployment. The separate
+> diagnostic [PR #5486](https://github.com/springfall2008/batpred/pull/5486) remains unchanged.
+
 ![image](https://github.com/springfall2008/batpred/actions/workflows/code-quality.yml/badge.svg)
 ![image](https://github.com/springfall2008/batpred/actions/workflows/publish-docs.yml/badge.svg)
 ![image](https://github.com/springfall2008/batpred/actions/workflows/pages/pages-build-deployment/badge.svg)
