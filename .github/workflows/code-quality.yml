@@ -1,58 +1,65 @@
-name: code-quality
+name: three-pr-head-validation
 on:
-  pull_request:
+  push:
+    branches: [ci/three-pr-validation-20261012]
+permissions:
+  contents: read
 jobs:
-  pre-commit:
+  validate:
+    name: PR ${{ matrix.pr }} head
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - pr: 5486
+            sha: 1a4368f2acf362f076fd2282f968bc6f0c910a81
+          - pr: 5497
+            sha: 68682c7a793d46902b90bef981ff3d5feb6f41db
+          - pr: 5498
+            sha: 091716c82864650cf05d356614dfadc53e0c4653
     steps:
-    - uses: actions/checkout@v4
-    - uses: actions/setup-python@v4
-      with:
-        python-version: 3.x
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
-    - uses: pre-commit/action@v3.0.0
-    - uses: pre-commit-ci/lite-action@v1.1.0
-      if: always()
-    - name: Build prediction kernel
-      run: bash apps/predbat/build_kernel.sh
-    - name: Run unit tests (quick mode)
-      env:
-        PREDBAT_KERNEL_REQUIRED: "1"
-      run: |
-        cd coverage
-        python3 ../apps/predbat/unit_test.py --quick
-    - name: Verify checked-in x86_64 kernel binary
-      run: |
-        cd coverage
-        python3 ../apps/predbat/verify_kernel_binary.py ../apps/predbat/prediction_kernel_lib_x86_64.so
-
-  # Cross-build the prediction kernel binaries for every platform and commit them
-  # back to the PR branch when they change (same auto-fix pattern as pre-commit)
-  kernel-binaries:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    if: github.event.pull_request.head.repo.full_name == github.repository
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        ref: ${{ github.head_ref }}
-    - uses: mlugg/setup-zig@v2
-      with:
-        version: 0.16.0
-    - name: Cross-build prediction kernel binaries
-      run: bash apps/predbat/build_kernel_cross.sh
-    - name: Commit updated kernel binaries
-      run: |
-        git add apps/predbat/prediction_kernel_lib_*.so
-        if git diff --cached --quiet; then
-          echo "Kernel binaries unchanged"
-        else
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git commit -m "chore: update prediction kernel binaries for all platforms"
-          git push
-        fi
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v4
+        with:
+          python-version: 3.x
+      - name: Record exact tested head and preserve checked-in binary
+        env:
+          EXPECTED_SHA: ${{ matrix.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          mkdir -p "$RUNNER_TEMP/evidence"
+          git rev-parse HEAD > "$RUNNER_TEMP/evidence/tested-sha.txt"
+          cp apps/predbat/prediction_kernel_lib_x86_64.so "$RUNNER_TEMP/checked-in-kernel.so"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run all pre-commit checks without auto-commit
+        run: |
+          pre-commit run --all-files > "$RUNNER_TEMP/evidence/pre-commit.log" 2>&1 || { cat "$RUNNER_TEMP/evidence/pre-commit.log"; exit 1; }
+      - name: Build prediction kernel
+        if: ${{ !cancelled() }}
+        run: bash apps/predbat/build_kernel.sh
+      - name: Run unit tests with required native kernel
+        if: ${{ !cancelled() }}
+        env:
+          PREDBAT_KERNEL_REQUIRED: "1"
+        working-directory: coverage
+        run: |
+          python3 ../apps/predbat/unit_test.py --quick > "$RUNNER_TEMP/evidence/unit-tests.log" 2>&1 || { tail -n 160 "$RUNNER_TEMP/evidence/unit-tests.log"; exit 1; }
+      - name: Verify original checked-in x86_64 kernel binary
+        if: ${{ !cancelled() }}
+        working-directory: coverage
+        run: |
+          python3 ../apps/predbat/verify_kernel_binary.py "$RUNNER_TEMP/checked-in-kernel.so" > "$RUNNER_TEMP/evidence/kernel-parity.log" 2>&1 || { cat "$RUNNER_TEMP/evidence/kernel-parity.log"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: pr-${{ matrix.pr }}-${{ matrix.sha }}
+          path: ${{ runner.temp }}/evidence/
+          retention-days: 7
