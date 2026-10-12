@@ -1,0 +1,20 @@
+apps/predbat/joint_site_apply.py
+  h_68913986b13417 179,212-213,220,321,324-326
+apps/predbat/joint_site_native.py
+  h_68913986b13417 321,450,554-555,654-655,657-661,676
+apps/predbat/tests/test_joint_site_entrypoints.py
+  h_68913986b13417 4,198-348,362-368
+docs/joint-site-planning.md
+  h_68913986b13417 269-284
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "affe7766d707d2d6701ef017f94ddcaf1914a412",
+  "prompts": {},
+  "humans": {
+    "h_68913986b13417": {
+      "author": "Arturo Naredo <arturonaredo@gmail.com>"
+    }
+  }
+}
