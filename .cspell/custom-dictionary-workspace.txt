@@ -440,6 +440,8 @@ nocharge
 NODETAIL
 nodischarge
 nohup
+nonboolean
+nonfinite
 noopener
 nord
 nordpool
@@ -732,6 +734,7 @@ vvwwxxabcdefyyzzuu
 waf
 waitpid
 Wallbox
+wallclock
 weakref
 weblink
 welink
