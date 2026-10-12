@@ -18,7 +18,9 @@ jobs:
           - pr: 5497
             sha: 68682c7a793d46902b90bef981ff3d5feb6f41db
           - pr: 5498
-            sha: 091716c82864650cf05d356614dfadc53e0c4653
+            sha: 6c6dcf8705d04d9287e898d9e32387bf37d3da80
+          - pr: combined
+            sha: 84bc4a9c9e3858cfb4f041bbdea09815c03108ad
     steps:
       - uses: actions/checkout@v4
         with:
