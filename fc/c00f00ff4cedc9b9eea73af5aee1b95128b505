@@ -1,0 +1,47 @@
+apps/predbat/joint_site_apply.py
+  s_836485183c0d37::t_9d1559627e772b 105-106,123-128,147,155-169,188,212-214,336-341
+docs/joint-site-planning.md
+  s_836485183c0d37::t_9d1559627e772b 48,201-204,266-326
+  s_836485183c0d37::t_12be0dad9c06f3 327
+templates/deye_solarman.yaml
+  s_836485183c0d37::t_9d1559627e772b 1-118
+apps/predbat/unit_test.py
+  s_836485183c0d37::t_ab813c14164c91 55-56,64-66,496-497
+apps/predbat/joint_site_template.py
+  s_836485183c0d37::t_9d1559627e772b 1-297
+apps/predbat/joint_site_native.py
+  s_836485183c0d37::t_9d1559627e772b 148,156-157,369-370,372-388,480-481,485-491,670,723-732,743,749
+apps/predbat/joint_site.py
+  s_836485183c0d37::t_9d1559627e772b 100-107,114,218-231,408-409,415-422,474-475,519
+apps/predbat/tests/test_joint_site_template.py
+  s_836485183c0d37::t_9d1559627e772b 1-505
+apps/predbat/tests/test_joint_site_combined.py
+  s_836485183c0d37::t_9d1559627e772b 1-404
+apps/predbat/tests/test_joint_site_capabilities.py
+  s_836485183c0d37::t_9d1559627e772b 1-397
+apps/predbat/tests/test_service_sequences.py
+  s_836485183c0d37::t_9d1559627e772b 1-266
+apps/predbat/inverter.py
+  s_836485183c0d37::t_15ba76ae95ce5f 515-518
+  s_836485183c0d37::t_9d1559627e772b 59-62,3330-3454,3462-3464,3471-3475
+  s_836485183c0d37::t_a274386b6fd528 572,848
+  s_836485183c0d37::t_20d120585b3344 3476
+apps/predbat/tests/test_deye_solarman_template.py
+  s_836485183c0d37::t_9d1559627e772b 1-178
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "fcc00f00ff4cedc9b9eea73af5aee1b95128b505",
+  "prompts": {},
+  "sessions": {
+    "s_836485183c0d37": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_ee4ab09a4ffek4rvQDMjglNH1W",
+        "model": "unknown"
+      },
+      "human_author": "Arturo Naredo <arturonaredo@gmail.com>"
+    }
+  }
+}
