@@ -1,0 +1,14 @@
+.github/workflows/code-quality.yml
+  h_68913986b13417 21-23
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "bf12534e54067c95bee0af0842344cb48e18fc1f",
+  "prompts": {},
+  "humans": {
+    "h_68913986b13417": {
+      "author": "Arturo Naredo <arturonaredo@gmail.com>"
+    }
+  }
+}
