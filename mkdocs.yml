@@ -9,6 +9,7 @@ nav:
     - 'Install summary': installation-summary.md
     - 'Install details': install.md
     - inverter-setup.md
+    - deye-local.md
     - apps-yaml.md
     - energy-rates.md
     - components.md
@@ -30,6 +31,7 @@ nav:
     - compare.md
   - 'What If Annual Prediction': annual-prediction.md
   - 'Predbat development':
+    - 'Personal fork: joint site planning': joint-site-planning.md
     - todo-list.md
     - developing.md
     - random-scenarios.md
