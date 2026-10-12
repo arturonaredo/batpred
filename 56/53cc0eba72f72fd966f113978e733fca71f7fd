@@ -1,0 +1,18 @@
+apps/predbat/joint_site_native.py
+  h_68913986b13417 106-110,183-186,204,223,251,283-286,585-587
+apps/predbat/tests/test_joint_site_native.py
+  h_68913986b13417 690-705,743,745-746
+docs/joint-site-planning.md
+  h_68913986b13417 94-99
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "5653cc0eba72f72fd966f113978e733fca71f7fd",
+  "prompts": {},
+  "humans": {
+    "h_68913986b13417": {
+      "author": "Arturo Naredo <arturonaredo@gmail.com>"
+    }
+  }
+}
