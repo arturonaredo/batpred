@@ -1,0 +1,50 @@
+README.md
+  h_68913986b13417 3-5
+apps/predbat/config.py
+  h_68913986b13417 2116-2145,2630-2632
+apps/predbat/deye_local.py
+  h_68913986b13417 1-291
+apps/predbat/deye_local_shadow.py
+  h_68913986b13417 1-125
+apps/predbat/ha.py
+  h_68913986b13417 856-858
+apps/predbat/inverter.py
+  h_68913986b13417 505-512,564-565,840-842,3403-3411,3461-3465
+apps/predbat/joint_site.py
+  h_68913986b13417 1-483
+apps/predbat/joint_site_native.py
+  h_68913986b13417 1-651
+apps/predbat/plan.py
+  h_68913986b13417 2403-2408
+apps/predbat/tests/test_deye_local.py
+  h_68913986b13417 1-2871
+apps/predbat/tests/test_deye_shadow.py
+  h_68913986b13417 1-143
+apps/predbat/tests/test_joint_site_core.py
+  h_68913986b13417 1-256
+apps/predbat/tests/test_joint_site_native.py
+  h_68913986b13417 1-730
+apps/predbat/unit_test.py
+  h_68913986b13417 17,55-58,422-432,478-481
+docs/deye-local.md
+  h_68913986b13417 1-159
+docs/inverter-setup.md
+  h_68913986b13417 51
+docs/joint-site-planning.md
+  h_68913986b13417 1-251
+mkdocs.yml
+  h_68913986b13417 12,34
+templates/deye.yaml
+  h_68913986b13417 1-51
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7a800b7e67bcb60781740c16fe0efd89f20d1d82",
+  "prompts": {},
+  "humans": {
+    "h_68913986b13417": {
+      "author": "Arturo Naredo <arturonaredo@gmail.com>"
+    }
+  }
+}
