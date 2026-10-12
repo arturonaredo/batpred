@@ -1,0 +1,22 @@
+apps/predbat/deye_local.py
+  h_68913986b13417 249,256-257,268-274,277-278
+apps/predbat/deye_local_shadow.py
+  h_68913986b13417 16,20-21,60,79,99,117,130-184
+apps/predbat/inverter.py
+  h_68913986b13417 3399,3407,3411-3413
+apps/predbat/tests/test_deye_shadow.py
+  h_68913986b13417 8,139-177
+docs/deye-local.md
+  h_68913986b13417 37-44,96-102
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "68682c7a793d46902b90bef981ff3d5feb6f41db",
+  "prompts": {},
+  "humans": {
+    "h_68913986b13417": {
+      "author": "Arturo Naredo <arturonaredo@gmail.com>"
+    }
+  }
+}
