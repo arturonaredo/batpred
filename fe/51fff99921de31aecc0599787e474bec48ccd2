@@ -1,5 +1,6 @@
 .cspell/custom-dictionary-workspace.txt
   s_836485183c0d37::t_beb25fb89d8af2 285
+  s_836485183c0d37::t_5de3d556d1a00a 143,446-447,569,719
 apps/predbat/tests/test_joint_site_actual.py
   s_836485183c0d37::t_c54edd170167f2 408-413
   s_9a2f5989953825::t_6bc2bf05b3c38a 1-407,414-432
@@ -18,6 +19,7 @@ apps/predbat/joint_site_preview.py
 docs/joint-site-planning.md
   s_836485183c0d37::t_beb25fb89d8af2 63-89,101-156,185,197-202,291-301,327-339,342-352,418-459,534-535
   s_836485183c0d37::t_6e5e0a1b897ac7 60-62
+  s_836485183c0d37::t_5de3d556d1a00a 18-59
 apps/predbat/joint_site.py
   s_836485183c0d37::t_043f36a4f48c67 92,116,274-275,321-328,420-439,445-451,453,456-461,558
 apps/predbat/joint_site_apply.py
@@ -46,6 +48,7 @@ apps/predbat/tests/test_joint_site_preview_integration.py
   s_836485183c0d37::t_360e40e849c94b 1-125
 apps/predbat/tests/test_joint_site_single_table.py
   s_836485183c0d37::t_0eb9e79f151a7e 1-916,932-1027,1029-1040
+  s_836485183c0d37::t_dcd70ca1f692ae 917-931,1028
 apps/predbat/tests/test_joint_site_targets.py
   s_836485183c0d37::t_b16f01e4b2f6f0 1-146
 apps/predbat/tests/test_prediction_grid_support.py
@@ -56,6 +59,7 @@ apps/predbat/web.py
   s_836485183c0d37::t_8fe508b3b44d5b 2566,2575-2578,2645,2650,2666-2671,2690
 apps/predbat/web_helper.py
   s_836485183c0d37::t_acff32600cff78 7043-7049,7144,7176,7251,7266-7270,7283,7345-7351,7868,7894,7896-7897,7900,7946,7948-7951,7961,7964,7991-7992,8016-8021,8027-8029
+  s_836485183c0d37::t_0ef57a4ff9410e 7870,7895
 tools/debug-journal.md
   s_836485183c0d37::t_cdead1f02f96aa 9-12
 ---
