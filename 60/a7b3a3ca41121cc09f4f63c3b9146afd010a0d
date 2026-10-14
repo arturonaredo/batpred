@@ -1,0 +1,65 @@
+apps/predbat/components.py
+  s_b48c7b9ff3b4ea::t_9eaaf6090d7cd9 730,1043,1047,1080-1081
+apps/predbat/const.py
+  s_b48c7b9ff3b4ea::t_7b74d78dce3f00 42-44
+apps/predbat/execute.py
+  s_b48c7b9ff3b4ea::t_f4a764fa4e3f1e 612-616,1258-1265
+apps/predbat/fetch.py
+  s_b48c7b9ff3b4ea::t_9464db1c1a54d8 1481-1483,1826-1827,1879,1883-1888,3627
+apps/predbat/gateway.py
+  s_b48c7b9ff3b4ea::t_6fd70c7510c868 106-107,236,250-263,268-269,291-298,444-445,662-667,688-696,905-913,1372-1376,1867-1868,2531-2532,2620-2622,2635-2648,2656-2658,2662-2663,2730-2767,2778-2839
+apps/predbat/gecloud.py
+  s_b48c7b9ff3b4ea::t_3566447a63574d 260-284,1463,1517-1519,1699-1709,1806-1809,2057-2058,2095-2098,2106
+apps/predbat/inverter.py
+  s_b48c7b9ff3b4ea::t_67bcd391e4e236 584-593,2123-2140,2146,2163,2226-2227,2236,2276-2277,2286,2960-3040,3138-3162,3164,3186,3624-3691,3763-3768,3770,3784,3802
+apps/predbat/octopus.py
+  s_b48c7b9ff3b4ea::t_a049f7adfdca85 22,3261-3263,3265,4062-4146
+apps/predbat/predbat.py
+  s_b48c7b9ff3b4ea::t_31f149a990950c 37,576-577
+apps/predbat/tests/test_execute.py
+  s_b48c7b9ff3b4ea::t_2dc6f9d9aeb2ff 2397-2400,2406-2419,2427-2442
+apps/predbat/tests/test_export_more_solar_warning.py
+  s_b48c7b9ff3b4ea::t_b671b702b708eb 62,69-70,146-148
+apps/predbat/tests/test_gateway.py
+  s_b48c7b9ff3b4ea::t_1b8dfa2809419f 698-737,7447-7449,7452-7454
+apps/predbat/tests/test_gateway_charge_window.py
+  s_b48c7b9ff3b4ea::t_d2068487a9fee7 1-224
+apps/predbat/tests/test_gateway_discharge_window.py
+  s_b48c7b9ff3b4ea::t_19d13907b86d50 1-297
+apps/predbat/tests/test_gateway_display.py
+  s_b48c7b9ff3b4ea::t_4e9aebfad15011 1-221
+apps/predbat/tests/test_ge_cloud.py
+  s_b48c7b9ff3b4ea::t_8b2eaf57b3e86d 326,328,5547-5633,6098-6100,6119,6121-6123
+apps/predbat/tests/test_inverter.py
+  s_b48c7b9ff3b4ea::t_99865c92dd111d 1112-1221,5605-5606
+apps/predbat/tests/test_inverter_config_sensor.py
+  s_b48c7b9ff3b4ea::t_cf9d9ad962a88e 15,23,200-214
+apps/predbat/tests/test_octopus_dispatch_hold.py
+  s_b48c7b9ff3b4ea::t_ffa0f159166441 1-285
+apps/predbat/unit_test.py
+  s_b48c7b9ff3b4ea::t_0233df4455e01e 210,542
+docs/apps-yaml.md
+  s_b48c7b9ff3b4ea::t_a25f620fafba68 618-623
+docs/car-charging.md
+  s_b48c7b9ff3b4ea::t_7df8d1bce8b1d9 665-668
+docs/inverter-setup.md
+  s_b48c7b9ff3b4ea::t_70e6ce1f8e5ca7 176-180
+tools/debug-journal.md
+  s_b48c7b9ff3b4ea::t_f677a0ec88c10a 114,122-123,162,164,170,179,186,193,203,268
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "60a7b3a3ca41121cc09f4f63c3b9146afd010a0d",
+  "prompts": {},
+  "sessions": {
+    "s_b48c7b9ff3b4ea": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_eca54f2efffeHFI3ebH8xqSKHp",
+        "model": "unknown"
+      },
+      "human_author": "Arturo Naredo <arturonaredo@gmail.com>"
+    }
+  }
+}
