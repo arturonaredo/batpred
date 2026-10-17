@@ -1,0 +1,22 @@
+apps/predbat/tests/test_deye_solarman_template.py
+  s_b48c7b9ff3b4ea::t_b19f8f358ceee1 90-93
+templates/deye_solarman.yaml
+  s_b48c7b9ff3b4ea::t_d842b0d47d2dd3 148
+  s_b48c7b9ff3b4ea::t_b19f8f358ceee1 120-147,149-238
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3edb4acff14e88ecfd6d7f66e842f06cf967fd56",
+  "prompts": {},
+  "sessions": {
+    "s_b48c7b9ff3b4ea": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_eca54f2efffeHFI3ebH8xqSKHp",
+        "model": "unknown"
+      },
+      "human_author": "Arturo Naredo <arturonaredo@gmail.com>"
+    }
+  }
+}

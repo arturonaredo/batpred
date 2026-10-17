@@ -1,0 +1,24 @@
+apps/predbat/inverter.py
+  h_68913986b13417 59-62,3378-3502,3510-3512,3519-3524
+apps/predbat/tests/test_deye_solarman_template.py
+  h_68913986b13417 1-178
+apps/predbat/tests/test_service_sequences.py
+  h_68913986b13417 1-266
+apps/predbat/unit_test.py
+  h_68913986b13417 55-56,468-469
+docs/inverter-setup.md
+  h_68913986b13417 65,2800-2830,3940,4084-4121,4136,4158,4258,4305
+templates/deye_solarman.yaml
+  h_68913986b13417 1-118
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "aa9e6294b7059167d9aa067048cb9e7b906e2d54",
+  "prompts": {},
+  "humans": {
+    "h_68913986b13417": {
+      "author": "Arturo Naredo <arturonaredo@gmail.com>"
+    }
+  }
+}

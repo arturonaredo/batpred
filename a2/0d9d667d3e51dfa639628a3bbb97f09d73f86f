@@ -1,0 +1,19 @@
+docs/inverter-setup.md
+  s_b48c7b9ff3b4ea::t_126b3bb02ef53f 2825-2831
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a20d9d667d3e51dfa639628a3bbb97f09d73f86f",
+  "prompts": {},
+  "sessions": {
+    "s_b48c7b9ff3b4ea": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_eca54f2efffeHFI3ebH8xqSKHp",
+        "model": "unknown"
+      },
+      "human_author": "Arturo Naredo <arturonaredo@gmail.com>"
+    }
+  }
+}

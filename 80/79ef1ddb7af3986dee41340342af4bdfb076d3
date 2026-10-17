@@ -1,0 +1,21 @@
+docs/inverter-setup.md
+  s_b48c7b9ff3b4ea::t_4ae875ffe305b0 4129-4152
+templates/deye_solarman.yaml
+  s_b48c7b9ff3b4ea::t_4ae875ffe305b0 101
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "8079ef1ddb7af3986dee41340342af4bdfb076d3",
+  "prompts": {},
+  "sessions": {
+    "s_b48c7b9ff3b4ea": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_eca54f2efffeHFI3ebH8xqSKHp",
+        "model": "unknown"
+      },
+      "human_author": "Arturo Naredo <arturonaredo@gmail.com>"
+    }
+  }
+}
