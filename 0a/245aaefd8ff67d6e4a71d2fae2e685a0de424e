@@ -1,0 +1,55 @@
+apps/predbat/tests/test_joint_site_recurring.py
+  s_b48c7b9ff3b4ea::t_264ef93c2aecaf 827-831
+  s_b48c7b9ff3b4ea::t_6d420ff45a1e7d 1-826,832-871
+apps/predbat/tests/test_joint_site_arrival.py
+  s_b48c7b9ff3b4ea::t_264ef93c2aecaf 242-248
+  s_b48c7b9ff3b4ea::t_5978fb9f5b746f 1-241,249-345
+apps/predbat/fetch.py
+  s_b48c7b9ff3b4ea::t_4945bb6e379029 1863-1866,1890-1894,1906,2009,2115-2116
+apps/predbat/ha.py
+  s_b48c7b9ff3b4ea::t_5c38a056d1dcbe 615,847,856-861,879-894,923,928
+apps/predbat/joint_site.py
+  s_b48c7b9ff3b4ea::t_d8520f86d9762d 117,235-236,534
+apps/predbat/joint_site_apply.py
+  s_b48c7b9ff3b4ea::t_317857a270a10d 18,105-112,114-123,184,189-190,197,237-241,290-291,308-309,440-467,521-523,531,572-573,582,607-609
+apps/predbat/joint_site_arrival.py
+  s_b48c7b9ff3b4ea::t_5dcd10f4e39b58 1-222
+apps/predbat/joint_site_native.py
+  s_b48c7b9ff3b4ea::t_7000a88ef2c999 73-87,123-132,168,172,184,189-193,214-223,293,412,426,597,837-849,919-926,960,963,1152,1205
+apps/predbat/joint_site_preview.py
+  s_b48c7b9ff3b4ea::t_e4f2aef3c1cc3b 697-770,796
+apps/predbat/joint_site_recurring.py
+  s_b48c7b9ff3b4ea::t_b7297c1b371fbf 1-385
+apps/predbat/joint_site_session.py
+  s_b48c7b9ff3b4ea::t_537b21c34e4eb7 13-16,65,68
+apps/predbat/plan.py
+  s_b48c7b9ff3b4ea::t_abe5d9f2fb90c4 361-366
+apps/predbat/storage.py
+  s_b48c7b9ff3b4ea::t_075b00a1d8f089 369-379,560-563
+apps/predbat/tests/test_joint_site_grid_support.py
+  s_b48c7b9ff3b4ea::t_b9561faa0f9786 186-248,257-258
+apps/predbat/tests/test_joint_site_priority.py
+  s_b48c7b9ff3b4ea::t_fbec20e620d391 1-143
+apps/predbat/unit_test.py
+  s_b48c7b9ff3b4ea::t_1970dbea3f7778 74-76,546-548
+docs/joint-site-planning.md
+  s_b48c7b9ff3b4ea::t_9b3a6f0e4012aa 55-66,79,97-165,266-267
+tools/debug-journal.md
+  s_b48c7b9ff3b4ea::t_2dc211f59203cd 9-16
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "0a245aaefd8ff67d6e4a71d2fae2e685a0de424e",
+  "prompts": {},
+  "sessions": {
+    "s_b48c7b9ff3b4ea": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_eca54f2efffeHFI3ebH8xqSKHp",
+        "model": "unknown"
+      },
+      "human_author": "Arturo Naredo <arturonaredo@gmail.com>"
+    }
+  }
+}

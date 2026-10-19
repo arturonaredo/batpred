@@ -1,0 +1,26 @@
+apps/predbat/joint_site.py
+  h_68913986b13417 13,21,105,152,207-208,320,327-335,341,381,415-433,443-444,460,466-467,506
+apps/predbat/joint_site_native.py
+  h_68913986b13417 136,148-149,199-201,230,233-234,298-301,394,399-401,405,410,433,450,472-480,495,499-500,505,507-508,535-536,552,598-599,613,616-617,621-629,642,656-657,664-694,696,701-704,720,722
+apps/predbat/joint_site_replay.py
+  h_68913986b13417 1-95
+apps/predbat/tests/test_joint_site_limited.py
+  h_68913986b13417 1-95
+apps/predbat/tests/test_joint_site_native.py
+  h_68913986b13417 706-731,770
+apps/predbat/unit_test.py
+  h_68913986b13417 58,485
+docs/joint-site-planning.md
+  h_68913986b13417 61,101-108,128-163
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "fafb8f18d3447e267f539baa77993fb9e3f2dae8",
+  "prompts": {},
+  "humans": {
+    "h_68913986b13417": {
+      "author": "Arturo Naredo <arturonaredo@gmail.com>"
+    }
+  }
+}

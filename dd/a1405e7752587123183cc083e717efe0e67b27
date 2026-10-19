@@ -1,0 +1,33 @@
+apps/predbat/joint_site.py
+  s_b48c7b9ff3b4ea::t_ab0bb615b135ec 118-119,223-226,541-543
+apps/predbat/joint_site_apply.py
+  s_b48c7b9ff3b4ea::t_75a3f0c44276fc 19-20,119-121,261-300,313-314,373-376,562,577-578,591,628-630,641-642,644-645
+apps/predbat/joint_site_native.py
+  s_b48c7b9ff3b4ea::t_80f52af0a1ff80 185-188,568-572,602-603,713-720,826-872,878-884,896-897,899-900,911-912,915,917-930,1103-1110,1267,1275-1276,1345-1363
+apps/predbat/tests/test_joint_site_actual.py
+  s_b48c7b9ff3b4ea::t_96c7427cdc62b1 355,362,370-372,376,378
+apps/predbat/tests/test_joint_site_now.py
+  s_b48c7b9ff3b4ea::t_05c029839874c4 1-203
+apps/predbat/tests/test_joint_site_preferences.py
+  s_b48c7b9ff3b4ea::t_a43eca158dcfce 1-277
+apps/predbat/tests/test_joint_site_priority.py
+  s_b48c7b9ff3b4ea::t_c9fa33a7b400fd 32,36,43,96,130-131,133-134
+docs/joint-site-planning.md
+  s_b48c7b9ff3b4ea::t_71a18f2e268a74 37-104,107,116,317
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "dda1405e7752587123183cc083e717efe0e67b27",
+  "prompts": {},
+  "sessions": {
+    "s_b48c7b9ff3b4ea": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_eca54f2efffeHFI3ebH8xqSKHp",
+        "model": "unknown"
+      },
+      "human_author": "Arturo Naredo <arturonaredo@gmail.com>"
+    }
+  }
+}
