@@ -1,0 +1,21 @@
+docs/inverter-setup.md
+  s_f23ed2617d9336::t_e60546c7a9e1f0 2808-2810,2815,2820,2833,2839,2841,2847,2851,3972,4137,4182,4208,4210
+docs/apps-yaml.md
+  s_f23ed2617d9336::t_e60546c7a9e1f0 1743-1772
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e8ca5b616372d1256eed7a7461961dab2ce4fdd9",
+  "prompts": {},
+  "sessions": {
+    "s_f23ed2617d9336": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_ebeb0c01effeC4l4FKDZhQZGes",
+        "model": "unknown"
+      },
+      "human_author": "Arturo Naredo <arturonaredo@gmail.com>"
+    }
+  }
+}
