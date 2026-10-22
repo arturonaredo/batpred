@@ -1,0 +1,23 @@
+apps/predbat/output.py
+  s_b48c7b9ff3b4ea::t_183946dd8c5a7d 1762,1764,1768,2015
+apps/predbat/tests/test_plan_json_rate_adjust.py
+  s_b48c7b9ff3b4ea::t_84036f1640260e 216-217,236-237
+apps/predbat/web_helper.py
+  s_b48c7b9ff3b4ea::t_183946dd8c5a7d 7250-7251,7336
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "30599c515210f03a848dd313c7f9776305d2868b",
+  "prompts": {},
+  "sessions": {
+    "s_b48c7b9ff3b4ea": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_eca54f2efffeHFI3ebH8xqSKHp",
+        "model": "unknown"
+      },
+      "human_author": "Arturo Naredo <arturonaredo@gmail.com>"
+    }
+  }
+}

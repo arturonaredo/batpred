@@ -1,0 +1,89 @@
+.cspell/custom-dictionary-workspace.txt
+  s_836485183c0d37::t_beb25fb89d8af2 290
+  s_836485183c0d37::t_5de3d556d1a00a 144,453-454,580,734
+apps/predbat/tests/test_joint_site_actual.py
+  s_836485183c0d37::t_c54edd170167f2 408-413
+  s_9a2f5989953825::t_6bc2bf05b3c38a 1-407,414-432
+apps/predbat/tests/test_joint_site_session.py
+  s_836485183c0d37::t_da8d1ed0bfea2a 82
+  s_836485183c0d37::t_c54edd170167f2 186-190
+  s_836485183c0d37::t_dab247c0804cd6 1-81,83-185,191-203
+apps/predbat/prediction.py
+  s_836485183c0d37::t_338203d00a2aaf 21-22,73-131,162-163,283,645,799,1224-1240,1454-1460
+  s_9a2f5989953825::t_2b5a2a49671506 1461
+apps/predbat/tests/test_joint_site_partial_apply.py
+  s_836485183c0d37::t_c54edd170167f2 89-93
+  s_9a2f5989953825::t_7a339e4b574fb2 1-88,94-99
+apps/predbat/joint_site_preview.py
+  s_836485183c0d37::t_da8d1ed0bfea2a 1-877
+docs/joint-site-planning.md
+  s_836485183c0d37::t_beb25fb89d8af2 63-89,101-156,185,197-202,291-301,327-339,342-352,418-459,534-535
+  s_836485183c0d37::t_6e5e0a1b897ac7 60-62
+  s_836485183c0d37::t_5de3d556d1a00a 18-59
+apps/predbat/joint_site.py
+  s_836485183c0d37::t_043f36a4f48c67 92,116,274-275,321-328,420-439,445-451,453,456-461,558
+apps/predbat/joint_site_apply.py
+  s_836485183c0d37::t_76c90c313158e2 7,16,122-126,138-159,164-170,176-179,184-186,209,213-214,216-218,222,245,248-250,267-275,284-286,288-289,292,298-317,367,390-411,413,418-424,427-428,430,435,443-446,451,456-464,470,477-478,486-489,492,496,498-503,512,515-526,528-529,542-548
+apps/predbat/joint_site_native.py
+  s_836485183c0d37::t_148379895ac505 73,139-146,158-162,169-175,234-259,263-268,369-370,383,532-542,544-555,599-602,606,616-622,668,674-675,678,680-683,685-805,835-844,848-851,866-873,903-906,923,960-967,985-987,996-1000,1002,1004-1026,1037-1042,1068,1074,1089-1101,1103,1114-1200
+apps/predbat/joint_site_observation.py
+  s_836485183c0d37::t_6081cea485cac6 1-92
+apps/predbat/joint_site_session.py
+  s_836485183c0d37::t_3a3c95b2cdc2de 1-140
+apps/predbat/joint_site_template.py
+  s_836485183c0d37::t_21ab2b59ebfda9 30-32,242,245-247,261-262,281-282
+apps/predbat/predbat.py
+  s_836485183c0d37::t_66dba48a2cb715 2296-2298
+apps/predbat/tests/test_joint_site_applied_view.py
+  s_836485183c0d37::t_6d35fab1169a3c 1-742
+apps/predbat/tests/test_joint_site_economic.py
+  s_836485183c0d37::t_949b189c7e702e 1-276
+apps/predbat/tests/test_joint_site_grid_support.py
+  s_836485183c0d37::t_d5a70779588384 1-194
+apps/predbat/tests/test_joint_site_partial.py
+  s_836485183c0d37::t_79f54c8573f024 1-175
+apps/predbat/tests/test_joint_site_preview.py
+  s_836485183c0d37::t_6db95c4f9800a7 1-609
+apps/predbat/tests/test_joint_site_preview_integration.py
+  s_836485183c0d37::t_360e40e849c94b 1-125
+apps/predbat/tests/test_joint_site_single_table.py
+  s_836485183c0d37::t_0eb9e79f151a7e 1-916,932-1027,1029-1040
+  s_836485183c0d37::t_dcd70ca1f692ae 917-931,1028
+apps/predbat/tests/test_joint_site_targets.py
+  s_836485183c0d37::t_b16f01e4b2f6f0 1-146
+apps/predbat/tests/test_prediction_grid_support.py
+  s_836485183c0d37::t_1e0fd6a48468ea 1-135
+apps/predbat/unit_test.py
+  s_836485183c0d37::t_d64c31d9051406 64-75,480-494,548-559
+apps/predbat/web.py
+  s_836485183c0d37::t_8fe508b3b44d5b 2570,2579-2582,2649,2654,2670-2675,2694
+apps/predbat/web_helper.py
+  s_836485183c0d37::t_acff32600cff78 7043-7049,7144,7176,7251,7266-7270,7283,7345-7351,7868,7894,7896-7897,7900,7946,7948-7951,7961,7964,7991-7992,8016-8021,8027-8029
+  s_836485183c0d37::t_0ef57a4ff9410e 7870,7895
+tools/debug-journal.md
+  s_836485183c0d37::t_cdead1f02f96aa 9-12
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "748b827abb7df20180e819b4bd84d3f991bccc38",
+  "prompts": {},
+  "sessions": {
+    "s_836485183c0d37": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_ee4ab09a4ffek4rvQDMjglNH1W",
+        "model": "unknown"
+      },
+      "human_author": "Arturo Naredo <arturonaredo@gmail.com>"
+    },
+    "s_9a2f5989953825": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_ecbdc20e1ffe3PmkJDTPqkrSW4",
+        "model": "unknown"
+      },
+      "human_author": "Arturo Naredo <arturonaredo@gmail.com>"
+    }
+  }
+}
