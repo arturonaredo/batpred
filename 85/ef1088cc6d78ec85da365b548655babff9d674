@@ -1,0 +1,38 @@
+apps/predbat/unit_test.py
+  s_f23ed2617d9336::t_9c08b662eb677b 77,467-472,549-550
+apps/predbat/config.py
+  s_f23ed2617d9336::t_9c08b662eb677b 1032-1038
+  s_f23ed2617d9336::t_23c0ca998fdb76 1031
+apps/predbat/joint_site.py
+  s_f23ed2617d9336::t_5f9aa0bf182355 109-127,139-141,265-278,343-352,362-363,571-579,589-604,611-619,636-662,666-667
+apps/predbat/joint_site_apply.py
+  s_f23ed2617d9336::t_48b6927545c69a 119-121,359-362,379-390,491,563-565,617
+apps/predbat/joint_site_battery_window.py
+  s_f23ed2617d9336::t_f91ae1d9a32a34 1-95
+apps/predbat/joint_site_native.py
+  s_f23ed2617d9336::t_05c28e7cec97b8 168,188-190,266,417-419,612-614,1050-1053
+apps/predbat/tests/test_joint_site_battery_windows.py
+  s_f23ed2617d9336::t_3e7ec8a064a809 1-245
+apps/predbat/tests/test_joint_site_battery_windows_core.py
+  s_f23ed2617d9336::t_e2bbb548ede556 1-866
+apps/predbat/tests/test_joint_site_native.py
+  s_f23ed2617d9336::t_bf57109d15968f 75-76
+docs/joint-site-planning.md
+  s_f23ed2617d9336::t_f7ad7b33347e79 70-124
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "85ef1088cc6d78ec85da365b548655babff9d674",
+  "prompts": {},
+  "sessions": {
+    "s_f23ed2617d9336": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_ebeb0c01effeC4l4FKDZhQZGes",
+        "model": "unknown"
+      },
+      "human_author": "Arturo Naredo <arturonaredo@gmail.com>"
+    }
+  }
+}
