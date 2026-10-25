@@ -159,6 +159,7 @@ deadbanding
 deadbeefdeadbeef
 dedup
 dedupe
+deepcopied
 deepseek
 dend
 denorm
@@ -173,6 +174,7 @@ devcontainers
 dexport
 deye
 deyecloud
+deyesolarman
 digestmod
 dimport
 dischargeenergytotal
@@ -325,6 +327,7 @@ halfhourly
 haléř
 hanchu
 hanchuess
+handback
 hanres
 HAOS
 harvi
@@ -501,6 +504,10 @@ nocharge
 NODETAIL
 nodischarge
 nohup
+nonboolean
+nonfeasible
+nonfinal
+nonfinite
 NONAME
 noopener
 nord
@@ -617,6 +624,7 @@ reactivepower
 readback
 readbacks
 reasoncodes
+rebasable
 rebooked
 recp
 redownload
@@ -634,6 +642,7 @@ repr
 resetmidnight
 resultid
 resultmid
+retrievalstatus
 retryable
 reweight
 reweighted
@@ -795,6 +804,7 @@ unhashable
 unindexed
 unnormalised
 unparseable
+unpassed
 unpickled
 unpickles
 unpushed
@@ -823,6 +833,7 @@ vvwwxxabcdefyyzzuu
 waf
 waitpid
 Wallbox
+wallclock
 weakref
 weblink
 welink

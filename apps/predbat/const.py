@@ -167,6 +167,8 @@ BALANCE_CEILING_SHORTFALL_W = 100  # Grid shortfall (W) during a balancing hold 
 BALANCE_CEILING_EXPIRY_SECONDS = 30 * 60  # How long a learned balancing rate ceiling is trusted before the configured rate is tried again
 INVERTER_LIMIT_DEFAULT_W = 7500.0  # Standing inverter AC limit when the user has not configured inverter_limit
 EXPORT_LIMIT_DEFAULT_W = 99999.0  # Standing export limit when the user has not configured export_limit - effectively unlimited
+# Whole-site diagnostic threshold in W; 0 disables reporting. Not a control or optimiser constraint.
+IMPORT_LIMIT_DEFAULT_W = 0.0
 PREDBAT_MAX_CARS = 8  # Matches PK_MAX_CARS in prediction_kernel.cpp and the car_charging_rate/_1../_7 config items - the hard ceiling on num_cars
 # A car_charging_now sensor that reports a charging power (in W, after unit conversion) rather than
 # on/off counts as charging from this power: above a charger's standby draw, below the smallest charge
