@@ -922,7 +922,7 @@ def test_js_refresh_uses_current_view_timestamp():
     start = renderer_js.index("function refreshPlan()")
     refresh = renderer_js[start : renderer_js.index("\n    }", start)]
     assert "let data = currentViewData();" in refresh
-    assert "checkStaleness(data);" in refresh
+    assert "checkStaleness(currentView === 'yesterday' && historyDay ? null : data);" in refresh
     assert "checkStaleness(null);" in refresh
     assert "Date.parse(data.timestamp)" in refresh
     assert "Date.parse(timestamp)" not in refresh
