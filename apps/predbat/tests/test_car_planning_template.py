@@ -28,7 +28,6 @@ from inverter import Inverter
 from inverter_service_control import ServiceSequenceError
 from tests.test_infra import reset_inverter
 
-
 SIX_PROGRAM_RANGE = range(1, 7)
 
 

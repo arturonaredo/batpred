@@ -14,7 +14,6 @@ from car_charging_solver import (
     plan,
 )
 
-
 _TOLERANCE = 1e-8
 
 

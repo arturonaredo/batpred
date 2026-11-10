@@ -7,7 +7,6 @@ module is an internal adapter, not another YAML namespace or another controller.
 from copy import deepcopy
 import math
 
-
 CAR_SETTING_KEYS = {
     "mode": "car_charging_plan_mode",
     "session": "car_charging_session",

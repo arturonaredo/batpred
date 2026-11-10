@@ -45,7 +45,6 @@ from car_charging_view import (
 )
 from web import WebInterface
 
-
 # ----------------------------------------------------------------------
 # Fixtures — reuse the existing test_car_planning_preview._good_row shape
 # ----------------------------------------------------------------------

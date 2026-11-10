@@ -51,7 +51,6 @@ from car_charging_plan import evaluate_car_charging
 from tests.test_car_planning_entrypoints import _apply_inputs
 from tests.test_car_planning_native import _setup
 
-
 # ----------------------------------------------------------------------
 # Fixture helpers — own clock, own field reset, real _setup + _apply_inputs.
 # ----------------------------------------------------------------------

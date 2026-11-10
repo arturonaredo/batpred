@@ -669,7 +669,7 @@ def test_recurring_domestic_boundary_keeps_only_bounded_ev_handoff(base):
     """An already-ON EV survives normal dispatch latency, never an off slot or stale plan."""
     from car_charging_execute import publish_car_charging_slot
 
-    (_, writes, _, _) = handoff_inputs(base)
+    _, writes, _, _ = handoff_inputs(base)
     receipt = deepcopy(base.car_charging_execution)
     boundary = base.midnight_utc + timedelta(minutes=receipt["command"]["end"])
     count = len(writes)
@@ -700,7 +700,7 @@ def test_recurring_handoff_cannot_waive_independent_guards(base):
     from car_charging_execute import publish_car_charging_slot
 
     for fault in ("permission", "reserve", "target", "controls", "deadline", "tampered_end"):
-        (_, writes, sources, _) = handoff_inputs(base)
+        _, writes, sources, _ = handoff_inputs(base)
         receipt = base.car_charging_execution
         boundary = base.midnight_utc + timedelta(minutes=receipt["command"]["end"])
         count = len(writes)

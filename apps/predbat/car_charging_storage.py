@@ -5,7 +5,6 @@ import hashlib
 import json
 import re
 
-
 CAR_STORAGE_MODULE = "car_charging"
 CAR_STORAGE_RECORDS = ("recurring_session", "confirmed_session_guard")
 

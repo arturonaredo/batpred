@@ -87,12 +87,14 @@ def _good_report(
         "actuator_signals_modified": actuator_signals_modified,
         "generated_at": (now - timedelta(minutes=generated_minutes_ago)).isoformat(),
         "uses_stale_soc_assumption": uses_stale,
-        "preview": preview
-        if preview is not None
-        else {
-            "nominal": [_good_row(scenario="nominal", import_rate=5.0, export_rate=0.0, cost_change=0.12, total_cost=1.25)],
-            "pv10": [_good_row(scenario="pv10", import_rate=5.0, export_rate=0.0)],
-        },
+        "preview": (
+            preview
+            if preview is not None
+            else {
+                "nominal": [_good_row(scenario="nominal", import_rate=5.0, export_rate=0.0, cost_change=0.12, total_cost=1.25)],
+                "pv10": [_good_row(scenario="pv10", import_rate=5.0, export_rate=0.0)],
+            }
+        ),
         "native_checks": {"nominal": {"passed": native_passed}, "pv10": {"passed": native_passed}},
     }
     if execution_observed_at is not None:
