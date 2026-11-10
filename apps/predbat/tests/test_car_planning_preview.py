@@ -47,7 +47,6 @@ from car_charging_view import (
     render_car_charging_preview,
 )
 
-
 # ----------------------------------------------------------------------
 # Synthetic fixtures — actual Predbat native replay contract
 # ----------------------------------------------------------------------

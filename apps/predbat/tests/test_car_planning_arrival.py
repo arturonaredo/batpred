@@ -16,7 +16,7 @@ from tests.test_car_planning_recurring import recurring_inputs
 
 def arrival_inputs(base):
     """Give the real native seams an absent car and three genuine historical round trips."""
-    (fixture, store) = recurring_inputs(base)
+    fixture, store = recurring_inputs(base)
     base.car_charging_plan_time = ["07:30:00"]
     base.car_charging_limit[0] = base.car_charging_battery_size[0] = 25.0
     base.car_charging_rate[0] = 6.77
