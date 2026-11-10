@@ -14,7 +14,6 @@ import json
 from threading import RLock
 from zoneinfo import ZoneInfo
 
-
 _LOCK = RLock()
 
 

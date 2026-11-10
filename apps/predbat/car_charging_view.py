@@ -27,7 +27,6 @@ import math
 
 from const import TIME_FORMAT
 
-
 PREVIEW_ROW_LIMIT = 97
 _NO_CANDIDATE_STATUSES = frozenset(
     {

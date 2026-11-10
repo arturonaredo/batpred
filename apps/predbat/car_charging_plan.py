@@ -1207,12 +1207,14 @@ def evaluate_car_charging(base, publish=True):
                     {
                         "start": model_base.minutes_now + slot.start_min,
                         "end": model_base.minutes_now + slot.start_min + slot.duration_min,
-                        "target_soc": next(
-                            (round(limit * 100 / model_base.soc_max) for window, limit in zip(windows[1], windows[2]) if window["start"] <= model_base.minutes_now + slot.start_min < window["end"]),
-                            0,
-                        )
-                        if action.battery_mode == "charge"
-                        else 0,
+                        "target_soc": (
+                            next(
+                                (round(limit * 100 / model_base.soc_max) for window, limit in zip(windows[1], windows[2]) if window["start"] <= model_base.minutes_now + slot.start_min < window["end"]),
+                                0,
+                            )
+                            if action.battery_mode == "charge"
+                            else 0
+                        ),
                         "freeze": action.battery_mode == "hold",
                         "power_w": power,
                         "ev_on": action.ev_action == "on",
