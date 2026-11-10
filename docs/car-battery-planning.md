@@ -300,6 +300,14 @@ new completed session, and later energy is never assigned retroactively to an
 earlier deadline. Missing durable storage blocks EV authority, not safe household
 handback after OFF.
 
+Connection and SOC publications need not arrive together. A recent lower SOC can
+correct an initial sample that predates connection, but only before the relay has
+been activated, with idle power and exactly unchanged cumulative energy. This
+retains the session identity, start time and physical meter baseline. It cannot
+correct SOC upwards, hide an energy increment or relay cycle, or clear a retained
+fault. A genuine contradiction remains blocked across restart and reconnection
+until evidence-backed reconciliation; changing the departure time is not a reset.
+
 ### Anticipated arrival is model-only demand
 
 While a recurring-policy car is observed away with relay OFF, native household

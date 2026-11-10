@@ -1061,6 +1061,90 @@ def test_recurring_allowlisted_stop_state_is_log_warning_only(base):
     assert retained["invalid"] == "" and retained["session"]["meter_baseline"] == before["meter_baseline"]
 
 
+def arrival_baseline_inputs(base):
+    """Reproduce independently delayed arrival fields without delivering any AC energy."""
+    fixture, store = recurring_inputs(base)
+    settings = car_settings(base)
+    settings.pop("home_entity")
+    base.car_charging_battery_size = [20]
+    base.car_charging_limit = [20]
+    arrival = base.now_utc - timedelta(seconds=8)
+    old_soc = arrival - timedelta(minutes=16)
+    _set_entity(base, settings["connection_entity"], "connected", last_changed=arrival, last_updated=arrival, attributes={"retrievalstatus": "VALID"})
+    _set_entity(base, settings["soc_entity"], 16, last_changed=old_soc, last_updated=old_soc, attributes={"retrievalstatus": "VALID"})
+    first = resolve_recurring_session(base, now=base.now_utc)
+    assert first["status"] == "ready", first
+    return fixture, store, first
+
+
+def test_recurring_delayed_lower_arrival_soc_before_delivery(base):
+    """A post-arrival lower reading corrects a pre-arrival baseline before energising."""
+    (_, writes, _, _), store, first = arrival_baseline_inputs(base)
+    settings = car_settings(base)
+    before = deepcopy(store.records[("car_charging", "recurring_session")]["session"])
+    observed = base.now_utc + timedelta(seconds=107)
+    _set_entity(base, settings["soc_entity"], 12.6, last_changed=observed, last_updated=observed, attributes={"retrievalstatus": "VALID"})
+    current = resolve_recurring_session(base, now=observed)
+    assert current["status"] == "ready", current
+    assert current["identity"] == first["identity"] and current["observation"]["ev_soc"] == 12.6
+    saved = store.records[("car_charging", "recurring_session")]
+    assert saved["invalid"] == "" and saved["session"]["initial_kwh"] == saved["session"]["anchor_kwh"] == 12.6
+    for key in ("identity", "started_at", "meter_baseline", "last_energy", "anchor_energy", "home_transition"):
+        assert saved["session"][key] == before[key], key
+    assert not writes
+    # A restart-like storage read and a later real energy batch retain the corrected anchor.
+    restored = RecurringStorage()
+    restored.records = deepcopy(store.records)
+    base.components = SimpleNamespace(get_component=lambda name: restored)
+    later = observed + timedelta(minutes=5)
+    _set_entity(base, "sensor.test_ev_energy", "100.5", last_changed=later, last_updated=later, attributes={"unit_of_measurement": "kWh"})
+    progress = resolve_recurring_session(base, now=later)
+    assert progress["status"] == "ready", progress
+    assert abs(progress["observation"]["ev_soc"] - (12.6 + 0.5 * base.car_charging_loss)) < 1e-9
+
+
+def test_recurring_arrival_correction_cannot_hide_delivery_or_newer_baseline(base):
+    """A lower reading remains a fault without complete evidence of an idle stale baseline."""
+    for fault in ("relay_on", "relay_cycled", "power", "energy", "post_arrival_baseline", "stale_update", "higher_soc", "invalid_quality"):
+        _, store, _ = arrival_baseline_inputs(base)
+        settings = car_settings(base)
+        started = base.now_utc
+        observed = started + timedelta(seconds=107)
+        value, quality = 12.6, "VALID"
+        if fault == "relay_on":
+            _set_entity(base, settings["relay_entity"], "on", last_changed=started + timedelta(seconds=1), last_updated=observed)
+        elif fault == "relay_cycled":
+            _set_entity(base, settings["relay_entity"], "off", last_changed=started + timedelta(seconds=30), last_updated=observed)
+        elif fault == "power":
+            _set_entity(base, "sensor.test_ev_power", "0.1", last_changed=observed, last_updated=observed, attributes={"unit_of_measurement": "kW"})
+        elif fault == "energy":
+            _set_entity(base, "sensor.test_ev_energy", "100.1", last_changed=observed, last_updated=observed, attributes={"unit_of_measurement": "kWh"})
+        elif fault == "post_arrival_baseline":
+            record = store.records[("car_charging", "recurring_session")]
+            record["session"]["anchor_soc_at"] = started.isoformat()
+        elif fault == "higher_soc":
+            value = 19
+        elif fault == "invalid_quality":
+            quality = "INVALID"
+        _set_entity(base, settings["soc_entity"], value, last_changed=observed, last_updated=observed, attributes={"retrievalstatus": quality})
+        now = observed + timedelta(seconds=181) if fault == "stale_update" else observed
+        current = resolve_recurring_session(base, now=now)
+        assert current["status"] == "blocked", (fault, current)
+        assert store.records[("car_charging", "recurring_session")]["session"]["initial_kwh"] == 16, fault
+
+
+def test_recurring_arrival_correction_does_not_clear_retained_fault(base):
+    """A persisted SOC fault still requires evidence-backed reconciliation, not a lower sample."""
+    _, store, _ = arrival_baseline_inputs(base)
+    settings = car_settings(base)
+    store.records[("car_charging", "recurring_session")]["invalid"] = "recurring_soc_contradiction"
+    before = deepcopy(store.records)
+    observed = base.now_utc + timedelta(seconds=107)
+    _set_entity(base, settings["soc_entity"], 12.6, last_changed=observed, last_updated=observed, attributes={"retrievalstatus": "VALID"})
+    assert resolve_recurring_session(base, now=observed)["reason"] == "recurring_soc_contradiction"
+    assert store.records == before
+
+
 def run_car_planning_recurring_tests(base):
     """Run isolated standing-policy tests through the normal Predbat registry."""
     from unit_test import create_predbat
@@ -1114,6 +1198,9 @@ def run_car_planning_recurring_tests(base):
         test_recurring_gap_does_not_hide_a_real_unplug_or_retained_fault,
         test_recurring_unavailable_connection_revokes_lease_without_losing_energy,
         test_recurring_allowlisted_stop_state_is_log_warning_only,
+        test_recurring_delayed_lower_arrival_soc_before_delivery,
+        test_recurring_arrival_correction_cannot_hide_delivery_or_newer_baseline,
+        test_recurring_arrival_correction_does_not_clear_retained_fault,
         test_vehicle_policy_contract,
     ):
         fresh = create_predbat()
