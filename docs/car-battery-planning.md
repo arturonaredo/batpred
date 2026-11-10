@@ -300,13 +300,29 @@ new completed session, and later energy is never assigned retroactively to an
 earlier deadline. Missing durable storage blocks EV authority, not safe household
 handback after OFF.
 
-Connection and SOC publications need not arrive together. A recent lower SOC can
-correct an initial sample that predates connection, but only before the relay has
-been activated, with idle power and exactly unchanged cumulative energy. This
-retains the session identity, start time and physical meter baseline. It cannot
-correct SOC upwards, hide an energy increment or relay cycle, or clear a retained
-fault. A genuine contradiction remains blocked across restart and reconnection
-until evidence-backed reconciliation; changing the departure time is not a reset.
+Connection and SOC publications need not arrive together. Configure both native
+`car_charging_soc_observed_at` and `car_charging_plugged_observed_at` mappings with
+the actual offset-aware field times, not HA publication times. A positive retained
+SOC that predates a new connection waits up to `car_charging_soc_recent_seconds`
+for the arrival fields to settle before creating a baseline. Unknown configured
+clocks withdraw authority rather than inventing a fresh observation.
+After that interval, a retained preconnection value may form an **estimated**
+baseline only if the relay remained OFF since both physical connection and its
+HA transition. Change-only integrations need not publish an identical SOC again
+to avoid a deadlock; this never relabels the retained reading as fresh.
+
+A recent lower SOC can correct an initial sample that predates connection only
+with a recent, non-future physical measurement, idle power,
+exactly unchanged cumulative energy and relay OFF since before connection, not
+merely since baseline creation. A lower preconnection value stays estimated, not
+proof of measured completion. Missing or stale field times report
+`recurring_arrival_soc_pending` without latching a fault or rewriting the baseline.
+This retains the session identity, start time and physical meter baseline. It
+cannot correct SOC upwards, hide an energy increment or relay cycle, or clear a
+retained fault. A genuine contradiction remains blocked across restart and
+reconnection until evidence-backed reconciliation; changing departure is not a reset.
+Once the relay has been activated, a delayed inconsistent arrival reading remains
+ambiguous delivery evidence and requires explicit reconciliation; it is not silently reset.
 
 ### Anticipated arrival is model-only demand
 

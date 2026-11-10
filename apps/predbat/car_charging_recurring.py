@@ -300,11 +300,32 @@ def _resolve(base, settings, now):
                 new_connection = any(_parse_entity_timestamp(item["at"], "connection_history") > checked and item["state"] not in allowed and item["state"] not in ("unknown", "unavailable") for item in history)
     new_session = (not record["active"] and not acknowledged) or session is None or new_home or new_connection
     _close_deadline(record, now, unavailable=new_session)
+
+    def arrival_clocks():
+        """Read actual configured field times, never infer measurement time from publication."""
+        values = []
+        for name in ("soc_observed_at_entity", "connection_observed_at_entity"):
+            stamp = read(settings.get(name))
+            measured_at = _parse_entity_timestamp(stamp["state"], name)
+            if measured_at > now:
+                raise ValueError("recurring_arrival_soc_pending")
+            values.append(measured_at)
+        return values
+
     if new_session:
         if relay["state"] != "off" or power_kw > measurements["idle_power_kw"]:
             return unavailable("recurring_new_baseline_requires_off", end_session=False)
         if measured >= target and (now - soc["last_updated"]).total_seconds() > measurements["soc_recent_seconds"]:
             return unavailable("recurring_stale_full_soc", end_session=False)
+        # Give independently published arrival fields their configured recent
+        # observation interval to settle before granting the first EV authority.
+        if measured > 0 and (settings.get("soc_observed_at_entity") or settings.get("connection_observed_at_entity")):
+            try:
+                measured_at, connected_at = arrival_clocks()
+            except ValueError:
+                return unavailable("recurring_arrival_soc_pending", end_session=False)
+            if measured_at < connected_at and (relay["last_changed"] > min(connected_at, connection["value_last_changed"]) or (now - connection["value_last_changed"]).total_seconds() <= measurements["soc_recent_seconds"]):
+                return unavailable("recurring_arrival_soc_pending", end_session=False)
         stamp = now.isoformat()
         session = {
             "identity": hashlib.sha256((policy + stamp).encode()).hexdigest(),
@@ -336,11 +357,17 @@ def _resolve(base, settings, now):
         and _parse_entity_timestamp(session["anchor_soc_at"], "anchor_soc_at") < connection["value_last_changed"] <= started < soc["last_changed"]
         and (now - soc["last_changed"]).total_seconds() <= measurements["soc_recent_seconds"]
         and relay["state"] == "off"
-        and relay["last_changed"] <= started
+        and relay["last_changed"] <= connection["value_last_changed"]
         and power_kw <= measurements["idle_power_kw"]
         and total == session["meter_baseline"] == session["last_energy"] == session["anchor_energy"]
     ):
-        session.update(initial_kwh=measured, anchor_kwh=measured, anchor_soc_at=soc["last_changed"].isoformat(), last_vehicle_value=measured, soc_observed_at=soc["last_updated"].isoformat())
+        try:
+            measured_at, connected_at = arrival_clocks()
+        except ValueError:
+            return unavailable("recurring_arrival_soc_pending", end_session=False)
+        if relay["last_changed"] > connected_at or (now - measured_at).total_seconds() > measurements["soc_recent_seconds"]:
+            return unavailable("recurring_arrival_soc_pending", end_session=False)
+        session.update(initial_kwh=measured, anchor_kwh=measured, anchor_soc_at=soc["last_changed"].isoformat(), last_vehicle_value=measured, soc_observed_at=measured_at.isoformat())
         base.log("Info: EV delayed arrival SOC corrected before relay activation or AC delivery: {} to {} kWh".format(initial, measured))
         initial = measured
     elapsed = (now - started).total_seconds() / 3600
