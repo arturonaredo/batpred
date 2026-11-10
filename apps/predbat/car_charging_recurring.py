@@ -327,6 +327,22 @@ def _resolve(base, settings, now):
         record.update(active=True, session=session)
     initial = _number(session["initial_kwh"], "initial", 0, capacity)
     started = _parse_entity_timestamp(session["started_at"], "session_start")
+    # Connection and SOC arrive independently. The first lower arrival value can
+    # replace a pre-connection sample only before any possible local delivery.
+    # Never reinterpret an already latched fault, a higher SOC, a relay cycle or
+    # even a small metered increment as a harmless delayed arrival publication.
+    if (
+        measured < initial
+        and _parse_entity_timestamp(session["anchor_soc_at"], "anchor_soc_at") < connection["value_last_changed"] <= started < soc["last_changed"]
+        and (now - soc["last_changed"]).total_seconds() <= measurements["soc_recent_seconds"]
+        and relay["state"] == "off"
+        and relay["last_changed"] <= started
+        and power_kw <= measurements["idle_power_kw"]
+        and total == session["meter_baseline"] == session["last_energy"] == session["anchor_energy"]
+    ):
+        session.update(initial_kwh=measured, anchor_kwh=measured, anchor_soc_at=soc["last_changed"].isoformat(), last_vehicle_value=measured, soc_observed_at=soc["last_updated"].isoformat())
+        base.log("Info: EV delayed arrival SOC corrected before relay activation or AC delivery: {} to {} kWh".format(initial, measured))
+        initial = measured
     elapsed = (now - started).total_seconds() / 3600
     delta = total - session["meter_baseline"]
     anchor_delta = total - session["anchor_energy"]
