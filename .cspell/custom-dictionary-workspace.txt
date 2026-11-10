@@ -587,6 +587,7 @@ predbat
 predbatsolcast
 predbatt
 predheat
+preplug
 preseed
 preseeded
 prevs
