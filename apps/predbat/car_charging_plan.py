@@ -945,25 +945,47 @@ def _continuous_grid_support_shadow(base, options):
     ranked = _priority_block_starts(base, options, first, last, duration)
     best, attempts = None, []
     selected = None
-    for start, reason in ranked:
-        for initial_demand in (True, False) if options.get("self_consumption_first") else (False,):
-            trial = {**options, "forecast_basis": "envelope", "ev_continuous_block": (start, start + duration), "initial_demand_only": initial_demand}
-            result, slots = build_candidate(base, trial)
-            passed = False
-            if result.actions:
-                _validate_candidate_modes(options, result)
-                windows, checks = _replay_candidate(base, trial, result, slots)
-                passed = all(check["passed"] for check in checks.values())
-                if passed and (best is None or result.total_cost < best[0].total_cost - 1e-9):
-                    best = result, slots, windows, checks
-                    selected = len(attempts)
-            attempts.append({"start_offset": start, "end_offset": start + duration, "solver_status": result.status, "native_passed": passed, "initial_demand_only": initial_demand, "priority_reason": reason})
-            # Demand-first is a tie preference for COST, not permission to defer
-            # economically useful charging again on every five-minute replan.
-            if passed and (priority != "cost" or not initial_demand):
+    configured_beam = options.get("beam", 128)
+    searches = [(configured_beam, ranked)]
+    if priority == "cost" and options["mode"] == "apply" and not options["initially_on"] and configured_beam < 512 and ranked:
+        # Feasible does not mean economical: a narrow beam can lose the path
+        # that prepares for a later cheap EV start. Refine four representative
+        # starts at the existing retry cap without discarding the baseline.
+        count = min(4, len(ranked))
+        indices = [math.floor(index * (len(ranked) - 1) / (count - 1)) for index in range(count)] if count > 1 else [0]
+        searches.append((512, [ranked[index] for index in indices]))
+    for search_beam, starts in searches:
+        for start, reason in starts:
+            for initial_demand in (True, False) if options.get("self_consumption_first") else (False,):
+                trial = {**options, "beam": search_beam, "forecast_basis": "envelope", "ev_continuous_block": (start, start + duration), "initial_demand_only": initial_demand}
+                result, slots = build_candidate(base, trial)
+                passed = False
+                if result.actions:
+                    _validate_candidate_modes(options, result)
+                    windows, checks = _replay_candidate(base, trial, result, slots)
+                    passed = all(check["passed"] for check in checks.values())
+                    if passed and (best is None or result.total_cost < best[0].total_cost - 1e-9):
+                        best = result, slots, windows, checks
+                        selected = len(attempts)
+                attempts.append(
+                    {
+                        "start_offset": start,
+                        "end_offset": start + duration,
+                        "beam_width": search_beam,
+                        "quality_refinement": search_beam != configured_beam,
+                        "solver_status": result.status,
+                        "solver_objective": result.total_cost,
+                        "native_passed": passed,
+                        "initial_demand_only": initial_demand,
+                        "priority_reason": reason,
+                    }
+                )
+                # Demand-first is a tie preference for COST, not permission to defer
+                # economically useful charging again on every five-minute replan.
+                if passed and (priority != "cost" or not initial_demand):
+                    break
+            if priority != "cost" and passed:
                 break
-        if priority != "cost" and passed:
-            break
     if priority == "cost" and not options["initially_on"]:
         trial = {**options, "forecast_basis": "envelope"}
         result, slots = build_candidate(base, trial)
@@ -975,7 +997,7 @@ def _continuous_grid_support_shadow(base, options):
             if passed and (best is None or result.total_cost < best[0].total_cost - 1e-9):
                 best = result, slots, windows, checks
                 selected = len(attempts)
-        attempts.append({"solver_status": result.status, "native_passed": passed, "priority_reason": "coupled_cost_flexible_schedule"})
+        attempts.append({"beam_width": configured_beam, "solver_status": result.status, "solver_objective": result.total_cost, "native_passed": passed, "priority_reason": "coupled_cost_flexible_schedule"})
     if selected is not None:
         attempts[selected]["selected"] = True
     return best, attempts
@@ -1165,7 +1187,9 @@ def evaluate_car_charging(base, publish=True):
             report["priority_selection_reason"] = next((attempt["priority_reason"] for attempt in report["continuous_block_attempts"] if attempt.get("selected")), "bounded_search_fallback")
         if options["control_model"] == "deye_solarman":
             report["supported_battery_modes"] = ["demand", "charge"]
-            report["search_beam_attempts"] = [{"beam_width": options["beam"], "solver_status": result.status}]
+            selected_search = next((attempt for attempt in report.get("continuous_block_attempts", []) if attempt.get("selected")), {})
+            report["configured_search_beam_width"] = options["beam"]
+            report["search_beam_attempts"] = [{"beam_width": selected_search.get("beam_width", options["beam"]), "solver_status": result.status}]
             if not result.actions and options["beam"] < 512:
                 # A bounded search miss is not infeasibility. One explicit, reported
                 # retry retains the exact capabilities/inputs and stays within the cap.

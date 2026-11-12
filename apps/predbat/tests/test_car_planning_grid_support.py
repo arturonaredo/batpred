@@ -245,6 +245,7 @@ def test_cost_priority_compares_safe_initial_demand_with_ordinary_candidate():
     base.car_charging_loss = 1.0
     options = {
         "arrival": 0,
+        "beam": 512,
         "control_model": "deye_solarman",
         "deadline": 905,
         "ev_charging_priority": "cost",
@@ -282,6 +283,59 @@ def test_cost_priority_compares_safe_initial_demand_with_ordinary_candidate():
         assert chosen is not None and chosen[0].total_cost == expected_cost
         assert chosen[0].actions[0].battery_mode == expected_mode
         assert len([attempt for attempt in attempts if "start_offset" in attempt]) == 2
+
+
+def test_apply_cost_refines_representative_starts_even_after_a_feasible_result():
+    """Feasibility at a narrow beam must not prevent bounded economic refinement."""
+    base = _priority_test_base()
+    base.car_charging_limit = [13.0]
+    base.car_charging_loss = 1.0
+    options = {
+        "arrival": 0,
+        "beam": 128,
+        "control_model": "deye_solarman",
+        "deadline": 905,
+        "ev_charging_priority": "cost",
+        "ev_soc": 0.0,
+        "grid_charge_support_w": 6000,
+        "house_only": False,
+        "initial_off_minutes": 10,
+        "initially_on": False,
+        "mode": "apply",
+        "off_minutes": 10,
+        "self_consumption_first": False,
+    }
+    ranked = [(index * 5, "coupled_cost") for index in range(24)]
+
+    for refined_safe in (True, False):
+        calls = []
+
+        def build(_, trial):
+            block = trial.get("ev_continuous_block")
+            calls.append((trial["beam"], block))
+            cost = 1.0 if trial["beam"] == 512 and block and block[0] == 115 else 10.0
+            if block is None:
+                cost = 100.0
+            result = SimpleNamespace(actions=[SimpleNamespace(battery_mode="demand", discharge_limit_kw=None)], status="feasible", total_cost=cost)
+            return result, []
+
+        def replay(_, trial, result, slots):
+            safe = trial["beam"] != 512 or refined_safe
+            return ([], [], []), {"nominal": {"passed": True}, "pv10": {"passed": safe}}
+
+        with (
+            patch("car_charging_plan._priority_block_starts", return_value=ranked),
+            patch("car_charging_plan.build_candidate", side_effect=build),
+            patch("car_charging_plan._replay_candidate", side_effect=replay),
+        ):
+            chosen, attempts = _continuous_grid_support_shadow(base, options)
+
+        assert chosen is not None and chosen[0].total_cost == (1.0 if refined_safe else 10.0)
+        assert {block[0] for beam, block in calls if beam == 128 and block} == {start for start, _ in ranked}
+        assert [(beam, block[0]) for beam, block in calls if beam == 512] == [(512, start) for start in [0, 35, 75, 115]]
+        selected = next(attempt for attempt in attempts if attempt.get("selected"))
+        assert selected["beam_width"] == (512 if refined_safe else 128)
+        assert len(attempts) == 29
 
 
 def test_grid_support_replay_rejects_hidden_reserve_tail(base):
@@ -409,6 +463,7 @@ def run_car_planning_grid_support_tests(base):
     test_cost_priority_shortlist_keeps_cheaper_starts_and_other_priorities()
     test_cost_priority_tie_search_samples_late_candidate()
     test_cost_priority_compares_safe_initial_demand_with_ordinary_candidate()
+    test_apply_cost_refines_representative_starts_even_after_a_feasible_result()
     test_grid_support_replay_rejects_hidden_reserve_tail(base)
     test_grid_support_domestic_targets_follow_solar(base)
     test_initial_demand_is_a_scoped_search_constraint()
