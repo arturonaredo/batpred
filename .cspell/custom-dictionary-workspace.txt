@@ -119,6 +119,7 @@ collapsable
 colorbar
 colorscale
 compareform
+componentwise
 configform
 connack
 Consolas

@@ -24,6 +24,16 @@ class CarPlanningConfigTests(unittest.TestCase):
         self.assertEqual(settings["soc_entity_unit"], "%")
         self.assertNotIn("settings", args)
 
+    def test_household_economic_fallback_has_a_distinct_default_false_opt_in(self):
+        """The economic route is a separate explicit native setting, not a semantic change to handback."""
+        from car_charging_config import CAR_SETTING_KEYS
+
+        key = "household_economic_fallback"
+        self.assertEqual(CAR_SETTING_KEYS.get(key), "car_charging_household_economic_fallback")
+        self.assertNotIn(key, read_car_charging_config(SimpleNamespace(args={"car_charging_plan_mode": "apply"})))
+        migrated = native_car_arguments({"mode": "apply", key: True})
+        self.assertIs(migrated["car_charging_household_economic_fallback"], True)
+
     def test_migration_preserves_values_and_saved_window(self):
         """A supplied saved choice must not be silently replaced with a new-install default."""
         previous = {"mode": "apply", "connection_entity": "sensor.example_plug", "recurring_session": {"enabled": True}}

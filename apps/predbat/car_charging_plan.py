@@ -172,6 +172,7 @@ def _options(base):
         "battery_min_window_minutes",
         "self_consumption_first",
         "household_fallback",
+        "household_economic_fallback",
         "home_entity",
         "ev_partial_target_authorised",
         "recurring_session",
@@ -210,9 +211,11 @@ def _options(base):
         raise ValueError("ev_executor_lease_verified must be boolean")
     if type(settings.get("execution_authorised", False)) is not bool:
         raise ValueError("execution_authorised must be boolean")
-    for name in ("household_fallback", "ev_partial_target_authorised"):
+    for name in ("household_fallback", "household_economic_fallback", "ev_partial_target_authorised"):
         if type(settings.get(name, False)) is not bool:
             raise ValueError("EV routing and partial authorisation must be boolean")
+    if settings.get("household_economic_fallback") and not settings.get("household_fallback"):
+        raise ValueError("Household economic fallback requires household handback opt-in")
     if settings.get("home_entity") is not None and (not isinstance(settings["home_entity"], str) or not settings["home_entity"].startswith("device_tracker.")):
         raise ValueError("home_entity must be a vehicle device tracker")
     if mode == "apply" and (control_model not in ("deye_tou", "deye_solarman") or settings.get("allow_stale_shadow_soc", False)):
@@ -551,9 +554,9 @@ def _forecast_inputs(base, options):
             _number(base.all_active_keep.get(minute, 0), "domestic_manual_floor", 0, 100)
 
 
-def build_candidate(base, options):
-    """Search coupled fixed-rate EV and battery decisions using native forecast inputs."""
-    from car_charging_solver import BatteryConfig, EVConfig, PlannerConfig, SiteConfig, Slot, plan
+def build_native_slots(base, options):
+    """Build complete native forecast slots without asking the solver for a feasible plan."""
+    from car_charging_solver import Slot
 
     slots = []
     conservative = options.get("forecast_basis") == "envelope"
@@ -568,6 +571,15 @@ def build_candidate(base, options):
             pv_ac = min(pv_ac, base.pv_ac_limit * PREDICT_STEP)
         floor_percent = max(base.all_active_keep.get(m, 0) for m in range(absolute, absolute + PREDICT_STEP))
         slots.append(Slot(index, minute, PREDICT_STEP, load_step, pv_ac, import_rate, export_rate, floor_percent * base.soc_max / 100))
+    return slots
+
+
+def build_candidate(base, options):
+    """Search coupled fixed-rate EV and battery decisions using native forecast inputs."""
+    from car_charging_solver import BatteryConfig, EVConfig, PlannerConfig, SiteConfig, plan
+
+    slots = build_native_slots(base, options)
+    conservative = options.get("forecast_basis") == "envelope"
     battery = BatteryConfig(
         capacity_kwh=base.soc_max,
         initial_kwh=base.soc_kw,
@@ -609,7 +621,7 @@ def build_candidate(base, options):
             raise ValueError("Invalid shadow continuous EV block")
         ev = replace(ev, availability=tuple(index for index in ev.availability if block[0] <= slots[index].start_min < block[1]))
     site = SiteConfig(options["import_limit_w"] / 1000, base.export_limit * 60, options["load_cap"], support_w / 1000 if support_w else None)
-    modes = ("demand", "charge") if options["control_model"] == "deye_solarman" else ("demand", "hold", "charge")
+    modes = ("demand",) if options.get("domestic_demand_baseline") else ("demand", "charge") if options["control_model"] == "deye_solarman" else ("demand", "hold", "charge")
     result = plan(
         slots,
         ev,
@@ -733,7 +745,7 @@ def _replay(base, options, result, slots, windows, scenario):
             reasons.append("ev_cooldown")
         scenario_load = base.load_minutes_step10 if scenario == 1 else base.load_minutes_step
         load_kw = scenario_load[slot.start_min] * 60 / slot.duration_min + (base.car_charging_rate[0] if on else 0)
-        if load_kw > options["load_cap"] + 1e-9:
+        if options.get("load_cap") is not None and load_kw > options["load_cap"] + 1e-9:
             reasons.append("load_port_exceeded")
         if on and options.get("ev_charging_priority") == "solar":
             # PV must cover the full house/EV reservation and the battery cannot
@@ -754,6 +766,7 @@ def _replay(base, options, result, slots, windows, scenario):
         "checked_minutes": diagnostic["checked_minutes"] if diagnostic else 0,
         "peak_import_w": diagnostic["peak_w"] if diagnostic else None,
         "final_battery_kwh": pred.final_soc,
+        "battery_cycle_kwh": pred.final_battery_cycle,
         "final_ev_kwh": pred.final_car_soc[0],
         "validated_ev_target_kwh": ev_target,
         "minimum_battery_kwh": reserve_min,
@@ -1063,10 +1076,20 @@ def evaluate_car_charging(base, publish=True):
     report = _empty_report("invalid_input")
     stage = "configuration"
     try:
+        if settings is not None and type(settings.get("household_economic_fallback", False)) is not bool:
+            raise ValueError("Household economic fallback must be boolean")
+        if settings is not None and settings.get("household_economic_fallback") and settings.get("household_fallback") is not True:
+            raise ValueError("Household economic fallback requires household handback opt-in")
         from car_charging_policy import household_reason
 
         reason = household_reason(base)
         if reason:
+            if settings.get("household_fallback") is True and settings.get("household_economic_fallback") is True:
+                from car_charging_household import evaluate_household_fallback
+
+                report = evaluate_household_fallback(base, settings, reason)
+                _publish_report(base, report, publish)
+                return report
             report = _empty_report("household_fallback")
             report.update(execution_reason=reason, requested_mode="apply", ev_available=False, household_executor="native", ev_soc_not_required=True)
             from car_charging_recurring import recurring_enabled, resolve_recurring_session
@@ -1444,6 +1467,20 @@ def evaluate_car_charging(base, publish=True):
                 report["ev_run_strategy"] = "immediate_start_not_validated"
                 report["execution_blockers"] = [*report.get("execution_blockers", []), "immediate_start_not_validated"]
                 report["reason"] = "No paired-safe EV start was validated for the current control interval; NOW does not defer the start"
+        if options["mode"] == "apply" and settings.get("household_fallback") is True and settings.get("household_economic_fallback") is True and report["status"] in ("no_plan_found", "native_rejected"):
+            from car_charging_household import evaluate_household_fallback
+
+            joint_rejection = {"status": report["status"]}
+            for name in ("search_beam_attempts", "search_attempts", "execution_blockers"):
+                if name in report:
+                    joint_rejection[name] = deepcopy(report[name])
+            fallback_report = evaluate_household_fallback(base, settings, "joint_candidate_" + report["status"])
+            if isinstance(fallback_report, dict):
+                fallback_report["joint_candidate_rejection"] = joint_rejection
+                pending = getattr(base, "car_charging_pending", None)
+                if isinstance(pending, dict) and pending.get("domestic_only") is True:
+                    pending["report"] = deepcopy(fallback_report)
+                report = fallback_report
     except UnsupportedCarPlanning as exc:
         report = _empty_report("unsupported")
         report["reason"] = str(exc)
