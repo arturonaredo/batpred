@@ -326,6 +326,123 @@ def test_build_car_planning_plan_view_state_text_charge_shows_100_limit():
     assert view["rows"][0]["show_limit"] == "100"
 
 
+def test_build_car_planning_plan_view_mixed_modes_show_ordered_durations_and_limit_bound():
+    """Mixed bins show mode totals without implying those totals were contiguous."""
+    report = _good_report()
+    for scenario in ("nominal", "pv10"):
+        row = _good_row(scenario=scenario, battery_modes="demand,charge", battery_start_percent=10.0, battery_end_percent=10.0, battery_min_percent=10.0)
+        row.update(mode_minutes={"demand": 5, "charge": 25}, charge_target_percent=100)
+        report["preview"][scenario] = [row]
+
+    view = build_car_charging_plan_view(_native_plan(), report)
+    row = view["rows"][0]
+    assert row["state"] == "Mixed"
+    assert row["state_text"] == "Demand 5m + Chrg 25m"
+    assert row["show_limit"] == "Chrg ≤100"
+    assert row["state_color"] == "#FFFFFF"
+    assert row["reasons"] == []
+    assert "rowspan_state" not in row
+
+
+def test_interleaved_mixed_modes_are_reported_as_totals_not_a_timeline():
+    """Demand 5m → charge 5m → demand 20m is only known as 25m + 5m in this preview."""
+    report = _good_report()
+    for scenario in ("nominal", "pv10"):
+        row = _good_row(scenario=scenario, battery_modes="demand,charge")
+        # These totals come from interleaved 5-minute actions; no contiguous mode segments are stored.
+        row.update(mode_minutes={"demand": 25, "charge": 5}, charge_target_percent=53)
+        report["preview"][scenario] = [row]
+
+    view = build_car_charging_plan_view(_native_plan(), report)
+    row = view["rows"][0]
+    assert row["state"] == "Mixed"
+    assert row["state_text"] == "Demand 25m + Chrg 5m"
+    assert "&rarr;" not in row["state_text"]
+    assert row["show_limit"] == "Chrg ≤53"
+
+
+def test_mixed_mode_durations_must_match_between_paired_scenarios():
+    """Different nominal/PV10 mode totals cannot be shown as one joint schedule."""
+    report = _good_report()
+    for scenario, mode_minutes in (
+        ("nominal", {"demand": 5, "charge": 25}),
+        ("pv10", {"demand": 25, "charge": 5}),
+    ):
+        row = _good_row(scenario=scenario, battery_modes="demand,charge")
+        row.update(mode_minutes=mode_minutes, charge_target_percent=53)
+        report["preview"][scenario] = [row]
+
+    view = build_car_charging_plan_view(_native_plan(), report)
+    assert view.get("plan_unavailable") is True
+    assert view["rows"] == []
+
+
+def test_html_plan_and_api_preserve_mixed_modes_in_the_joint_state_and_limit_cells():
+    """The actual Plan page and polling API carry mixed-mode labels into State and Limit % cells."""
+    report = _good_report()
+    for scenario in ("nominal", "pv10"):
+        row = _good_row(
+            scenario=scenario,
+            start="2026-01-01T12:05:00+0000",
+            end="2026-01-01T12:30:00+0000",
+            minutes=25,
+            battery_modes="charge,demand",
+            battery_start_percent=40.0,
+            battery_end_percent=39.0,
+            battery_min_percent=39.0,
+        )
+        row.update(mode_minutes={"charge": 15, "demand": 10}, charge_target_percent=53)
+        report["preview"][scenario] = [row]
+
+    page = _build_page(report)
+    html = asyncio.run(page.html_plan(SimpleNamespace(rel_url=SimpleNamespace(query={}))))
+    match = re.search(r"window\.planData\s*=\s*({.*?});", html.text)
+    assert match, html.text
+    plan = json.loads(match.group(1))
+    assert 'id="planContainer"' in html.text
+    assert "Limit %" in html.text and "row.state_text" in html.text and "row.show_limit" in html.text
+    assert plan["rows"][0]["time"] == "2026-01-01T12:05:00+0000"
+    assert plan["rows"][0]["plan_interval_end"] == "2026-01-01T12:30:00+0000"
+    assert plan["rows"][0]["state"] == "Mixed"
+    assert plan["rows"][0]["state_text"] == "Chrg 15m + Demand 10m"
+    assert plan["rows"][0]["show_limit"] == "Chrg ≤53"
+    assert "rowspan_state" not in plan["rows"][0]
+
+    api_response = asyncio.run(page.html_api_plan_data(SimpleNamespace(rel_url=SimpleNamespace(query={}))))
+    api_plan = json.loads(api_response.text)["plan"]
+    assert api_plan["rows"][0]["state_text"] == "Chrg 15m + Demand 10m"
+    assert api_plan["rows"][0]["show_limit"] == "Chrg ≤53"
+
+
+def test_mixed_modes_without_matching_durations_are_unavailable():
+    """A mixed candidate with incomplete duration data cannot be shown as a guessed state."""
+    report = _good_report()
+    for scenario in ("nominal", "pv10"):
+        row = _good_row(scenario=scenario, battery_modes="demand,charge")
+        row["mode_minutes"] = {"demand": 5, "charge": 20}
+        report["preview"][scenario] = [row]
+
+    view = build_car_charging_plan_view(_native_plan(), report)
+    assert view.get("plan_unavailable") is True
+    assert view["rows"] == []
+
+
+def test_mixed_demand_and_hold_modes_remain_explicit_without_a_charge_limit():
+    """A mixed hold row is not collapsed to HoldChrg or given a charge limit."""
+    report = _good_report()
+    for scenario in ("nominal", "pv10"):
+        row = _good_row(scenario=scenario, battery_modes="demand,hold", battery_start_percent=50.0, battery_end_percent=50.0, battery_min_percent=50.0)
+        row["mode_minutes"] = {"demand": 10, "hold": 20}
+        report["preview"][scenario] = [row]
+
+    view = build_car_charging_plan_view(_native_plan(), report)
+    row = view["rows"][0]
+    assert row["state"] == "Mixed"
+    assert row["state_text"] == "Demand 10m + HoldChrg 20m"
+    assert row["show_limit"] == ""
+    assert row["state_color"] == "#FFFFFF"
+
+
 def test_build_car_planning_plan_view_state_text_hold_includes_duration():
     """Keep the original HoldChrg label and colour rather than a duration label."""
     report = _good_report()
@@ -980,6 +1097,12 @@ def run_car_planning_single_table_tests(base):
         test_build_car_planning_plan_view_car_planning_soc_end_percent_nominal,
         test_build_car_planning_plan_view_state_text_demand_includes_minutes,
         test_build_car_planning_plan_view_state_text_charge_shows_100_limit,
+        test_build_car_planning_plan_view_mixed_modes_show_ordered_durations_and_limit_bound,
+        test_interleaved_mixed_modes_are_reported_as_totals_not_a_timeline,
+        test_mixed_mode_durations_must_match_between_paired_scenarios,
+        test_html_plan_and_api_preserve_mixed_modes_in_the_joint_state_and_limit_cells,
+        test_mixed_modes_without_matching_durations_are_unavailable,
+        test_mixed_demand_and_hold_modes_remain_explicit_without_a_charge_limit,
         test_build_car_planning_plan_view_state_text_hold_includes_duration,
         test_build_car_planning_plan_view_pv_load_sums_are_real_5min_kwh,
         test_build_car_planning_plan_view_grid_peaks_preserved,

@@ -438,8 +438,23 @@ def _paired_preview(report, now):
                 "charge,hold,demand",
             ):
                 return None
+            modes = row["battery_modes"].split(",")
+            if len(modes) > 1:
+                mode_minutes = row.get("mode_minutes")
+                if not isinstance(mode_minutes, dict) or set(mode_minutes) != set(modes):
+                    return None
+                durations = [mode_minutes.get(mode) for mode in modes]
+                if not all(_is_finite(duration) and duration > 0 and duration % 5 == 0 for duration in durations):
+                    return None
+                if sum(durations) != row["minutes"]:
+                    return None
         if (left["start"], left["end"]) != (right["start"], right["end"]) or (previous is not None and previous != _parse_iso(left["start"])):
             return None
+        left_modes = left["battery_modes"].split(",")
+        right_modes = right["battery_modes"].split(",")
+        if len(left_modes) > 1 or len(right_modes) > 1:
+            if left["battery_modes"] != right["battery_modes"] or left["mode_minutes"] != right["mode_minutes"]:
+                return None
         if abs(left.get("charge_target_percent", 100) - right.get("charge_target_percent", 100)) > 0.0001:
             return None
         previous = _parse_iso(left["end"])
@@ -505,15 +520,25 @@ def build_car_charging_plan_view(native_plan, report, now=None):
         start = _parse_iso(row["start"])
         midnight = _parse_iso(view.get("time")) or start.replace(hour=0, minute=0, second=0, microsecond=0)
         names = row["battery_modes"].split(",")
-        # Keep the established table's state labels, arrows and colour rules.
-        # Coarse mixed rows use its existing asterisk/reason convention.
+        # Keep the established table's state labels and colour rules.
         change = row["battery_end_percent"] - row["battery_start_percent"]
         soc_sym = "&rarr;" if abs(change) < 0.15 else ("&nearr;" if change > 0 else "&searr;")
-        state = "Chrg" if "charge" in names else ("HoldChrg" if "hold" in names else "Demand")
-        state_text = "Chrg&nearr;" if state == "Chrg" else ("HoldChrg&rarr;" if state == "HoldChrg" else soc_sym)
         if len(names) > 1:
-            state_text += "*"
-        reasons = [{"code": "mixed_slot_states", "params": {"states": ", ".join(name.capitalize() for name in names)}}] if len(names) > 1 else []
+            mode_labels = {"demand": "Demand", "hold": "HoldChrg", "charge": "Chrg"}
+            mode_minutes = row["mode_minutes"]
+            state = "Mixed"
+            state_text = " + ".join("{} {}m".format(mode_labels[name], int(mode_minutes[name])) for name in names)
+            reasons = []
+            if "charge" in names:
+                charge_limit = round(row.get("charge_target_percent", 100))
+                show_limit = "Chrg ≤{}".format(charge_limit)
+            else:
+                show_limit = ""
+        else:
+            state = "Chrg" if "charge" in names else ("HoldChrg" if "hold" in names else "Demand")
+            state_text = "Chrg&nearr;" if state == "Chrg" else ("HoldChrg&rarr;" if state == "HoldChrg" else soc_sym)
+            reasons = []
+            show_limit = str(round(row.get("charge_target_percent", 100))) if "charge" in names else ""
         rate = row.get("import_rate")
         threshold = native.get("import_cost_threshold")
         rate_color = "#FFFFFF"
@@ -541,7 +566,7 @@ def build_car_charging_plan_view(native_plan, report, now=None):
                 "state": state,
                 "state_text": state_text,
                 "state_color": "#3AEE85" if state == "Chrg" else ("#34DBEB" if state == "HoldChrg" else "#FFFFFF"),
-                "show_limit": str(round(row.get("charge_target_percent", 100))) if "charge" in names else "",
+                "show_limit": show_limit,
                 "reasons": reasons,
                 "split": False,
                 "pv_forecast": round(row["pv_kwh"], 2),

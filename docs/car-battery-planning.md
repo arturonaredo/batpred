@@ -72,7 +72,7 @@ as session evidence remain values of their documented flat argument.
 | `car_charging_battery_pause_soc` / `car_charging_battery_restart_soc` | Domestic-battery EV pause/restart thresholds; defaults 15 / 25 percent. |
 | `car_charging_min_off_minutes` | Minimum EV OFF interval; default 10 minutes. |
 | `car_charging_priority` | `cost` (default), `asap`, `now`, `solar`, or a watched HA dropdown. |
-| `car_charging_self_consumption_first` | Default false; with shared grid support, first try a complete continuous candidate using native Demand in the current step. Both native replays must pass; otherwise a separately validated ordinary candidate may be used. Not a ban on necessary import. |
+| `car_charging_self_consumption_first` | Default false; with shared grid support, first try a complete continuous candidate using native Demand in the current step. COST also compares the separately validated ordinary candidate and keeps Demand on cost ties; a feasible Demand step must not repeatedly defer cheaper charging now. Both native replays must pass. Other priorities retain the Demand-first fallback. Not a ban on economically useful import. |
 | `battery_terminal_min_soc` | End-of-horizon domestic floor; defaults to the configured reserve. |
 | `car_charging_search_beam_width` | Bounded search width; default 128, maximum 512. |
 | `car_charging_soc` / `car_charging_soc_unit` | Current EV SOC mapping; `%` by default, or explicitly configured `kWh`. The native fetch path uses the same units. Existing explicit manual EV SOC retains precedence, without substituting for physical execution evidence. |

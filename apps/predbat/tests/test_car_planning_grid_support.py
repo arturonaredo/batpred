@@ -8,7 +8,7 @@ from unittest.mock import patch
 from types import SimpleNamespace
 
 from car_charging_solver import BatteryConfig, EVConfig, SiteConfig, PlannerConfig, Slot, _segment, plan
-from car_charging_plan import _options, _continuous_grid_support_shadow, _native_windows, _replay, evaluate_car_charging
+from car_charging_plan import _options, _continuous_grid_support_shadow, _native_windows, _priority_block_starts, _replay, evaluate_car_charging
 from prediction import Prediction
 from tests.test_car_planning_native import _setup, _controls, _set_entity
 from tests.test_infra import reset_rates
@@ -133,6 +133,157 @@ def test_grid_support_continuous_candidate_is_paired(base):
     assert rejected is None and all(not attempt["native_passed"] for attempt in attempts)
 
 
+def _priority_test_base(rates=None, solar_kwh=0):
+    """Build a compact rate/PV view for priority-window shortlist tests."""
+    rates = rates or {minute: 10.0 for minute in range(1000)}
+    return SimpleNamespace(
+        car_charging_rate=[6.0],
+        inverter_hybrid=False,
+        inverter_limit=20.0,
+        inverter_loss=1.0,
+        load_minutes_step={minute: 0.0 for minute in range(1000)},
+        load_minutes_step10={minute: 0.0 for minute in range(1000)},
+        minutes_now=0,
+        pv_ac_limit=0.0,
+        pv_forecast_minute_step={minute: solar_kwh for minute in range(1000)},
+        pv_forecast_minute10_step={minute: solar_kwh for minute in range(1000)},
+        rate_export={minute: 0.0 for minute in range(1000)},
+        rate_import=rates,
+    )
+
+
+def test_cost_priority_shortlist_retains_baseline_and_samples_ties():
+    """The prior twelve cost starts remain while twelve stratified ties extend coverage."""
+    base = _priority_test_base()
+    options = {"ev_charging_priority": "cost", "initially_on": False}
+
+    selected = _priority_block_starts(base, options, first=0, last=775, duration=130)
+    starts = [start for start, _ in selected]
+
+    assert starts[:12] == list(range(0, 60, 5))
+    assert 710 in starts
+    assert len(starts) == len(set(starts))
+    assert len(starts) <= 24
+
+
+def test_cost_priority_shortlist_keeps_cheaper_starts_and_other_priorities():
+    """Every strictly cheaper candidate survives without changing non-cost priorities."""
+    rates = {minute: 10.0 for minute in range(1000)}
+    cheaper_rates = {0: 1.0, 5: 2.0, 10: 3.0, 15: 4.0}
+    rates.update(cheaper_rates)
+    base = _priority_test_base(rates)
+    cost_options = {"ev_charging_priority": "cost", "initially_on": False}
+    selected = _priority_block_starts(base, cost_options, first=0, last=775, duration=5)
+    starts = [start for start, _ in selected]
+
+    assert set(cheaper_rates).issubset(starts)
+    assert len(starts) == len(set(starts))
+    assert len(starts) <= 24
+    assert _priority_block_starts(base, {"ev_charging_priority": "now", "initially_on": False}, 0, 60, 5) == [(0, "immediate")]
+    assert _priority_block_starts(base, {"ev_charging_priority": "asap", "initially_on": False}, 0, 60, 5) == [(start, "deadline_or_no_opportunity") for start in range(0, 60, 5)]
+    assert _priority_block_starts(_priority_test_base(solar_kwh=1.0), {"ev_charging_priority": "solar", "initially_on": False}, 0, 60, 5) == [(start, "solar_surplus_only") for start in range(0, 60, 5)]
+
+
+def test_cost_priority_tie_search_samples_late_candidate():
+    """Equal EV-cost starts are spread so a later coupled-cost winner stays in the bounded search."""
+    base = SimpleNamespace(
+        car_charging_limit=[13.0],
+        car_charging_loss=1.0,
+        car_charging_rate=[6.0],
+        minutes_now=0,
+        rate_export={minute: 0.0 for minute in range(1000)},
+        rate_import={minute: 10.0 for minute in range(1000)},
+    )
+    options = {
+        "arrival": 0,
+        "control_model": "deye_solarman",
+        "deadline": 905,
+        "ev_charging_priority": "cost",
+        "ev_soc": 0.0,
+        "grid_charge_support_w": 6000,
+        "house_only": False,
+        "initial_off_minutes": 10,
+        "initially_on": False,
+        "mode": "shadow",
+        "off_minutes": 10,
+        "self_consumption_first": False,
+    }
+
+    def build_candidate(_, trial):
+        """Make the omitted late block cheaper while keeping every trial structurally valid."""
+        block = trial.get("ev_continuous_block")
+        cost = 0.0 if block and block[0] == 710 else 10.0 if block else 100.0
+        result = SimpleNamespace(
+            actions=[SimpleNamespace(battery_mode="demand", discharge_limit_kw=None)],
+            status="feasible",
+            total_cost=cost,
+        )
+        return result, []
+
+    def replay_candidate(_, trial, result, slots):
+        """Treat fixed blocks as paired-safe; the unrestricted fallback remains rejected."""
+        passed = trial.get("ev_continuous_block") is not None
+        checks = {name: {"passed": passed} for name in ("nominal", "pv10")}
+        return ([], [], []), checks
+
+    with (
+        patch("car_charging_plan._solar_surplus_kwh", return_value=0),
+        patch("car_charging_plan.build_candidate", side_effect=build_candidate),
+        patch("car_charging_plan._replay_candidate", side_effect=replay_candidate),
+    ):
+        chosen, attempts = _continuous_grid_support_shadow(base, options)
+
+    assert chosen is not None and chosen[0].total_cost == 0.0
+    assert any(attempt.get("selected") and attempt.get("start_offset") == 710 for attempt in attempts)
+    assert len([attempt for attempt in attempts if "start_offset" in attempt]) <= 24
+
+
+def test_cost_priority_compares_safe_initial_demand_with_ordinary_candidate():
+    """A feasible current Demand step must not hide cheaper, paired-safe charging now."""
+    base = _priority_test_base()
+    base.car_charging_limit = [13.0]
+    base.car_charging_loss = 1.0
+    options = {
+        "arrival": 0,
+        "control_model": "deye_solarman",
+        "deadline": 905,
+        "ev_charging_priority": "cost",
+        "ev_soc": 0.0,
+        "grid_charge_support_w": 6000,
+        "house_only": False,
+        "initial_off_minutes": 10,
+        "initially_on": False,
+        "mode": "apply",
+        "off_minutes": 10,
+        "self_consumption_first": True,
+    }
+
+    def build(_, trial):
+        constrained = trial.get("initial_demand_only", False)
+        mode = "demand" if constrained else "charge"
+        cost = 2.0 if constrained else ordinary_cost
+        if "ev_continuous_block" not in trial:
+            cost = 100.0
+        return SimpleNamespace(actions=[SimpleNamespace(battery_mode=mode, discharge_limit_kw=None)], status="feasible", total_cost=cost), []
+
+    for ordinary_safe, ordinary_cost, expected_mode, expected_cost in ((True, 1.0, "charge", 1.0), (True, 2.0, "demand", 2.0), (False, 1.0, "demand", 2.0)):
+
+        def replay(_, trial, result, slots):
+            safe = trial.get("initial_demand_only", False) or ordinary_safe
+            return ([], [], []), {"nominal": {"passed": True}, "pv10": {"passed": safe}}
+
+        with (
+            patch("car_charging_plan._priority_block_starts", return_value=[(0, "coupled_cost")]),
+            patch("car_charging_plan.build_candidate", side_effect=build),
+            patch("car_charging_plan._replay_candidate", side_effect=replay),
+        ):
+            chosen, attempts = _continuous_grid_support_shadow(base, options)
+
+        assert chosen is not None and chosen[0].total_cost == expected_cost
+        assert chosen[0].actions[0].battery_mode == expected_mode
+        assert len([attempt for attempt in attempts if "start_offset" in attempt]) == 2
+
+
 def test_grid_support_replay_rejects_hidden_reserve_tail(base):
     """The independent bridge uses exact intra-step peaks even without companion import diagnostics."""
     _support_fixture(base)
@@ -254,6 +405,10 @@ def run_car_planning_grid_support_tests(base):
         test()
     test_grid_support_options_fail_closed(base)
     test_grid_support_continuous_candidate_is_paired(base)
+    test_cost_priority_shortlist_retains_baseline_and_samples_ties()
+    test_cost_priority_shortlist_keeps_cheaper_starts_and_other_priorities()
+    test_cost_priority_tie_search_samples_late_candidate()
+    test_cost_priority_compares_safe_initial_demand_with_ordinary_candidate()
     test_grid_support_replay_rejects_hidden_reserve_tail(base)
     test_grid_support_domestic_targets_follow_solar(base)
     test_initial_demand_is_a_scoped_search_constraint()
