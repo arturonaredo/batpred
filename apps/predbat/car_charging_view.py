@@ -209,6 +209,10 @@ def build_replay_preview(base, pred, result, slots, scenario):
     row_minutes = getattr(base, "plan_preview_row_minutes", 30)
     if type(row_minutes) is not int or row_minutes not in (5, 15, 30, 60):
         return []
+    plan_hours = getattr(base, "forecast_plan_hours", None)
+    if plan_hours is not None and (not _is_finite(plan_hours) or not 8 <= plan_hours <= 96 or plan_hours % 1):
+        return []
+    display_minutes = plan_hours * 60 if plan_hours is not None else horizon
     rows = []
     previous_key = None
     for position, (action, slot) in enumerate(zip(actions, slots)):
@@ -230,7 +234,7 @@ def build_replay_preview(base, pred, result, slots, scenario):
         start_soc = pred.predict_soc[minute] * 100 / soc_max
         end_soc = (final_soc if minute + 5 == horizon else pred.predict_soc[minute + 5]) * 100 / soc_max
         peak = max(0.0, pred.predict_grid_power[_format_iso(base, absolute)] * 1000 + 0.5)
-        key = (absolute // row_minutes, action.battery_mode, target, action.ev_action, getattr(slot, "import_price", None), getattr(slot, "export_price", None))
+        key = (absolute // row_minutes, minute >= display_minutes, action.battery_mode, target, action.ev_action, getattr(slot, "import_price", None), getattr(slot, "export_price", None))
         if key != previous_key:
             rows.append(
                 {
@@ -505,6 +509,19 @@ def build_car_charging_plan_view(native_plan, report, now=None):
     is_applied = status == "applied"
     is_blocked = status == "apply_blocked"
     paired = _paired_preview(report, now) if status not in (None, "disabled") else None
+    # Validate the complete paired replay before limiting the visible horizon.
+    # The preview builder splits at this exact boundary, preserving real SOC,
+    # energy and cost endpoints instead of interpolating a partial row.
+    if paired is not None and "forecast_plan_hours" in report:
+        plan_hours = report["forecast_plan_hours"]
+        if not _is_finite(plan_hours) or not 8 <= plan_hours <= 96 or plan_hours % 1:
+            paired = None
+        else:
+            cutoff = _parse_iso(paired[0][0]["start"]) + timedelta(hours=plan_hours)
+            if any(_parse_iso(row["start"]) < cutoff < _parse_iso(row["end"]) for row in paired[0]):
+                paired = None
+            else:
+                paired = tuple([row for row in rows if _parse_iso(row["end"]) <= cutoff] for rows in paired)
     applied_fresh = _applied_display_allowed(report, now, paired)
     if applied_fresh:
         view["plan_simulation"] = False

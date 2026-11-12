@@ -1111,6 +1111,7 @@ def evaluate_car_charging(base, publish=True):
             "grid_charge_support_w": options["grid_charge_support_w"],
             "ev_charging_priority": options["ev_charging_priority"],
             "battery_min_window_minutes": options["battery_min_window_minutes"],
+            "forecast_plan_hours": getattr(base, "forecast_plan_hours", 48),
             "battery_window_initial_mode": options["initial_window_mode"],
             "battery_window_remaining_minutes": options["initial_window_remaining_minutes"],
             "battery_window_policy": "minimum_mode_duration_no_silent_relaxation_safety_gates_take_precedence",
