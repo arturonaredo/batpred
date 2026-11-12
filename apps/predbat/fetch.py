@@ -5205,11 +5205,13 @@ class Fetch:
             if coverage_end <= anchor or anchor not in forecast or coverage_end not in forecast:
                 raise ValueError("forecast does not cover a future interval")
             anchor_value = forecast[anchor]
-            end_value = forecast[coverage_end]
+            # minute_data pads the exact final timestamp with zero; use the validated
+            # source endpoint instead, otherwise a short forecast resets cumulative load.
+            end_value = parsed[-1][1]
             for minute in list(forecast):
                 if minute < anchor:
                     forecast[minute] = 0.0
-                elif minute <= coverage_end:
+                elif minute < coverage_end:
                     forecast[minute] = max(forecast[minute] - anchor_value, 0.0)
                 else:
                     forecast[minute] = max(end_value - anchor_value, 0.0)

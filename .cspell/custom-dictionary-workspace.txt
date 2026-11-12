@@ -509,6 +509,7 @@ nonboolean
 nonfeasible
 nonfinal
 nonfinite
+nonmonotonic
 noopener
 nord
 nordpool
@@ -731,6 +732,7 @@ Strømligning
 suback
 subclassing
 submessage
+subminute
 substep
 sunspec
 sunsynk

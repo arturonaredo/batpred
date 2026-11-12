@@ -16,7 +16,6 @@ from config import APPS_SCHEMA
 from tests.test_load_forecast_history import build_load_minutes
 from utils import is_debug_excluded_key
 
-
 FORECAST_ENTITY = "sensor.space_heat_forecast"
 ENERGY_ENTITY = "sensor.heating_energy_total"
 ACTIVE_ENTITY = "binary_sensor.space_heating_active"
@@ -294,11 +293,7 @@ def test_load_forecast_replaces(my_predbat):
         failed = True
     accepted_log = "\n".join(my_predbat.load_forecast_test_logs)
     accepted_evidence_lines = list(my_predbat.load_forecast_test_logs)
-    if (
-        "Load forecast replacement binding summary: requested_pairs=1 accepted_pairs=1 fallback_pairs=0" not in accepted_log
-        or "counter_history_covered_minutes=21600" not in accepted_log
-        or "active_history_covered_minutes=21600" not in accepted_log
-    ):
+    if "Load forecast replacement binding summary: requested_pairs=1 accepted_pairs=1 fallback_pairs=0" not in accepted_log or "counter_history_covered_minutes=21600" not in accepted_log or "active_history_covered_minutes=21600" not in accepted_log:
         print("ERROR: accepted replacement log is missing aggregate binding or exact 15-day history coverage: {}".format(accepted_log))
         failed = True
     application_log = next((line for line in my_predbat.load_forecast_test_logs if "Load forecast replacement application:" in line), "")
@@ -326,17 +321,10 @@ def test_load_forecast_replaces(my_predbat):
     counter_start_minute = int((now_utc - counter_start).total_seconds() / 60)
     counter_end_minute = int((now_utc - counter_end).total_seconds() / 60)
     subminute_energy = subminute_replacements[0]["energy_minutes"] if subminute_replacements else None
-    preserved_energy = (
-        subminute_energy.get(counter_end_minute, 0.0) - subminute_energy.get(counter_start_minute, 0.0)
-        if subminute_energy
-        else 0.0
-    )
+    preserved_energy = subminute_energy.get(counter_end_minute, 0.0) - subminute_energy.get(counter_start_minute, 0.0) if subminute_energy else 0.0
     subminute_future = _forecast_step(my_predbat, subminute_combined, my_predbat.minutes_now)
     if len(subminute_replacements) != 1 or abs(preserved_energy - 0.003) > 0.0001 or abs(subminute_future - 0.009) > 0.0003:
-        print(
-            "ERROR: 20-second counter readings in one minute must retain 0.003 kWh and allow safe replacement; "
-            "accepted={} preserved={} future_step={}".format(len(subminute_replacements), preserved_energy, subminute_future)
-        )
+        print("ERROR: 20-second counter readings in one minute must retain 0.003 kWh and allow safe replacement; " "accepted={} preserved={} future_step={}".format(len(subminute_replacements), preserved_energy, subminute_future))
         failed = True
 
     # The oldest day sampled for tomorrow at 00:00 is 15 days plus the current 12-hour offset ago.
@@ -364,11 +352,7 @@ def test_load_forecast_replaces(my_predbat):
     _run_pair(my_predbat, now_utc, history_days=16, active_history_days=15, load_history_days=16)
     active_extent_replacements = getattr(my_predbat, "__load_forecast_replacements", [])
     oldest_sample_minute = 15 * 24 * 60 + my_predbat.minutes_now
-    if (
-        len(active_extent_replacements) != 1
-        or active_extent_replacements[0]["energy_valid_minutes"].get(oldest_sample_minute, 0) != 1
-        or active_extent_replacements[0]["active_minutes"].get(oldest_sample_minute, 0) != 0
-    ):
+    if len(active_extent_replacements) != 1 or active_extent_replacements[0]["energy_valid_minutes"].get(oldest_sample_minute, 0) != 1 or active_extent_replacements[0]["active_minutes"].get(oldest_sample_minute, 0) != 0:
         print("ERROR: 15-day active history must remain unknown at a 15.5-day counter sample")
         failed = True
 
@@ -378,10 +362,7 @@ def test_load_forecast_replaces(my_predbat):
     transition_replacements = getattr(my_predbat, "__load_forecast_replacements", [])
     transition_bucket = my_predbat.sample_load_history_bucket(1680, None, 999999, replacement_mask=(True,))
     if len(transition_replacements) != 1 or not transition_bucket or abs(transition_bucket[2] - 0.0024) > 0.0002:
-        print(
-            "ERROR: same-minute active transition must retain one minute of meter energy; "
-            "accepted={} bucket={}".format(len(transition_replacements), transition_bucket)
-        )
+        print("ERROR: same-minute active transition must retain one minute of meter energy; " "accepted={} bucket={}".format(len(transition_replacements), transition_bucket))
         failed = True
 
     # Exact duplicate recorder timestamps remain invalid even though distinct sub-minute rows are accepted.
@@ -431,6 +412,16 @@ def test_load_forecast_replaces(my_predbat):
         print("ERROR: partial coverage expected 0.009 covered / 0.008 uncovered, got {} / {}".format(covered, uncovered))
         failed = True
 
+    # PredHeat publishes a 48-hour series whose last timestamp is one sample before the
+    # planning horizon. Preserve that final cumulative point and hold it flat afterwards.
+    short_forecast, _, _ = _run_pair(my_predbat, now_utc, forecast_hours=47 + 50 / 60)
+    horizon_end = my_predbat.minutes_now + my_predbat.forecast_minutes
+    tail_energy = short_forecast.get(horizon_end, 0.0) - short_forecast.get(my_predbat.minutes_now, 0.0)
+    integrated_energy = sum(my_predbat.get_from_incrementing(short_forecast, minute, backwards=False) for minute in range(my_predbat.minutes_now, horizon_end))
+    if abs(tail_energy - 2.296) > 0.000001 or abs(integrated_energy - tail_energy) > 0.000001:
+        print("ERROR: the last forecast sample must remain flat without reset or duplicated energy, tail={} integrated={}".format(tail_energy, integrated_energy))
+        failed = True
+
     # Stale, malformed, or history-incomplete pairs must use the untouched historical forecast.
     coverage_fallback_evidence = ""
     for label, options in (
@@ -454,11 +445,7 @@ def test_load_forecast_replaces(my_predbat):
         if label == "active-state history short by one day":
             fallback_log = "\n".join(my_predbat.load_forecast_test_logs)
             coverage_fallback_evidence = fallback_log
-            if (
-                "active-state history does not cover the complete automatic-history window" not in fallback_log
-                or "requested_pairs=1 accepted_pairs=0 fallback_pairs=1" not in fallback_log
-                or "status=fallback_full_history" not in fallback_log
-            ):
+            if "active-state history does not cover the complete automatic-history window" not in fallback_log or "requested_pairs=1 accepted_pairs=0 fallback_pairs=1" not in fallback_log or "status=fallback_full_history" not in fallback_log:
                 print("ERROR: the 15-day active-history fallback reason is not visible in logs")
                 failed = True
 
@@ -491,10 +478,6 @@ def test_load_forecast_replaces(my_predbat):
             if "Load forecast replacement binding summary:" in line or "Load forecast replacement application:" in line:
                 print("EVIDENCE: {}".format(line))
         for line in coverage_fallback_evidence.splitlines():
-            if (
-                "Rejecting paired load forecast" in line
-                or "Load forecast replacement binding summary:" in line
-                or "Load forecast replacement application:" in line
-            ):
+            if "Rejecting paired load forecast" in line or "Load forecast replacement binding summary:" in line or "Load forecast replacement application:" in line:
                 print("EVIDENCE: {}".format(line))
     return failed
