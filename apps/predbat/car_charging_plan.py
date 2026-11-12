@@ -860,6 +860,8 @@ def _solar_surplus_kwh(base, minute):
 
 def _priority_block_starts(base, options, first, last, duration):
     """Rank bounded opportunities, with explicit deadline fallback rather than a silent delay."""
+    shortlist_limit = 12
+    tied_shortlist_limit = 24
     priority = options.get("ev_charging_priority", "cost")
     if options["initially_on"]:
         return [(0, "active_continuation")]
@@ -882,7 +884,7 @@ def _priority_block_starts(base, options, first, last, duration):
         preferred = preferred[:12]
         tried = {start for start, _ in preferred}
         return preferred + [(start, "deadline_or_no_opportunity") for start in starts if start not in tried][:12]
-    # Include PV opportunity cost when selecting the twelve coupled searches.
+    # Include PV opportunity cost when selecting the bounded coupled-search shortlist.
     # The final ranking still uses the whole-house solver objective and both replays.
     ranked = []
     for start in starts:
@@ -892,7 +894,27 @@ def _priority_block_starts(base, options, first, last, duration):
             absolute = base.minutes_now + minute
             estimate += (ev_step - solar) * base.rate_import[absolute] + solar * base.rate_export[absolute]
         ranked.append((estimate, start))
-    return [(start, "coupled_cost") for _, start in sorted(ranked)[:12]]
+    ranked.sort()
+    if len(ranked) <= shortlist_limit:
+        selected = ranked
+    else:
+        selected = ranked[:shortlist_limit]
+        cutoff = selected[-1][0]
+        selected_starts = {start for _, start in selected}
+        cutoff_ties = [entry for entry in ranked if abs(entry[0] - cutoff) <= 1e-9]
+        if len(cutoff_ties) <= tied_shortlist_limit:
+            sampled_ties = cutoff_ties
+        else:
+            # Start with the previous 24-way spread, then preserve the old twelve
+            # and stratify only the sampled ties that add new coverage.
+            indices = [round(index * (len(cutoff_ties) - 1) / (tied_shortlist_limit - 1)) for index in range(tied_shortlist_limit)]
+            sampled_ties = [cutoff_ties[index] for index in indices]
+        extras = [entry for entry in sampled_ties if entry[1] not in selected_starts]
+        if len(extras) > shortlist_limit:
+            indices = [math.floor(index * (len(extras) - 1) / (shortlist_limit - 1)) for index in range(shortlist_limit)]
+            extras = [extras[index] for index in indices]
+        selected.extend(extras)
+    return [(start, "coupled_cost") for _, start in sorted(selected)]
 
 
 def _continuous_grid_support_shadow(base, options):
@@ -900,8 +922,9 @@ def _continuous_grid_support_shadow(base, options):
 
     This is an explicit continuity preference, not a calibrated restart penalty or
     global cost optimum. Rank valid blocks by the existing conservative solver
-    objective (including cycle cost and terminal energy). COST also compares an
-    unrestricted envelope schedule, so continuity cannot hide a cheaper valid plan.
+    objective (including cycle cost and terminal energy). COST compares both the
+    preferred current Demand step and the ordinary candidate, then an unrestricted
+    envelope schedule, so neither preference can hide a cheaper validated plan.
     An active relay tries continuation without inventing a new OFF interval.
     ASAP tries nearby solar, then the next cheaper band, then an earlier safe
     deadline path. SOLAR reserves conservative surplus and never falls back to grid.
@@ -931,11 +954,13 @@ def _continuous_grid_support_shadow(base, options):
                 _validate_candidate_modes(options, result)
                 windows, checks = _replay_candidate(base, trial, result, slots)
                 passed = all(check["passed"] for check in checks.values())
-                if passed and (best is None or result.total_cost < best[0].total_cost):
+                if passed and (best is None or result.total_cost < best[0].total_cost - 1e-9):
                     best = result, slots, windows, checks
                     selected = len(attempts)
             attempts.append({"start_offset": start, "end_offset": start + duration, "solver_status": result.status, "native_passed": passed, "initial_demand_only": initial_demand, "priority_reason": reason})
-            if passed:
+            # Demand-first is a tie preference for COST, not permission to defer
+            # economically useful charging again on every five-minute replan.
+            if passed and (priority != "cost" or not initial_demand):
                 break
         if priority != "cost" and passed:
             break

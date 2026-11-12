@@ -18,8 +18,10 @@ avoids mid-horizon peak-band imports. This module guards the new behaviour:
   optimal schedule for tiny (≤ 6 slot) cases.
 """
 
+from dataclasses import replace
 from itertools import product
 import unittest
+from unittest.mock import patch
 
 from car_charging_solver import (
     BATTERY_DEMAND,
@@ -168,6 +170,69 @@ class PruneBucketHeadTests(unittest.TestCase):
 class EconomicSearchTests(unittest.TestCase):
     """Real search comparisons with the synthetic inputs."""
 
+    @staticmethod
+    def _paired_band_inputs(intervening_peak):
+        """Use one low-SOC battery, EV target/deadline and cap for paired band cases."""
+        slots = []
+        for index in range(72):
+            if intervening_peak:
+                price = 11.2 if index < 12 or 36 <= index < 48 else 19.1 if index < 36 else 8.1
+                load_kw = 1.2 if index < 12 or 36 <= index < 48 else 1.8 if index < 36 else 0.3
+            else:
+                price = 11.2 if index < 48 else 8.1
+                load_kw = 1.2 if index < 48 else 0.3
+            slots.append(Slot(index, index * 5, 5, load_kw * 5 / 60, 0, price, 0))
+        ev = _vehicle(
+            battery_kwh=40,
+            start_soc_kwh=0.5,
+            stop_soc_kwh=2.5,
+            rate_kw=6.77,
+            efficiency=0.92,
+            deadline_min=360,
+            availability=tuple(range(48, 72)),
+            pause_battery_percent=0,
+            restart_battery_percent=0,
+            min_off_minutes=10,
+        )
+        battery = _battery(
+            capacity_kwh=32.154,
+            initial_kwh=3.215,
+            reserve_kwh=3.215,
+            max_charge_kw=3,
+            max_discharge_kw=3.7,
+            charge_efficiency=0.95,
+            discharge_efficiency=0.97,
+            end_min_kwh=4.0,
+            cycle_cost_per_kwh=0.2,
+            terminal_value_per_kwh=0.1,
+        )
+        site = SiteConfig(import_cap_kw=7.5, export_cap_kw=0, load_port_cap_kw=16)
+        config = PlannerConfig(beam_width=128, allowed_battery_modes=(BATTERY_DEMAND, BATTERY_CHARGE), economic_diversity=True)
+        return tuple(slots), ev, battery, site, config
+
+    @staticmethod
+    def _plan_without_early_charge(slots, ev, battery, site, config, cutoff_minute):
+        """Solve the matched counterfactual with only pre-cutoff grid-charge transitions removed."""
+        original_resolve = _resolve_action
+
+        def resolve_without_early_charge(slot, ev_on, mode, node, battery_config, ev_config, site_config):
+            if slot.start_min < cutoff_minute and mode == BATTERY_CHARGE:
+                return None
+            return original_resolve(slot, ev_on, mode, node, battery_config, ev_config, site_config)
+
+        with patch("car_charging_solver._resolve_action", side_effect=resolve_without_early_charge):
+            return plan(slots, ev, battery, site, config)
+
+    def _assert_paired_constraints(self, result, ev, battery, site):
+        """Check the paired economic results meet unchanged terminal and power gates."""
+        self.assertEqual(result.status, STATUS_FEASIBLE)
+        self.assertTrue(result.diagnostics.ev_stop_target_met)
+        self.assertGreaterEqual(result.diagnostics.final_ev_soc_kwh, ev.stop_soc_kwh - 1e-9)
+        self.assertGreaterEqual(result.diagnostics.final_battery_soc_kwh, battery.end_min_kwh - 1e-9)
+        self.assertGreaterEqual(min(result.battery_soc_trace), battery.reserve_kwh - 1e-9)
+        peak_import_kw = max(segment.grid_import_kw for action in result.actions for segment in action.segments)
+        self.assertLessEqual(peak_import_kw, site.import_cap_kw + 1e-9)
+
     def test_bounded_search_matches_positive_cost_oracle_and_uses_cheap_tail(self):
         """An actual price transition moves required imports into the cheaper slots."""
         slots = tuple(Slot(i, i * 5, 5, 0.03, 0, 19.1 if i < 3 else 8.1, 0) for i in range(6))
@@ -233,6 +298,77 @@ class EconomicSearchTests(unittest.TestCase):
         self.assertEqual(cheap.status, STATUS_FEASIBLE)
         # Cheap-band weighted cost is at most half of peak-band weighted cost.
         self.assertLess(cheap.total_cost, peak.total_cost / 2)
+
+    def test_waits_for_cheap_band_without_a_profitable_peak(self):
+        """An 8.1-cent overnight band beats storing energy at 11.2 when no peak intervenes."""
+        slots, ev, battery, site, config = self._paired_band_inputs(intervening_peak=False)
+        result = plan(slots, ev, battery, site, config)
+        no_precharge = self._plan_without_early_charge(slots, ev, battery, site, config, cutoff_minute=240)
+
+        self._assert_paired_constraints(result, ev, battery, site)
+        self._assert_paired_constraints(no_precharge, ev, battery, site)
+        self.assertAlmostEqual(result.total_cost, no_precharge.total_cost, places=6)
+        self.assertEqual(sum(action.battery_charge_kwh for action in result.actions[:48]), 0)
+        self.assertGreater(sum(action.battery_charge_kwh for action in result.actions[48:]), 0)
+
+    def test_peak_avoiding_charge_then_cheap_band_recharge(self):
+        """Buying at 11.2 beats 19.1 peak imports; 8.1 restores the terminal SOC."""
+        slots, ev, battery, site, config = self._paired_band_inputs(intervening_peak=True)
+        result = plan(slots, ev, battery, site, config)
+        wait_for_cheap = self._plan_without_early_charge(slots, ev, battery, site, config, cutoff_minute=240)
+
+        self._assert_paired_constraints(result, ev, battery, site)
+        self._assert_paired_constraints(wait_for_cheap, ev, battery, site)
+        self.assertLess(result.total_cost, wait_for_cheap.total_cost)
+        self.assertGreater(sum(action.battery_charge_kwh for action in result.actions[:12]), 0)
+        self.assertGreater(sum(action.battery_discharge_kwh for action in result.actions[12:36]), 0)
+        self.assertGreater(sum(action.battery_charge_kwh for action in result.actions[48:]), 0)
+
+    def test_apply_six_kw_waits_for_cheap_band_without_a_profitable_peak(self):
+        """Apply ordering with grid support waits when early storage has no price benefit."""
+        slots, ev, battery, site, config = self._paired_band_inputs(intervening_peak=False)
+        site = replace(site, import_cap_kw=6, charge_import_cap_kw=6)
+        config = replace(config, economic_diversity=False)
+        result = plan(slots, ev, battery, site, config)
+        wait = self._plan_without_early_charge(slots, ev, battery, site, config, cutoff_minute=240)
+
+        self._assert_paired_constraints(result, ev, battery, site)
+        self._assert_paired_constraints(wait, ev, battery, site)
+        self.assertAlmostEqual(result.total_cost, wait.total_cost, places=6)
+        self.assertEqual(sum(action.battery_charge_kwh for action in result.actions[:48]), 0)
+        self.assertGreater(sum(action.battery_charge_kwh for action in result.actions[48:]), 0)
+
+    def test_apply_six_kw_prepares_for_peak_then_recharges_overnight(self):
+        """The live apply ordering can buy before a peak without filling all expensive slots."""
+        slots, ev, battery, site, config = self._paired_band_inputs(intervening_peak=True)
+        site = replace(site, import_cap_kw=6, charge_import_cap_kw=6)
+        config = replace(config, economic_diversity=False)
+        result = plan(slots, ev, battery, site, config)
+        wait = self._plan_without_early_charge(slots, ev, battery, site, config, cutoff_minute=240)
+
+        self._assert_paired_constraints(result, ev, battery, site)
+        self._assert_paired_constraints(wait, ev, battery, site)
+        self.assertLess(result.total_cost, wait.total_cost)
+        self.assertGreater(sum(action.battery_charge_kwh for action in result.actions[:12]), 0)
+        self.assertGreater(sum(action.battery_discharge_kwh for action in result.actions[12:36]), 0)
+        self.assertGreater(sum(action.battery_charge_kwh for action in result.actions[48:]), 0)
+
+    def test_apply_six_kw_feasible_initial_demand_can_cost_more_than_charging_now(self):
+        """Deferring the last cheap step is feasible but loses a real peak-avoidance saving."""
+        slots, ev, battery, site, config = self._paired_band_inputs(intervening_peak=True)
+        slots = tuple(replace(slot, import_price=19.1) if 1 <= index < 12 else slot for index, slot in enumerate(slots))
+        site = replace(site, import_cap_kw=6, charge_import_cap_kw=6)
+        config = replace(config, economic_diversity=False)
+        ordinary = plan(slots, ev, battery, site, config)
+        demand_first = plan(slots, ev, battery, site, replace(config, initial_battery_mode=BATTERY_DEMAND))
+
+        self._assert_paired_constraints(ordinary, ev, battery, site)
+        self._assert_paired_constraints(demand_first, ev, battery, site)
+        self.assertEqual(ordinary.actions[0].battery_mode, BATTERY_CHARGE)
+        self.assertEqual(demand_first.actions[0].battery_mode, BATTERY_DEMAND)
+        self.assertLess(ordinary.total_cost, demand_first.total_cost)
+        self.assertAlmostEqual(ordinary.diagnostics.final_ev_soc_kwh, demand_first.diagnostics.final_ev_soc_kwh)
+        self.assertAlmostEqual(ordinary.diagnostics.final_battery_soc_kwh, demand_first.diagnostics.final_battery_soc_kwh)
 
     @staticmethod
     def _oracle_search(slots, ev, battery, site, modes=(BATTERY_DEMAND, BATTERY_HOLD, BATTERY_CHARGE)):
