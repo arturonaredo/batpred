@@ -2939,6 +2939,7 @@ APPS_SCHEMA = {
     "car_charging_priority": {"type": "sensor", "sensor_type": "string"},
     "car_charging_self_consumption_first": {"type": "boolean"},
     "car_charging_household_fallback": {"type": "boolean"},
+    "car_charging_household_economic_fallback": {"type": "boolean"},
     "car_charging_home": {"type": "sensor|sensor_list", "sensor_type": "string", "entries": "num_cars"},
     "car_charging_partial_target": {"type": "boolean"},
     "car_charging_recurring_session": {"type": "dict"},

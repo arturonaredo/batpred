@@ -546,13 +546,73 @@ def _blocked(base, reason, attempted=False):
 
 def _withdraw_for_household(base, reason, attempted=False):
     """Withdraw EV authority, then require observed relay OFF before the sole native handback."""
+    settings = read_car_charging_config(base) or {}
+    pending = getattr(base, "car_charging_pending", None)
+    receipt = getattr(base, "car_charging_execution", None)
+    prior_report = getattr(base, "car_charging_report", None)
+    domestic_context = settings.get("household_economic_fallback") is True or any(isinstance(value, dict) and value.get("domestic_only") is True for value in (pending, receipt, prior_report))
+    temporary_authority = attempted or isinstance(receipt, dict) and bool(receipt)
     base.car_charging_execution = None
     base.battery_window = None
     base.car_charging_pending = None
     base.car_charging_slots = [[] for _ in range(PREDBAT_MAX_CARS)]
     try:
         _publish_ev(base)
-        relay = _cached(base, read_car_charging_config(base).get("relay_entity"))
+        if domestic_context:
+            from car_charging_household import HouseholdFallbackBlocked, safe_demand_handback, validate_native_handoff
+
+            demand_cancelled = False
+            if temporary_authority:
+                try:
+                    safe_demand_handback(base, settings)
+                    demand_cancelled = True
+                    attempted = True
+                except HouseholdFallbackBlocked as exc:
+                    attempted = attempted or exc.attempted
+                    if exc.waiting:
+                        _report(base, "household_waiting", False, exc.reason, attempted)
+                        base.car_charging_report.update(household_executor="waiting_for_ev_off", ev_available=False, household_demand_handback=False)
+                        return "EV waiting", "EV authority withdrawn; waiting for fresh relay OFF evidence"
+                    return _blocked(base, "hardware_stop_not_observed", attempted)
+                except (ValueError, TypeError, KeyError, AttributeError):
+                    return _blocked(base, "hardware_stop_not_observed", attempted)
+
+            try:
+                validate_native_handoff(base, settings, prior_report)
+            except HouseholdFallbackBlocked as exc:
+                if exc.waiting:
+                    _report(base, "household_waiting", False, exc.reason, attempted)
+                    base.car_charging_report.update(household_executor="waiting_for_ev_off", ev_available=False, household_demand_handback=demand_cancelled, household_native_handoff="blocked")
+                    return "EV waiting", "Native handoff blocked while waiting for fresh relay OFF evidence"
+                reason = exc.reason
+            except (ValueError, TypeError, KeyError, AttributeError):
+                reason = "native_baseline_replay_failed"
+            else:
+                reason = None
+
+            if reason is not None:
+                _report(base, "safety_economics_conflict", False, reason, attempted)
+                base.car_charging_report.update(
+                    household_executor="native",
+                    ev_available=False,
+                    household_demand_handback=demand_cancelled,
+                    household_native_handoff="blocked",
+                    household_conflict_reason=reason,
+                )
+                return "Household conflict", "Native schedule failed paired safety/economics replay ({})".format(reason)
+
+            base.inverter_rate_intent = {}
+            base.isCharging = base.isExporting = False
+            _report(base, "household_fallback", False, "paired_safe_native_handoff", attempted)
+            base.car_charging_report.update(
+                household_executor="native",
+                ev_available=False,
+                household_demand_handback=demand_cancelled,
+                household_native_handoff="paired_safe_after_cancellation" if demand_cancelled else "paired_safe",
+            )
+            return None
+
+        relay = _cached(base, settings.get("relay_entity"))
         now = _clock()
         off = relay["state"] == "off" and relay["last_changed"] <= now and relay["last_updated"] <= now
         _report(base, "household_fallback" if off else "household_waiting", False, reason, attempted)
@@ -564,7 +624,7 @@ def _withdraw_for_household(base, reason, attempted=False):
     except Exception:
         # Missing relay or failed publication is not an OFF observation. Existing
         # battery support must remain until the external executor is observed OFF.
-        return _blocked(base, "household_handback_unconfirmed", attempted)
+        return _blocked(base, "hardware_stop_not_observed" if domestic_context else "household_handback_unconfirmed", attempted)
 
 
 def _ev_handoff_until(base, options, run, commands):
@@ -599,6 +659,11 @@ def execute_car_charging_plan(base):
     """Execute combined intents or hand back only after revocation and observed EV OFF."""
     if not _requested(base):
         return None
+    pending = getattr(base, "car_charging_pending", None)
+    if isinstance(pending, dict) and pending.get("domestic_only") is True:
+        from car_charging_household import execute_household_candidate
+
+        return execute_household_candidate(base)
     attempted = False
     try:
         from car_charging_policy import household_reason
@@ -691,6 +756,26 @@ def publish_car_charging_slot(base, renew=False):
         return False
     receipt = getattr(base, "car_charging_execution", None)
     try:
+        if isinstance(receipt, dict) and receipt.get("domestic_only") is True:
+            from car_charging_household import HouseholdFallbackBlocked, validate_household_receipt
+
+            try:
+                validate_household_receipt(base, receipt)
+                _publish_ev(base)
+            except (HouseholdFallbackBlocked, ValueError, TypeError, KeyError, AttributeError) as exc:
+                reason = exc.reason if isinstance(exc, HouseholdFallbackBlocked) else "execution_validation_failed"
+                _withdraw_for_household(base, reason)
+            return True
+        report = getattr(base, "car_charging_report", None)
+        settings = read_car_charging_config(base)
+        if isinstance(report, dict) and report.get("domestic_only") is True and isinstance(settings, dict) and settings.get("household_fallback") is True and settings.get("household_economic_fallback") is True:
+            if isinstance(receipt, dict) and receipt.get("domestic_only") is not True:
+                _withdraw_for_household(base, "domestic_authority_mismatch")
+                return True
+            # A domestic candidate or handback has no EV slot to publish. Keep
+            # the EV entity explicitly empty without consulting EV consent/SOC.
+            _publish_ev(base)
+            return True
         from car_charging_policy import household_reason
 
         reason = household_reason(base)

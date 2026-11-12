@@ -40,6 +40,7 @@ CAR_SETTING_KEYS = {
     "battery_min_window_minutes": "battery_min_window_minutes",
     "self_consumption_first": "car_charging_self_consumption_first",
     "household_fallback": "car_charging_household_fallback",
+    "household_economic_fallback": "car_charging_household_economic_fallback",
     "home_entity": "car_charging_home",
     "ev_partial_target_authorised": "car_charging_partial_target",
     "recurring_session": "car_charging_recurring_session",

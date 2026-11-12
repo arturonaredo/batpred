@@ -84,6 +84,18 @@ def test_absence_never_reads_soc_or_meter(base):
         assert banner == ('<div class="car-charging-preview-debug" style="display:none;">EV authority withdrawn; native domestic control retained. Reason: ' + base.car_charging_report["execution_reason"] + "</div>")
 
 
+def test_household_fallback_remains_explicit_opt_in(base):
+    """An absent EV does not activate household routing unless its native flag is exactly true."""
+    from car_charging_policy import household_reason
+
+    session_inputs(base)
+    settings = car_settings(base)
+    settings["household_fallback"] = False
+    _set_entity(base, settings["home_entity"], "not_home")
+    with patch.object(base, "get_state_wrapper", side_effect=AssertionError("disabled fallback read an entity")):
+        assert household_reason(base) is None
+
+
 def test_real_native_handoff_requires_observed_off(base):
     """The real execute_plan seam reaches native allocation only after actual relay OFF."""
     for relay in ("on", "unknown", "off"):
@@ -193,6 +205,7 @@ def run_car_planning_session_tests(base):
 
     for test in (
         test_absence_never_reads_soc_or_meter,
+        test_household_fallback_remains_explicit_opt_in,
         test_real_native_handoff_requires_observed_off,
         test_rejected_car_planning_plan_does_not_block_household,
         test_contradiction_persists_across_age_and_restart,

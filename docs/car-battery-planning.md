@@ -90,6 +90,7 @@ as session evidence remain values of their documented flat argument.
 | `car_charging_control_authorised` | Default false; explicit execution request for the metered shared-support path, distinct from commissioning verification. |
 | `car_charging_error_acknowledgement` | Exact configured `state`, original `observed_at`, `acknowledged_at` and unchanged `departure` for an operator-attributed interruption event. Never a general error allowlist. |
 | `car_charging_household_fallback` | Default false; withdraw EV authority and return to native household execution only after observed relay OFF. |
+| `car_charging_household_economic_fallback` | Default false and requires `car_charging_household_fallback: true`. Separately opts into domestic-only optimization after the joint EV plan is absent or rejected. Requires the shared Deye/Solarman profile, explicit execution authorization or commissioning attestation, configured grid-support observations and complete nominal/PV10 native replays. It does not require EV SOC, meter or permission reads. |
 | `car_charging_home` | Optional vehicle tracker; only `home` counts as present. |
 | `car_charging_partial_target` | Default false; separately authorise a validated partial shared-support apply target while retaining the original request and shortfall. |
 | `car_charging_recurring_session` | Off-by-default standing policy, mutually exclusive with dated and confirmed sessions; see below. |
@@ -239,6 +240,14 @@ nominal and PV10 Python replay models this sharing; ordinary native plans and
 unmodified kernel semantics remain unchanged. Cached settings are neither physical
 commissioning nor a guaranteed instantaneous grid clamp.
 
+For the household economic fallback, the configured 6 kW import/support value is
+model-only: it is a solver constraint, not an electrical clamp or a promise that
+site import cannot exceed 6 kW. This change does not alter Predheat settings,
+commands or heating policy; existing heating demand remains part of the normal
+household forecast. Real-home use remains on HOLD until the installed inverter
+model/firmware and physical enforcement of the import limit are independently
+commissioned and verified. An opt-in or an HA state match is not that evidence.
+
 ## Sessions, household routing and partial targets
 
 `car_charging_household_fallback` opts into availability-first routing in apply.
@@ -247,6 +256,37 @@ before vehicle SOC or metered delivery. EV authority is revoked, but native
 household execution resumes only after observed relay OFF. While ON or unknown,
 existing battery support is retained and no second writer runs. Ordinary absence
 does not turn into a global error or override read-only/manual controls.
+
+`car_charging_household_economic_fallback` is a distinct, default-false opt-in.
+When the joint EV candidate is missing or rejected, it may stage a domestic-only
+candidate for the complete configured horizon (up to 48 hours). Candidates must
+pass both nominal and PV10 native replays and improve on the snapshotted, valid
+ordinary native household charge plan without regressing either scenario beyond
+the 0.002 cost-unit comparison tolerance. Per-scenario costs include cycle cost and
+the same terminal-SOC value. If the ordinary plan cannot be reconstructed from
+its valid native charge windows and limits, the fallback is not staged. The
+direct all-Demand schedule remains a separately labeled, non-executable
+counterfactual only; it is not the economic reference. The bounded 128/512
+search is not a proof of global optimality. Planning and new-charge dispatch
+require the EV relay plus both configured grid-support controls from HA's
+current-state endpoint; unchanged entity timestamps are not treated as fresh
+evidence and no timestamp TTL is invented.
+
+Activation authorization is `car_charging_control_authorised` set to `true`
+**or** `car_charging_control_verified` set to `true`. These are separate
+settings: execution authorization does not attest to commissioning and does not
+modify the commissioning value.
+
+If a domestic candidate or its execution checks fail, this route never falls
+through to an unrelated native charge plan. With relay ON or unknown it waits
+without issuing a second inverter command. With relay OFF, it may issue only the
+validated shared-template Demand intent after current relay-OFF evidence and
+template validation; cancelling an existing target does not require grid support
+to remain ON or its limit to remain valid. A failed cancellation reports
+`hardware_stop_not_observed`, blocks execution and never falls through to native
+charging. Grid-support ON and a valid limit remain mandatory for every new
+economic charge candidate. HA state observations are still not physical hardware
+confirmation.
 
 An operator-confirmed session is an explicit baseline, **not fresh vehicle
 telemetry**. Dedicated cumulative AC energy and power, with configured efficiency,

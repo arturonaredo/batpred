@@ -4,6 +4,7 @@ from tests.car_planning_fixtures import car_settings, configure_car_settings
 
 from dataclasses import replace
 from copy import deepcopy
+from datetime import timedelta
 from unittest.mock import patch
 from types import SimpleNamespace
 
@@ -453,6 +454,930 @@ def test_self_consumption_preference_is_paired_and_explicit(base):
                 raise AssertionError("Non-boolean source preference accepted")
 
 
+def _household_template_fixture(base, minutes=360, economic_fallback=True):
+    """Build the actual verified template with no configured EV permission or SOC source."""
+    from tests.test_car_planning_combined import _template_inputs
+
+    inverter, writes, _, _ = _template_inputs(base, minutes=minutes, pv=0)
+    settings = car_settings(base)
+    for name in ("session", "soc_entity", "soc_observed_at_entity", "permission_entity", "connection_entity", "connection_observed_at_entity"):
+        settings.pop(name, None)
+    settings.update(
+        mode="apply",
+        control_model="deye_solarman",
+        apply_verified=True,
+        household_fallback=True,
+        ev_executor_lease_verified=False,
+        grid_charge_support={"enabled_entity": "switch.combined_test_grid_support", "limit_entity": "number.combined_test_grid_support"},
+        import_limit_w=6000,
+    )
+    base.args["car_charging_household_economic_fallback"] = economic_fallback
+    base.ha_interface.is_alive = lambda: True
+
+    def live_state_api(endpoint, **_kwargs):
+        """Mirror HA's GET /api/states/<entity_id> response for configured controls."""
+        if not isinstance(endpoint, str) or not endpoint.startswith("/api/states/"):
+            return None
+        entity = endpoint.removeprefix("/api/states/")
+        payload = base.ha_interface.get_state(entity_id=entity, raw=True)
+        if not isinstance(payload, dict):
+            return None
+        last_changed = payload.get("last_changed")
+        last_updated = payload.get("last_updated")
+        return {
+            "entity_id": entity,
+            "state": payload.get("state"),
+            "last_changed": last_changed.isoformat() if hasattr(last_changed, "isoformat") else last_changed,
+            "last_updated": last_updated.isoformat() if hasattr(last_updated, "isoformat") else last_updated,
+            "attributes": payload.get("attributes", {}),
+        }
+
+    base.ha_interface.api_call = live_state_api
+    _set_entity(base, "switch.combined_test_grid_support", "on")
+    _set_entity(base, "number.combined_test_grid_support", "6000")
+    _set_entity(base, "binary_sensor.combined_test_relay", "off", last_changed=base.now_utc - timedelta(minutes=10))
+    base.soc_kw = 4.0
+    base.metric_battery_value_scaling = 0
+    base.plan_valid = True
+    target = min(base.soc_max, base.soc_kw + 3)
+    start = base.minutes_now + (120 if minutes >= 360 else 0)
+    base.charge_window_best = [{"start": start, "end": start + min(60, minutes), "average": 8.1, "target": target}]
+    base.charge_limit_best = [target]
+    base.export_window_best = []
+    base.export_limits_best = []
+    return inverter, writes
+
+
+def test_household_authorized_metered_route_does_not_require_ev_reads(base):
+    """The existing metered control-authorisation route is not a commissioning attestation."""
+    from car_charging_household import evaluate_household_fallback, household_options
+
+    _household_template_fixture(base)
+    settings = car_settings(base)
+    settings.update(
+        apply_verified=False,
+        execution_authorised=True,
+    )
+    reset_rates(base, 10, 0)
+    base.rate_import.update({base.minutes_now + minute: 40 for minute in range(120, 360)})
+    reads = []
+    original = base.ha_interface.api_call
+
+    def record_read(endpoint, **kwargs):
+        """Record exact live HA state reads so this proves EV evidence is not consulted."""
+        reads.append(endpoint.removeprefix("/api/states/"))
+        return original(endpoint, **kwargs)
+
+    with patch.object(base.ha_interface, "api_call", side_effect=record_read), patch("car_charging_plan._observation_clock", return_value=base.now_utc):
+        options = household_options(base, settings)
+        report = evaluate_household_fallback(base, settings, "connection_not_confirmed")
+
+    assert options["domestic_only"] is True
+    assert options["settings"]["apply_verified"] is False
+    assert report["status"] == "candidate", report
+    assert "execution_authorised_or_apply_commissioning" in report["activation_requirements"]
+    assert "apply_commissioning" not in report["activation_requirements"]
+    assert set(reads) == {
+        "binary_sensor.combined_test_relay",
+        "switch.combined_test_grid_support",
+        "number.combined_test_grid_support",
+    }
+    assert "sensor.combined_test_ev_soc" not in reads
+    assert "switch.combined_test_permission" not in reads
+
+
+def test_household_fallback_refuses_to_stage_without_a_valid_native_plan(base):
+    """An empty or invalid ordinary plan cannot be replaced by a fabricated Demand baseline."""
+    from car_charging_household import evaluate_household_fallback
+
+    _household_template_fixture(base, minutes=60)
+    base.charge_window_best = []
+    base.charge_limit_best = []
+    searched = []
+
+    def record_search(*_args):
+        """Record whether fallback improperly searches without a native reference."""
+        searched.append(True)
+        return None
+
+    with patch("car_charging_plan._observation_clock", return_value=base.now_utc), patch("car_charging_household._solve_and_replay", side_effect=record_search):
+        report = evaluate_household_fallback(base, car_settings(base), "connection_not_confirmed")
+
+    assert report["execution_reason"] == "native_baseline_unavailable", report
+    assert report.get("native_comparison", {}).get("status") == "baseline_unavailable"
+    assert searched == []
+    assert base.car_charging_pending is None
+
+
+def test_household_native_baseline_replays_the_pre_fallback_plan_snapshot(base):
+    """The reported native reference is the saved ordinary plan, not candidate or all-Demand windows."""
+    import car_charging_plan
+    from car_charging_household import evaluate_household_fallback
+
+    _household_template_fixture(base, minutes=360)
+    original_windows = deepcopy(base.charge_window_best)
+    original_limits = deepcopy(base.charge_limit_best)
+    replayed_native = []
+    original_replay = car_charging_plan._replay
+
+    def record_replay(observed_base, options, result, slots, windows, scenario):
+        """Capture the actual native schedule passed into both independent replays."""
+        if getattr(result, "status", None) == "ordinary_native_household_plan":
+            replayed_native.append((deepcopy(windows[1]), deepcopy(windows[2])))
+        return original_replay(observed_base, options, result, slots, windows, scenario)
+
+    def search_mutates_native_state(*_args):
+        """Model a fallback candidate builder replacing shared plan fields after the snapshot."""
+        base.charge_window_best = [{"start": base.minutes_now, "end": base.minutes_now + 5, "target": base.soc_max}]
+        base.charge_limit_best = [base.soc_max]
+        return None
+
+    with (
+        patch("car_charging_plan._observation_clock", return_value=base.now_utc),
+        patch("car_charging_plan._replay", side_effect=record_replay),
+        patch("car_charging_household._solve_and_replay", side_effect=search_mutates_native_state),
+    ):
+        report = evaluate_household_fallback(base, car_settings(base), "connection_not_confirmed")
+
+    comparison = report.get("native_comparison", {})
+    assert comparison.get("baseline_kind") == "ordinary_native_household_plan"
+    assert comparison.get("baseline_charge_windows") == original_windows
+    assert comparison.get("baseline_charge_limits") == original_limits
+    assert replayed_native == [(original_windows, original_limits), (original_windows, original_limits)]
+    assert report["demand_comparison"].get("baseline_kind") == "direct_all_demand_counterfactual"
+    assert report["demand_comparison"].get("baseline_executable") is False
+
+
+def test_household_baseline_uses_native_schedule_after_current_cycle_recompute(base):
+    """Fallback economics bind to calculate_plan's new schedule, not the previous incumbent or test pollution."""
+    from unit_test import create_predbat
+
+    base = create_predbat()
+    _household_template_fixture(base, minutes=1440)
+    base.args["threads"] = 0
+    now = base.minutes_now
+    previous_windows = [{"start": now + 35, "end": now + 55, "average": 8.1, "target": base.soc_max}]
+    current_window = {"start": now + 5, "end": now + 25, "average": 5.0, "target": base.soc_max}
+    base.plan_valid = True
+    base.plan_made_by_version = "previous-cycle-plan"
+    base.update_pending = False
+    base.current_charge_limit = 100.0
+    base.charge_window_best = deepcopy(previous_windows)
+    base.charge_limit_best = [base.soc_max]
+    base.export_window_best = []
+    base.export_limits_best = []
+    base.calculate_best_charge = False
+    base.calculate_best_export = False
+    base.charge_window = [deepcopy(current_window)]
+    base.charge_limit = [base.soc_max]
+    base.export_window = []
+    base.export_limits = []
+    native_snapshots = []
+    from car_charging_household import _snapshot_native_plan
+
+    def capture_native_snapshot(observed_base):
+        """Capture the exact snapshot helper used at calculate_plan's fallback boundary."""
+        snapshot = _snapshot_native_plan(observed_base)
+        native_snapshots.append(deepcopy(snapshot))
+        return snapshot
+
+    with (
+        patch("car_charging_plan._observation_clock", return_value=base.now_utc),
+        patch("car_charging_household._snapshot_native_plan", side_effect=capture_native_snapshot),
+        patch("car_charging_household._solve_and_replay", return_value=None),
+    ):
+        base.calculate_plan(recompute=True, publish=True)
+
+    current_windows = deepcopy(base.charge_window_best)
+    current_limits = deepcopy(base.charge_limit_best)
+    assert current_windows != previous_windows, (previous_windows, current_windows)
+    expected_snapshot = {"plan_valid": True, "charge_windows": current_windows, "charge_limits": current_limits}
+    assert native_snapshots == [expected_snapshot], (
+        native_snapshots,
+        base.car_charging_report,
+        {name: getattr(base, name) for name in ("plan_valid", "charge_window_best", "charge_limit_best", "export_window_best", "export_limits_best", "forecast_minutes")},
+    )
+    comparison = base.car_charging_report["native_comparison"]
+    assert comparison["baseline_charge_windows"] == current_windows
+    assert comparison["baseline_charge_limits"] == current_limits
+    assert comparison["baseline_initial_battery_soc_kwh"] == base.soc_kw
+
+
+def test_household_economic_gate_rejects_nominal_regression_hidden_by_pv10_savings(base):
+    """A PV10 improvement cannot authorize a candidate that is costlier than native nominal."""
+    from car_charging_household import evaluate_household_fallback
+
+    _household_template_fixture(base, minutes=60)
+    base.metric_battery_cycle = 0
+    base.metric_battery_value_scaling = 0
+    options = {"mode": "apply", "grid_charge_support_w": 6000, "import_limit_w": 6000}
+    action = SimpleNamespace(slot_index=0, battery_mode="charge", ev_action="off", discharge_limit_kw=None)
+    result = SimpleNamespace(actions=(action,), status="candidate", total_cost=None)
+    slots = [SimpleNamespace(index=0, start_min=0, duration_min=5)]
+    windows = ([], [{"start": base.minutes_now, "end": base.minutes_now + 5}], [base.soc_max])
+    candidate_checks = {
+        "nominal": {"passed": True, "checked_minutes": 60, "horizon_energy_cost": 150, "battery_cycle_kwh": 0, "final_battery_kwh": 0},
+        "pv10": {"passed": True, "checked_minutes": 60, "horizon_energy_cost": 100, "battery_cycle_kwh": 0, "final_battery_kwh": 0},
+    }
+    baseline_checks = {
+        "nominal": {"passed": True, "checked_minutes": 60, "horizon_energy_cost": 100, "battery_cycle_kwh": 0, "final_battery_kwh": 0},
+        "pv10": {"passed": True, "checked_minutes": 60, "horizon_energy_cost": 200, "battery_cycle_kwh": 0, "final_battery_kwh": 0},
+    }
+    demand_checks = {name: {**check, "horizon_energy_cost": 300} for name, check in candidate_checks.items()}
+    baseline_result = SimpleNamespace(status="ordinary_native_household_plan", actions=())
+    demand_result = SimpleNamespace(status="direct_demand_counterfactual", total_cost=None, actions=())
+    fake_candidate = (result, slots, windows, candidate_checks, options)
+
+    with (
+        patch("car_charging_plan._observation_clock", return_value=base.now_utc),
+        patch("car_charging_household._replay_native_plan", return_value=(baseline_result, ([], base.charge_window_best, base.charge_limit_best), baseline_checks), create=True),
+        patch("car_charging_household._solve_and_replay", return_value=fake_candidate),
+        patch("car_charging_household._replay_demand_counterfactual", return_value=(demand_result, ([], [], []), demand_checks)),
+    ):
+        report = evaluate_household_fallback(base, car_settings(base), "connection_not_confirmed")
+
+    assert report["status"] == "household_fallback", report
+    assert report["execution_reason"] == "no_componentwise_savings_over_native", report
+    assert base.car_charging_pending is None
+
+
+def test_household_fallback_requires_live_ha_transport_for_cached_controls(base):
+    """An OFF/on cache snapshot cannot grant a domestic command without the existing HA transport."""
+    from car_charging_household import HouseholdFallbackBlocked, household_options
+
+    _household_template_fixture(base)
+    base.ha_interface.is_alive = lambda: False
+    try:
+        with patch("car_charging_plan._observation_clock", return_value=base.now_utc):
+            household_options(base, car_settings(base))
+    except HouseholdFallbackBlocked as exc:
+        assert exc.reason == "household_control_transport_unavailable"
+    else:
+        raise AssertionError("Disconnected HA transport accepted cached relay/support values")
+
+
+def test_household_fallback_rechecks_controls_from_live_ha_state_api(base):
+    """A cached relay-OFF value cannot override a live HA response that says relay ON."""
+    from car_charging_household import HouseholdFallbackBlocked, household_options
+
+    _household_template_fixture(base)
+    live_states = {
+        "/api/states/binary_sensor.combined_test_relay": {
+            "entity_id": "binary_sensor.combined_test_relay",
+            "state": "on",
+            "last_changed": base.now_utc.isoformat(),
+            "last_updated": base.now_utc.isoformat(),
+            "attributes": {},
+        },
+        "/api/states/switch.combined_test_grid_support": {
+            "entity_id": "switch.combined_test_grid_support",
+            "state": "on",
+            "last_changed": base.now_utc.isoformat(),
+            "last_updated": base.now_utc.isoformat(),
+            "attributes": {},
+        },
+        "/api/states/number.combined_test_grid_support": {
+            "entity_id": "number.combined_test_grid_support",
+            "state": "6000",
+            "last_changed": base.now_utc.isoformat(),
+            "last_updated": base.now_utc.isoformat(),
+            "attributes": {},
+        },
+    }
+    base.ha_interface.api_call = lambda endpoint, **_kwargs: live_states.get(endpoint)
+
+    try:
+        with patch("car_charging_plan._observation_clock", return_value=base.now_utc):
+            household_options(base, car_settings(base))
+    except HouseholdFallbackBlocked as exc:
+        assert exc.reason == "waiting_for_ev_relay_off"
+        assert exc.waiting is True
+    else:
+        raise AssertionError("Cached relay OFF overrode a fresh HA state response showing relay ON")
+
+
+def test_household_fallback_blocks_when_live_control_request_raises(base):
+    """A failed current-state request becomes a bounded wait instead of escaping execution."""
+    from car_charging_household import HouseholdFallbackBlocked, household_options
+
+    _household_template_fixture(base)
+
+    def fail_live_read(_endpoint, **_kwargs):
+        """Represent a transport exception from the HA current-state request."""
+        raise OSError("test transport failure")
+
+    base.ha_interface.api_call = fail_live_read
+    try:
+        with patch("car_charging_plan._observation_clock", return_value=base.now_utc):
+            household_options(base, car_settings(base))
+    except HouseholdFallbackBlocked as exc:
+        assert exc.reason == "relay_observation_unavailable"
+        assert exc.waiting is True
+    else:
+        raise AssertionError("A failed current-state request was treated as valid cached evidence")
+
+
+def test_joint_search_miss_attempts_opted_in_household_fallback(base):
+    """A missing joint candidate triggers domestic fallback without replacing its diagnostics."""
+    from tests.test_car_planning_combined import _template_inputs
+
+    _template_inputs(base, minutes=60, pv=0)
+    settings = car_settings(base)
+    settings.update(
+        mode="apply",
+        control_model="deye_solarman",
+        apply_verified=True,
+        household_fallback=True,
+        household_economic_fallback=True,
+        grid_charge_support={"enabled_entity": "switch.combined_test_grid_support", "limit_entity": "number.combined_test_grid_support"},
+        import_limit_w=6000,
+    )
+    _set_entity(base, "switch.combined_test_grid_support", "on")
+    _set_entity(base, "number.combined_test_grid_support", "6000")
+    _set_entity(base, "binary_sensor.combined_test_relay", "off", last_changed=base.now_utc - timedelta(minutes=10))
+    fallback_report = {"status": "candidate", "domestic_only": True, "native_checks": {}}
+    no_candidate = SimpleNamespace(actions=(), status="bounded_no_plan", total_cost=None)
+
+    with (
+        patch("car_charging_plan._observation_clock", return_value=base.now_utc),
+        patch("car_charging_policy.household_reason", return_value=None),
+        patch("car_charging_plan.build_candidate", return_value=(no_candidate, [])),
+        patch("car_charging_household.evaluate_household_fallback", return_value=fallback_report) as fallback,
+    ):
+        report = evaluate_car_charging(base, publish=False)
+
+    assert fallback.call_count == 1
+    assert report is fallback_report
+    assert report["joint_candidate_rejection"]["status"] == "no_plan_found"
+    assert report["joint_candidate_rejection"]["search_beam_attempts"]
+
+
+def test_household_native_cost_refinement_runs_both_beams_and_includes_cycle_and_terminal_value(base):
+    """Refinement ranks paired native costs, including each replay's cycle and terminal terms."""
+    from car_charging_household import _solve_and_replay, household_options
+
+    _household_template_fixture(base, minutes=60)
+    base.metric_battery_cycle = 2
+    base.metric_battery_value_scaling = 1
+    base.battery_value_rate = lambda _minute: 5
+    with patch("car_charging_plan._observation_clock", return_value=base.now_utc):
+        options = household_options(base, car_settings(base))
+    options["beam"] = 128
+    options["native_reference_costs"] = {"nominal": 100, "pv10": 100}
+    calls = []
+
+    def fake_build(_base, trial):
+        """Return a feasible, one-slot Demand shape with deliberately misleading solver ranks."""
+        calls.append(trial["beam"])
+        action = SimpleNamespace(slot_index=0, battery_mode="demand", ev_action="off", discharge_limit_kw=None)
+        result = SimpleNamespace(actions=(action,), total_cost=1 if trial["beam"] == 128 else 1000, beam=trial["beam"])
+        return result, [SimpleNamespace(index=0)]
+
+    def fake_replay(_base, _trial, result, _slots):
+        """Make the wider search cheaper only after native cycle and terminal adjustments."""
+        horizon_cost, cycle_kwh, final_soc = (90, 10, 10) if result.beam == 128 else (95, 0, 8)
+        checks = {
+            name: {
+                "passed": True,
+                "checked_minutes": 60,
+                "horizon_energy_cost": horizon_cost,
+                "battery_cycle_kwh": cycle_kwh,
+                "final_battery_kwh": final_soc,
+            }
+            for name in ("nominal", "pv10")
+        }
+        return ([], [], []), checks
+
+    with patch("car_charging_plan.build_candidate", side_effect=fake_build), patch("car_charging_plan._replay_candidate", side_effect=fake_replay):
+        selected = _solve_and_replay(base, options)
+
+    assert calls == [128, 512], calls
+    assert selected is not None
+    assert selected[0].beam == 512, "the wider plan should win on replay cost, not the solver objective"
+    assert selected[4]["beam"] == 512
+
+
+def test_household_native_cost_refinement_discards_scenario_regression_before_ranking(base):
+    """A lower worst-case scalar cannot hide nominal regression against the native reference."""
+    from car_charging_household import _solve_and_replay, household_options
+
+    _household_template_fixture(base, minutes=60)
+    base.metric_battery_cycle = 0
+    base.metric_battery_value_scaling = 0
+    with patch("car_charging_plan._observation_clock", return_value=base.now_utc):
+        options = household_options(base, car_settings(base))
+    options["beam"] = 128
+    options["native_reference_costs"] = {"nominal": 100, "pv10": 200}
+
+    def fake_build(_base, trial):
+        """Return two paired-safe schedules: the scalar winner regresses nominal cost."""
+        action = SimpleNamespace(slot_index=0, battery_mode="charge", ev_action="off", discharge_limit_kw=None)
+        return SimpleNamespace(actions=(action,), beam=trial["beam"]), [SimpleNamespace(index=0)]
+
+    def fake_replay(_base, _trial, result, _slots):
+        """Expose literal costs where beam 512 improves PV10 but regresses nominal."""
+        costs = (99, 199) if result.beam == 128 else (101, 150)
+        checks = {
+            name: {
+                "passed": True,
+                "checked_minutes": 60,
+                "horizon_energy_cost": cost,
+                "battery_cycle_kwh": 0,
+                "final_battery_kwh": 0,
+            }
+            for name, cost in zip(("nominal", "pv10"), costs)
+        }
+        return ([], [{"start": base.minutes_now, "end": base.minutes_now + 5}], [base.soc_max]), checks
+
+    with patch("car_charging_plan.build_candidate", side_effect=fake_build), patch("car_charging_plan._replay_candidate", side_effect=fake_replay):
+        selected = _solve_and_replay(base, options)
+
+    assert selected is not None
+    assert selected[0].beam == 128, "the nominal-regressing scalar winner must be excluded before ranking"
+
+
+def test_household_direct_demand_counterfactual_can_fail_cap_without_blocking_candidate(base):
+    """The non-executable direct-Demand replay is diagnostic, not a solver-feasibility gate."""
+    import car_charging_plan
+
+    _household_template_fixture(base)
+    reset_rates(base, 10, 0)
+    base.rate_import.update({base.minutes_now + minute: 40 for minute in range(120, 360)})
+    original_build = car_charging_plan.build_candidate
+    original_replay = car_charging_plan._replay
+    demand_searches = []
+
+    def build_without_feasible_demand(observed_base, options):
+        """Retain ordinary candidates while making the Demand solver baseline infeasible."""
+        result, slots = original_build(observed_base, options)
+        if options.get("domestic_demand_baseline"):
+            demand_searches.append(options["beam"])
+            return SimpleNamespace(actions=(), status="bounded_no_plan", total_cost=None), slots
+        return result, slots
+
+    def replay_with_counterfactual_cap_failure(observed_base, options, result, slots, windows, scenario):
+        """Keep real replay accounting, but model a Demand-only site-cap violation."""
+        check = original_replay(observed_base, options, result, slots, windows, scenario)
+        if result.actions and all(action.battery_mode == "demand" for action in result.actions):
+            check["passed"] = False
+            check["reasons"] = ["site_import_exceeded"]
+            check["peak_import_w"] = options["import_limit_w"] + 100
+        return check
+
+    with (
+        patch("car_charging_plan._observation_clock", return_value=base.now_utc),
+        patch("car_charging_plan.build_candidate", side_effect=build_without_feasible_demand),
+        patch("car_charging_plan._replay", side_effect=replay_with_counterfactual_cap_failure),
+    ):
+        report = evaluate_car_charging(base, publish=False)
+
+    assert report["status"] == "candidate", report
+    assert report["native_checks"]["nominal"]["passed"] and report["native_checks"]["pv10"]["passed"]
+    assert demand_searches == [], "the direct Demand counterfactual must not require a feasible solver result"
+    assert report["demand_comparison"]["baseline_executable"] is False
+    assert report["demand_comparison"]["baseline_checks"]["nominal"]["reasons"] == ["site_import_exceeded"]
+
+
+def test_household_direct_demand_replay_runs_when_solver_finds_no_candidate(base):
+    """A bounded search miss still records the full non-executable all-Demand replay, including cap failure."""
+    import car_charging_plan
+    from car_charging_household import evaluate_household_fallback
+
+    _household_template_fixture(base, minutes=60)
+    reset_rates(base, 10, 0)
+    original_build = car_charging_plan.build_candidate
+    original_replay = car_charging_plan._replay
+    replayed_modes = []
+
+    def build_without_plan(observed_base, options):
+        """Return complete forecast slots with a truthful bounded search miss."""
+        _, slots = original_build(observed_base, options)
+        return SimpleNamespace(actions=(), status="bounded_no_plan", total_cost=None), slots
+
+    def record_demand_replay(observed_base, options, result, slots, windows, scenario):
+        """Keep native replay behavior but expose that both direct-Demand scenarios ran."""
+        if result.status == "direct_demand_counterfactual":
+            replayed_modes.append((scenario, {action.battery_mode for action in result.actions}))
+        check = original_replay(observed_base, options, result, slots, windows, scenario)
+        if result.status == "direct_demand_counterfactual":
+            check["passed"] = False
+            check["reasons"] = ["site_import_exceeded"]
+        return check
+
+    with (
+        patch("car_charging_plan._observation_clock", return_value=base.now_utc),
+        patch("car_charging_plan.build_candidate", side_effect=build_without_plan),
+        patch("car_charging_plan._replay", side_effect=record_demand_replay),
+    ):
+        report = evaluate_household_fallback(base, car_settings(base), "joint_candidate_no_plan_found")
+
+    assert report["execution_reason"] == "household_plan_not_found", report
+    assert replayed_modes == [(0, {"demand"}), (1, {"demand"})]
+    comparison = report["demand_comparison"]
+    assert comparison["baseline_kind"] == "direct_all_demand_counterfactual"
+    assert comparison["baseline_executable"] is False
+    assert comparison["baseline_checks"]["nominal"]["checked_minutes"] == 60
+    assert comparison["baseline_checks"]["pv10"]["checked_minutes"] == 60
+    assert comparison["baseline_checks"]["nominal"]["reasons"] == ["site_import_exceeded"]
+    assert comparison["baseline_checks"]["pv10"]["reasons"] == ["site_import_exceeded"]
+
+
+def test_household_failed_economic_gate_resumes_paired_safe_native_plan(base):
+    """With no prior domestic authority, a rejected candidate leaves the native executor in control."""
+    from inverter_service_control import dispatch_template
+
+    _household_template_fixture(base)
+    reset_rates(base, 40, 0)
+    base.soc_kw = 20
+    with patch("car_charging_plan._observation_clock", return_value=base.now_utc):
+        report = evaluate_car_charging(base, publish=False)
+    assert report["status"] == "household_fallback"
+    assert report["native_comparison"]["baseline_passed"] is True, report
+    assert base.car_charging_pending is None
+
+    inverter = base.inverters[0]
+    with (
+        patch("car_charging_plan._observation_clock", return_value=base.now_utc),
+        patch("inverter_service_control.dispatch_template", wraps=dispatch_template) as shared_dispatch,
+        patch.object(inverter, "adjust_charge_window", wraps=inverter.adjust_charge_window) as native_window,
+        patch.object(base, "set_window_minutes", 240),
+    ):
+        base.execute_plan()
+
+    assert shared_dispatch.call_count == 0
+    assert native_window.called
+    assert base.car_charging_execution is None
+    assert base.car_charging_report["household_native_handoff"] == "paired_safe"
+
+
+def test_household_rejected_candidate_reports_conflict_when_native_replay_fails(base):
+    """A cap-failing native schedule is neither silently executed nor replaced with fresh Demand."""
+    from car_charging_execute import execute_car_charging_plan
+    from inverter_service_control import dispatch_template
+
+    _household_template_fixture(base)
+    reset_rates(base, 40, 0)
+    base.soc_kw = 20
+    with patch("car_charging_plan._observation_clock", return_value=base.now_utc):
+        report = evaluate_car_charging(base, publish=False)
+    assert report["status"] == "household_fallback" and base.car_charging_pending is None, report
+    comparison = report["native_comparison"]
+    comparison["baseline_passed"] = False
+    comparison["baseline_checks"]["nominal"]["passed"] = False
+    comparison["baseline_checks"]["nominal"]["reasons"] = ["site_import_exceeded"]
+
+    with patch("car_charging_plan._observation_clock", return_value=base.now_utc), patch("inverter_service_control.dispatch_template", wraps=dispatch_template) as shared_dispatch:
+        outcome = execute_car_charging_plan(base)
+
+    assert outcome[0] == "Household conflict", outcome
+    assert shared_dispatch.call_count == 0
+    assert base.car_charging_report["status"] == "safety_economics_conflict"
+    assert base.car_charging_report["household_native_handoff"] == "blocked"
+
+
+def test_household_prior_temporary_authority_is_cancelled_before_native_handoff(base):
+    """Only a genuine earlier receipt gets checked target-zero cancellation before native execution."""
+    from car_charging_execute import execute_car_charging_plan
+    from inverter_service_control import dispatch_template
+
+    _household_template_fixture(base)
+    reset_rates(base, 40, 0)
+    base.soc_kw = 20
+    with patch("car_charging_plan._observation_clock", return_value=base.now_utc):
+        report = evaluate_car_charging(base, publish=False)
+    assert report["native_comparison"]["baseline_passed"] is True, report
+    assert report["status"] == "household_fallback" and base.car_charging_pending is None, report
+    base.car_charging_execution = {"domestic_only": True}
+
+    with patch("car_charging_plan._observation_clock", return_value=base.now_utc), patch("inverter_service_control.dispatch_template", wraps=dispatch_template) as shared_dispatch:
+        outcome = execute_car_charging_plan(base)
+
+    assert outcome is None
+    assert [call.args[1] for call in shared_dispatch.call_args_list] == [0]
+    assert base.car_charging_execution is None
+    assert base.car_charging_report["household_native_handoff"] == "paired_safe_after_cancellation"
+
+
+def test_household_fallback_validates_48h_and_displays_only_24h(base):
+    """The accepted domestic route keeps its full paired replay while the view stops at 24 hours."""
+    from datetime import datetime
+
+    from car_charging_view import build_car_charging_plan_view
+
+    _household_template_fixture(base, minutes=2880)
+    base.forecast_plan_hours = 24
+    reset_rates(base, 10, 0)
+    base.rate_import.update({base.minutes_now + minute: 40 for minute in range(120, 360)})
+    with patch("car_charging_plan._observation_clock", return_value=base.now_utc):
+        report = evaluate_car_charging(base, publish=False)
+
+    assert report["status"] == "candidate", report
+    assert set(report["native_checks"]) == {"nominal", "pv10"}
+    assert all(check["passed"] and check["checked_minutes"] == 2880 for check in report["native_checks"].values())
+    assert all(sum(row["minutes"] for row in rows) == 2880 for rows in report["preview"].values())
+    view = build_car_charging_plan_view({}, report, now=base.now_utc)
+    assert view["plan_simulation"] is True and view["rows"]
+    visible_minutes = sum((datetime.fromisoformat(row["plan_interval_end"]) - datetime.fromisoformat(row["time"])).total_seconds() / 60 for row in view["rows"])
+    cutoff = datetime.fromisoformat(report["preview"]["nominal"][0]["start"]) + timedelta(hours=24)
+    assert visible_minutes == 1440
+    assert datetime.fromisoformat(view["rows"][-1]["plan_interval_end"]) == cutoff
+    assert any(datetime.fromisoformat(row["start"]) >= cutoff for row in report["preview"]["nominal"])
+
+
+def test_household_demand_comparison_uses_an_all_demand_baseline(base):
+    """The candidate comparison uses an independently replayed all-Demand diagnostic."""
+    from car_charging_household import _replay_demand_counterfactual, _solve_and_replay, household_options
+
+    _household_template_fixture(base)
+    reset_rates(base, 10, 0)
+    base.rate_import.update({base.minutes_now + minute: 40 for minute in range(120, 360)})
+    with patch("car_charging_plan._observation_clock", return_value=base.now_utc):
+        options = household_options(base, car_settings(base))
+    candidate = _solve_and_replay(base, options)
+
+    assert candidate is not None
+    candidate_result, slots, _, candidate_checks, _ = candidate
+    demand_result, _, demand_checks = _replay_demand_counterfactual(base, options, candidate_result, slots)
+    assert any(action.battery_mode == "charge" for action in candidate_result.actions)
+    assert all(action.battery_mode == "demand" for action in demand_result.actions)
+    assert demand_result.status == "direct_demand_counterfactual" and demand_result.total_cost is None
+    assert all(check["passed"] and check["checked_minutes"] == 360 for check in (*candidate_checks.values(), *demand_checks.values()))
+    assert all(action.ev_action == "off" for action in (*candidate_result.actions, *demand_result.actions))
+    assert all("battery_cycle_kwh" in check for check in (*candidate_checks.values(), *demand_checks.values()))
+
+
+def test_household_fallback_plans_cheaper_than_demand_without_ev_evidence(base):
+    """The opt-in household schedule beats native operation, replays both cases, and reads no EV consent or SOC."""
+    import car_charging_plan
+    from car_charging_policy import household_reason
+
+    _, writes = _household_template_fixture(base)
+    reset_rates(base, 10, 0)
+    base.rate_import.update({base.minutes_now + minute: 40 for minute in range(120, 360)})
+    original = car_charging_plan._read_entity_state
+    read_entities = []
+
+    def guarded_read(observed_base, entity):
+        """Keep real HA cache reads but reject an EV permission or SOC lookup."""
+        read_entities.append(entity)
+        assert entity not in ("sensor.combined_test_ev_soc", "switch.combined_test_permission")
+        return original(observed_base, entity)
+
+    with patch.object(car_charging_plan, "_read_entity_state", side_effect=guarded_read), patch.object(car_charging_plan, "_observation_clock", return_value=base.now_utc):
+        report = evaluate_car_charging(base, publish=False)
+
+    assert report["status"] == "candidate", report
+    assert report["domestic_only"] is True and report["ev_soc_not_required"] is True
+    assert "ev_initial_state" not in report and not report.get("proposed_ev_windows")
+    assert all(check["passed"] and check["checked_minutes"] == 360 for check in report["native_checks"].values())
+    assert {"nominal", "pv10"} == set(report["native_checks"])
+    assert report["native_comparison"]["status"] == "componentwise_cheaper_than_native"
+    assert report["native_comparison"]["componentwise_non_regression"] is True
+    assert report["native_comparison"]["positive_improvement"] is True
+    assert report["native_comparison"]["baseline_kind"] == "ordinary_native_household_plan"
+    assert all(check["final_battery_kwh"] >= base.reserve - 0.002 for check in report["native_comparison"]["baseline_checks"].values())
+    assert len(base.car_charging_pending["commands"]) == 72
+    assert all(command["ev_on"] is False for command in base.car_charging_pending["commands"])
+    assert any(command["target_soc"] > 0 for command in base.car_charging_pending["commands"])
+    assert "sensor.combined_test_ev_soc" not in read_entities
+    assert "switch.combined_test_permission" not in read_entities
+    assert not writes
+
+    pending = deepcopy(base.car_charging_pending)
+    from inverter_service_control import dispatch_template
+
+    _set_entity(base, "select.combined_test_program_1_charging", "Grid", attributes={"options": ["Disabled", "Grid", "Generator", "Both"]})
+    with (
+        patch("car_charging_plan._observation_clock", return_value=base.now_utc),
+        patch("car_charging_policy.household_reason", wraps=household_reason) as fallback_reason,
+        patch("inverter_service_control.dispatch_template", wraps=dispatch_template) as shared_dispatch,
+    ):
+        fallback_reason.reset_mock()
+        base.publish_car_plan()
+        assert fallback_reason.call_count == 0, "Domestic candidate publication must not inspect EV availability or consent"
+        assert base.car_charging_pending is not None
+        empty_slot = base.dashboard_values["binary_sensor." + base.prefix + "_car_charging_slot"]
+        assert empty_slot["state"] == "off" and empty_slot["attributes"]["planned"] == []
+
+        outcome = base.execute_plan()
+        assert fallback_reason.call_count == 0, "Domestic dispatch must not inspect EV availability or consent"
+        assert outcome[0] == ("Charging" if pending["commands"][0]["target_soc"] else "Demand"), (outcome, base.car_charging_report)
+        assert shared_dispatch.call_count == 1
+        assert writes
+        assert base.car_charging_execution["domestic_only"] is True
+        assert base.car_charging_report["hardware_confirmed"] is False
+        base.publish_car_plan()
+        assert fallback_reason.call_count == 0, "Domestic receipt publication must not inspect EV availability or consent"
+    signal = base.dashboard_values["binary_sensor." + base.prefix + "_car_charging_slot"]
+    assert signal["state"] == "off" and signal["attributes"]["planned"] == []
+    assert base.car_charging_report["status"] == "applied"
+
+    base.car_charging_execution = {"domestic_only": False, "observations_match": True}
+    with patch("car_charging_plan._observation_clock", return_value=base.now_utc), patch("car_charging_policy.household_reason", wraps=household_reason) as fallback_reason:
+        fallback_reason.reset_mock()
+        base.publish_car_plan()
+        assert fallback_reason.call_count == 0, "Domestic handback must revoke stale EV authority without checking consent"
+    assert base.car_charging_execution is None and base.car_charging_pending is None
+    assert base.car_charging_report["status"] == "household_fallback"
+
+
+def test_household_execution_rechecks_relay_and_support_before_dispatch(base):
+    """Support loss cancels safely; an ON relay waits before any new inverter call."""
+    from car_charging_policy import household_reason
+    from car_charging_execute import execute_car_charging_plan
+    from inverter_service_control import dispatch_template
+
+    for entity, state, expected_status in (
+        ("switch.combined_test_grid_support", "off", "household_fallback"),
+        ("binary_sensor.combined_test_relay", "on", "household_waiting"),
+    ):
+        _, writes = _household_template_fixture(base)
+        reset_rates(base, 10, 0)
+        base.rate_import.update({base.minutes_now + minute: 40 for minute in range(120, 360)})
+        with patch("car_charging_plan._observation_clock", return_value=base.now_utc):
+            report = evaluate_car_charging(base, publish=False)
+        assert report["status"] == "candidate", report
+        _set_entity(base, entity, state)
+
+        with (
+            patch("car_charging_plan._observation_clock", return_value=base.now_utc),
+            patch("car_charging_policy.household_reason", wraps=household_reason) as fallback_reason,
+            patch("inverter_service_control.dispatch_template", wraps=dispatch_template) as shared_dispatch,
+        ):
+            fallback_reason.reset_mock()
+            outcome = execute_car_charging_plan(base)
+            if entity == "switch.combined_test_grid_support":
+                assert shared_dispatch.call_count == 0
+            else:
+                assert shared_dispatch.call_count == 0
+            assert fallback_reason.call_count == 0
+            base.publish_car_plan()
+            assert fallback_reason.call_count == 0
+
+        if entity == "switch.combined_test_grid_support":
+            assert not writes
+            assert outcome[0] == "Household conflict", outcome
+            assert base.car_charging_report["status"] == "safety_economics_conflict"
+            assert base.car_charging_report["household_demand_handback"] is False
+        else:
+            assert not writes
+        assert base.car_charging_pending is None and base.car_charging_execution is None
+        assert base.car_charging_report["status"] == ("safety_economics_conflict" if entity == "switch.combined_test_grid_support" else expected_status)
+        if entity == "switch.combined_test_grid_support":
+            assert outcome[0] == "Household conflict", outcome
+        else:
+            assert outcome[0] == "EV waiting", outcome
+        signal = base.dashboard_values["binary_sensor." + base.prefix + "_car_charging_slot"]
+        assert signal["state"] == "off" and signal["attributes"]["planned"] == []
+
+
+def test_household_execution_rechecks_relay_and_support_after_dispatch(base):
+    """Evidence changing while shared writes settle revokes the receipt and returns safe handback."""
+    from car_charging_policy import household_reason
+    from car_charging_execute import execute_car_charging_plan
+    from inverter_service_control import dispatch_template
+
+    for changed_entity, changed_state, expected_status in (
+        ("switch.combined_test_grid_support", "off", "household_fallback"),
+        ("binary_sensor.combined_test_relay", "on", "household_waiting"),
+    ):
+        _, writes = _household_template_fixture(base)
+        reset_rates(base, 10, 0)
+        base.rate_import.update({base.minutes_now + minute: 40 for minute in range(120, 360)})
+        with patch("car_charging_plan._observation_clock", return_value=base.now_utc):
+            report = evaluate_car_charging(base, publish=False)
+        assert report["status"] == "candidate", report
+        candidate_target = base.car_charging_pending["commands"][0]["target_soc"]
+        _set_entity(base, "select.combined_test_program_1_charging", "Grid", attributes={"options": ["Disabled", "Grid", "Generator", "Both"]})
+
+        def dispatch_then_drift(inverter, target_soc, **kwargs):
+            """Perform the real template dispatch, then model a concurrent HA observation change."""
+            observed = dispatch_template(inverter, target_soc, **kwargs)
+            _set_entity(base, changed_entity, changed_state)
+            return observed
+
+        with (
+            patch("car_charging_plan._observation_clock", return_value=base.now_utc),
+            patch("car_charging_policy.household_reason", wraps=household_reason) as fallback_reason,
+            patch("inverter_service_control.dispatch_template", side_effect=dispatch_then_drift) as shared_dispatch,
+        ):
+            fallback_reason.reset_mock()
+            outcome = execute_car_charging_plan(base)
+            if changed_entity == "switch.combined_test_grid_support":
+                assert [call.args[1] for call in shared_dispatch.call_args_list] == [candidate_target, 0]
+            else:
+                assert shared_dispatch.call_count == 1
+            assert fallback_reason.call_count == 0
+            base.publish_car_plan()
+            assert fallback_reason.call_count == 0
+
+        assert writes
+        assert base.car_charging_pending is None and base.car_charging_execution is None
+        assert base.car_charging_report["status"] == ("safety_economics_conflict" if changed_entity == "switch.combined_test_grid_support" else expected_status)
+        if changed_entity == "switch.combined_test_grid_support":
+            assert outcome[0] == "Household conflict", outcome
+            assert base.car_charging_report["household_demand_handback"] is True
+            assert base.car_charging_report["status"] == "safety_economics_conflict"
+        else:
+            assert outcome[0] == "EV waiting", outcome
+        signal = base.dashboard_values["binary_sensor." + base.prefix + "_car_charging_slot"]
+        assert signal["state"] == "off" and signal["attributes"]["planned"] == []
+
+
+def test_household_cancellation_failure_reports_unobserved_hardware_stop(base):
+    """A failed zero-target handback blocks and cannot resume native charging."""
+    from car_charging_execute import execute_car_charging_plan
+    from inverter_service_control import dispatch_template
+
+    _household_template_fixture(base)
+    reset_rates(base, 10, 0)
+    base.rate_import.update({base.minutes_now + minute: 40 for minute in range(120, 360)})
+    with patch("car_charging_plan._observation_clock", return_value=base.now_utc):
+        report = evaluate_car_charging(base, publish=False)
+    assert report["status"] == "candidate", report
+    _set_entity(base, "select.combined_test_program_1_charging", "Grid", attributes={"options": ["Disabled", "Grid", "Generator", "Both"]})
+    targets = []
+
+    def fail_zero_target(inverter, target, **kwargs):
+        """Allow the initial intent, then fail the explicit zero-target cancellation."""
+        targets.append(target)
+        if len(targets) > 1 and target == 0:
+            return False
+        observed = dispatch_template(inverter, target, **kwargs)
+        _set_entity(base, "switch.combined_test_grid_support", "off")
+        return observed
+
+    with (
+        patch("car_charging_plan._observation_clock", return_value=base.now_utc),
+        patch("inverter_service_control.dispatch_template", side_effect=fail_zero_target),
+    ):
+        outcome = execute_car_charging_plan(base)
+
+    assert len(targets) == 2 and targets[-1] == 0, f"expected one intent and one failed cancellation, got {targets}"
+    assert outcome[0] == "EV blocked", outcome
+    assert base.car_charging_report["execution_reason"] == "hardware_stop_not_observed"
+    assert base.car_charging_execution is None and base.car_charging_pending is None
+    assert base.isCharging is False and base.isExporting is False
+
+
+def test_domestic_economic_fallback_remains_default_false(base):
+    """The existing native household handback does not become an arbitrage plan by default."""
+    _household_template_fixture(base, economic_fallback=False)
+
+    with patch("car_charging_plan._observation_clock", return_value=base.now_utc):
+        report = evaluate_car_charging(base, publish=False)
+
+    assert report["status"] == "household_fallback", report
+    assert "demand_comparison" not in report
+    assert base.car_charging_pending is None
+
+
+def test_household_fallback_keeps_demand_when_arbitrage_does_not_save(base):
+    """A household candidate must improve componentwise on the ordinary native baseline."""
+    _household_template_fixture(base)
+    reset_rates(base, 40, 0)
+    base.soc_kw = 20
+    with patch("car_charging_plan._observation_clock", return_value=base.now_utc):
+        report = evaluate_car_charging(base, publish=False)
+
+    assert report["status"] == "household_fallback", report
+    assert report["native_comparison"]["status"] == "not_componentwise_cheaper"
+    assert report["native_comparison"]["componentwise_rejected_candidates"]
+    assert base.car_charging_pending is None
+
+
+def test_household_fallback_waits_for_relay_off_and_enabled_grid_support(base):
+    """Support loss blocks new charge, while only live relay OFF permits a safe Demand handback."""
+    from car_charging_execute import execute_car_charging_plan
+    from inverter_service_control import dispatch_template
+
+    for support_state, limit_state in (("off", "6000"), ("unknown", "6000"), ("on", "unknown")):
+        _, writes = _household_template_fixture(base, minutes=60)
+        _set_entity(base, "switch.combined_test_grid_support", support_state)
+        _set_entity(base, "number.combined_test_grid_support", limit_state)
+        with patch("car_charging_plan._observation_clock", return_value=base.now_utc):
+            report = evaluate_car_charging(base, publish=False)
+        assert report["status"] == "household_fallback", (support_state, limit_state, report)
+        assert base.car_charging_pending is None
+        with patch("car_charging_plan._observation_clock", return_value=base.now_utc), patch("inverter_service_control.dispatch_template", wraps=dispatch_template) as handback:
+            outcome = execute_car_charging_plan(base)
+        assert outcome[0] == "Household conflict", (support_state, limit_state, outcome)
+        assert handback.call_count == 0
+        assert base.car_charging_report["status"] == "safety_economics_conflict"
+
+    for relay_state in ("on", "unknown"):
+        _, writes = _household_template_fixture(base, minutes=60)
+        _set_entity(base, "binary_sensor.combined_test_relay", relay_state)
+        with patch("car_charging_plan._observation_clock", return_value=base.now_utc):
+            report = evaluate_car_charging(base, publish=False)
+        assert report["status"] == "household_waiting", (relay_state, report)
+        assert base.car_charging_pending is None
+        with patch("car_charging_plan._observation_clock", return_value=base.now_utc):
+            outcome = execute_car_charging_plan(base)
+        assert outcome[0] == "EV waiting", (relay_state, outcome)
+        assert not writes
+
+
 def run_car_planning_grid_support_tests(base):
     """Run deterministic dispatch and authority-boundary regressions."""
     for test in (test_grid_support_recorded_charge_request, test_grid_support_headroom_and_exhaustion, test_grid_support_continuous_ev_before_solar):
@@ -468,4 +1393,29 @@ def run_car_planning_grid_support_tests(base):
     test_grid_support_domestic_targets_follow_solar(base)
     test_initial_demand_is_a_scoped_search_constraint()
     test_self_consumption_preference_is_paired_and_explicit(base)
+    test_household_demand_comparison_uses_an_all_demand_baseline(base)
+    test_household_direct_demand_replay_runs_when_solver_finds_no_candidate(base)
+    test_household_authorized_metered_route_does_not_require_ev_reads(base)
+    test_household_fallback_refuses_to_stage_without_a_valid_native_plan(base)
+    test_household_native_baseline_replays_the_pre_fallback_plan_snapshot(base)
+    test_household_baseline_uses_native_schedule_after_current_cycle_recompute(base)
+    test_household_economic_gate_rejects_nominal_regression_hidden_by_pv10_savings(base)
+    test_household_fallback_requires_live_ha_transport_for_cached_controls(base)
+    test_household_fallback_rechecks_controls_from_live_ha_state_api(base)
+    test_household_fallback_blocks_when_live_control_request_raises(base)
+    test_joint_search_miss_attempts_opted_in_household_fallback(base)
+    test_household_native_cost_refinement_runs_both_beams_and_includes_cycle_and_terminal_value(base)
+    test_household_native_cost_refinement_discards_scenario_regression_before_ranking(base)
+    test_household_direct_demand_counterfactual_can_fail_cap_without_blocking_candidate(base)
+    test_household_failed_economic_gate_resumes_paired_safe_native_plan(base)
+    test_household_rejected_candidate_reports_conflict_when_native_replay_fails(base)
+    test_household_prior_temporary_authority_is_cancelled_before_native_handoff(base)
+    test_household_fallback_validates_48h_and_displays_only_24h(base)
+    test_household_fallback_plans_cheaper_than_demand_without_ev_evidence(base)
+    test_household_execution_rechecks_relay_and_support_before_dispatch(base)
+    test_household_execution_rechecks_relay_and_support_after_dispatch(base)
+    test_household_cancellation_failure_reports_unobserved_hardware_stop(base)
+    test_domestic_economic_fallback_remains_default_false(base)
+    test_household_fallback_keeps_demand_when_arbitrage_does_not_save(base)
+    test_household_fallback_waits_for_relay_off_and_enabled_grid_support(base)
     return False
