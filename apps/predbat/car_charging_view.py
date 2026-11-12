@@ -582,6 +582,7 @@ def build_car_charging_plan_view(native_plan, report, now=None):
         cost_color = "#FFFFFF"
         if _is_finite(cost):
             cost_color = "#F18261" if cost >= 0.1 else ("#FFFF00" if cost >= 0.005 else ("#3AEE85" if cost <= -0.005 else "#FFFFFF"))
+        displayed_pv = round(row["pv_kwh"], 2)
         view["rows"].append(
             {
                 "time": row["start"],
@@ -598,7 +599,7 @@ def build_car_charging_plan_view(native_plan, report, now=None):
                 "show_limit": show_limit,
                 "reasons": reasons,
                 "split": False,
-                "pv_forecast": round(row["pv_kwh"], 2),
+                "pv_forecast": displayed_pv,
                 "pv_forecast10": round(pv10["pv_kwh"], 2),
                 "load_forecast": round(row["house_kwh"], 2),
                 "load_forecast10": round(pv10["house_kwh"], 2),
@@ -610,7 +611,7 @@ def build_car_charging_plan_view(native_plan, report, now=None):
                 "soc_sym": soc_sym,
                 "soc_color": "#F18261" if row["battery_start_percent"] < 20 else ("#FFFF00" if row["battery_start_percent"] < 50 else "#3AEE85"),
                 "load_color": "#F18261" if row["house_kwh"] >= 0.5 else ("#FFFF00" if row["house_kwh"] >= 0.25 else ("#AAFFAA" if row["house_kwh"] > 0 else "#FFFFFF")),
-                "pv_color": "#FFAAAA" if row["pv_kwh"] >= 0.2 else ("#FFFF00" if row["pv_kwh"] >= 0.1 else "#FFFFFF"),
+                "pv_color": "#FFAAAA" if displayed_pv >= 0.2 else ("#FFFF00" if displayed_pv >= 0.1 else "#FFFFFF"),
                 "car_color": "#FFFF00" if row["ev_reserved_kwh"] > 0 else "#FFFFFF",
                 "soc_end_percent": row["battery_end_percent"],
                 "plan_soc_pv10_start_percent": pv10["battery_start_percent"],
