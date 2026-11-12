@@ -107,6 +107,19 @@ def _stage(base, **kwargs):
     """Attest only within a synthetic fixture; staging itself must never actuate."""
     fixture = _template_inputs(base, **kwargs)
     car_settings(base).update(mode="apply", apply_verified=True, ev_executor_lease_verified=True)
+    # COST apply requires a paired ordinary-plan reference from this exact
+    # synthetic cycle. Use a safe, equal-cost alternative for the template path.
+    base.import_limit = 12000.0
+    car_settings(base)["import_limit_w"] = 12000.0
+    base.rate_import.update({base.minutes_now + minute: 10 for minute in range(base.forecast_minutes)})
+    base.plan_valid = True
+    base.plan_last_updated = base.now_utc
+    base.plan_last_updated_minutes = base.minutes_now
+    base.plan_made_by_version = "synthetic-current-cycle"
+    base.charge_window_best = [{"start": base.minutes_now + 40, "end": base.minutes_now + 45, "average": 10, "target": base.soc_max}]
+    base.charge_limit_best = [base.soc_max]
+    base.export_window_best = []
+    base.export_limits_best = []
     before = _controls(base)
     report = evaluate_car_charging(base, publish=False)
     assert report["status"] == "candidate", report
@@ -217,11 +230,21 @@ def test_real_template_failed_write_and_drift(base):
 def test_real_template_charge_then_house_only(base):
     """A closed session can replenish the house but never renew EV permission."""
     inverter, writes, sources, targets = _template_inputs(base, pv=0)
-    base.soc_kw = base.reserve + 0.05
+    base.soc_kw = 12.0
     session = car_settings(base)["session"]
     session.update(available_from=(base.now_utc - timedelta(hours=2)).isoformat(), departure=(base.now_utc - timedelta(minutes=5)).isoformat())
     original = deepcopy(session)
-    car_settings(base).update(mode="apply", apply_verified=True, ev_executor_lease_verified=True, terminal_min_percent=15)
+    car_settings(base).update(mode="apply", apply_verified=True, ev_executor_lease_verified=True, terminal_min_percent=15, import_limit_w=12000)
+    base.import_limit = 12000.0
+    base.rate_import.update({base.minutes_now + minute: 10 for minute in range(base.forecast_minutes)})
+    base.plan_valid = True
+    base.plan_last_updated = base.now_utc
+    base.plan_last_updated_minutes = base.minutes_now
+    base.plan_made_by_version = "synthetic-current-cycle"
+    base.charge_window_best = [{"start": base.minutes_now, "end": base.minutes_now + 5, "average": 10, "target": base.soc_max}]
+    base.charge_limit_best = [base.soc_max]
+    base.export_window_best = []
+    base.export_limits_best = []
     base.all_active_keep[base.minutes_now + 5] = base.soc_kw / base.soc_max * 100 + 0.25
     report = evaluate_car_charging(base, publish=False)
     assert report["status"] == "candidate", report
@@ -229,10 +252,11 @@ def test_real_template_charge_then_house_only(base):
     assert not any(command["ev_on"] for command in base.car_charging_pending["commands"])
     assert base.car_charging_pending["commands"][0]["target_soc"] == 100
     _set_entity(base, "binary_sensor.combined_test_relay", "on", last_changed=base.now_utc - timedelta(minutes=10))
-    assert base.execute_plan() == ("EV blocked", "waiting_for_ev_relay_off")
+    assert base.execute_plan() == ("EV blocked", "economic_inputs_changed")
     assert not writes
     base.had_errors = False
     _set_entity(base, "binary_sensor.combined_test_relay", "off", last_changed=base.now_utc - timedelta(minutes=10))
+    assert evaluate_car_charging(base, publish=False)["status"] == "candidate"
     outcome = base.execute_plan()
     assert outcome[0] == "Charging", (outcome, base.car_charging_report)
     assert all(base.ha_interface.get_state(entity) == "Grid" for entity in sources)
@@ -246,8 +270,10 @@ def test_real_template_full_horizon(base):
     """The real demand/charge-only model meets a dated EV target and both 48-hour checks."""
     inverter, writes, _, _ = _template_inputs(base, minutes=2880, pv=0)
     base.car_charging_limit[0] = base.car_charging_battery_size[0] = 25
-    base.car_charging_soc[0] = 3.25
-    _set_entity(base, "sensor.combined_test_ev_soc", 3.25)
+    # Keep the 25 kWh departure target achievable under the battery's safe
+    # SOC ceiling and the deliberately zero-PV, 1 kW house-load horizon.
+    base.car_charging_soc[0] = 17.25
+    _set_entity(base, "sensor.combined_test_ev_soc", 17.25)
     departure = (base.now_utc + timedelta(days=1)).replace(hour=7, minute=30, second=0, microsecond=0)
     car_settings(base)["session"].update(departure=departure.isoformat(), soc_kwh=3.25)
     car_settings(base)["beam_width"] = 128
@@ -301,7 +327,8 @@ def test_real_template_manual_floor_and_no_plan(base):
     base.soc_kw = base.reserve
     car_settings(base).update(mode="apply", apply_verified=True, ev_executor_lease_verified=True)
     report = evaluate_car_charging(base, publish=False)
-    assert report["status"] == "no_plan_found", report
+    assert report["status"] == "economic_rejected", report
+    assert report["execution_reason"] == "no_eligible_paired_economic_candidate", report
     assert not base.car_charging_pending
     assert base.execute_plan()[0] == "EV blocked"
     assert not writes and not any(base.car_charging_slots)

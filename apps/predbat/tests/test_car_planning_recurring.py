@@ -643,15 +643,18 @@ def test_recurring_stop_acknowledgement_keeps_electrical_guards(base):
 
 
 def handoff_inputs(base, next_ev=True):
-    """Stage a paired-safe EV run whose domestic target changes at the first boundary."""
+    """Stage a paired-safe EV run with a first-slot domestic target boundary."""
     from car_charging_execute import command_fingerprint, execute_car_charging_plan
     from car_charging_plan import evaluate_car_charging
 
     fixture, _ = recurring_inputs(base)
+    # Make the native candidate stop battery charging after the first five-minute
+    # cheap slot while the solver keeps the EV delivery ON across that boundary.
+    base.rate_import.update({base.minutes_now + minute: 1 if minute < 5 else 10 for minute in range(base.forecast_minutes)})
     assert evaluate_car_charging(base, publish=False)["status"] == "candidate"
     pending = base.car_charging_pending
-    # Use the actual complete paired-replay candidate, which has a domestic-only
-    # transition after its first step while the accepted EV run stays ON.
+    # The target transition comes from this accepted paired-replay candidate,
+    # rather than a post-validation mutation of its commands.
     first = pending["commands"][0]
     assert first["ev_on"] and pending["commands"][1]["ev_on"]
     assert first["target_soc"] != pending["commands"][1]["target_soc"]
@@ -666,7 +669,7 @@ def handoff_inputs(base, next_ev=True):
 
 
 def test_recurring_domestic_boundary_keeps_only_bounded_ev_handoff(base):
-    """An already-ON EV survives normal dispatch latency, never an off slot or stale plan."""
+    """An already-ON EV survives domestic target-boundary latency, never an off slot or stale plan."""
     from car_charging_execute import publish_car_charging_slot
 
     _, writes, _, _ = handoff_inputs(base)

@@ -87,6 +87,7 @@ def test_now_can_use_shared_grid_support(base):
     """Immediate charging can choose supported Charge when a current Demand start fails the floor."""
     _, writes, _, _ = _actual_inputs(base)
     car_settings(base).update(ev_charging_priority="now", self_consumption_first=True)
+    base.all_active_keep = {base.minutes_now + minute: 50 for minute in range(5)}
     report = evaluate_car_charging(base, publish=False)
     assert first_start(base, report) == 0
     assert base.car_charging_pending["commands"][0]["target_soc"] > 0

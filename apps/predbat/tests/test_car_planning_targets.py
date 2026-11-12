@@ -3,51 +3,145 @@
 from tests.car_planning_fixtures import car_settings
 
 from copy import deepcopy
+import math
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from car_charging_solver import Slot
-from car_charging_plan import _native_windows, _replay, _replay_candidate, _options, build_candidate, evaluate_car_charging
+from car_charging_plan import _native_windows, _replay_candidate, _options, build_candidate, evaluate_car_charging
 from car_charging_view import build_car_charging_plan_view, _unavailable_reason
 from tests.test_car_planning_native import _setup, _controls
 from tests.test_car_planning_single_table import _native_plan, _good_report
 
 
 def test_charge_ceiling_is_replayed_not_cosmetic(base):
-    """A short charge uses its attainable paired peak plus margin, not a 100% label."""
+    """A solver trajectory supplies the whole-percent target which both native cases replay."""
     _setup(base, minutes=60)
     base.car_charging_limit = [0] * len(base.car_charging_limit)
-    result = SimpleNamespace(status="feasible", actions=tuple(SimpleNamespace(slot_index=index, battery_mode="charge", ev_action="off") for index in range(12)))
+    trajectory_peak = max(base.soc_kw, base.soc_max * 0.73)
+    result = SimpleNamespace(
+        status="feasible",
+        actions=tuple(SimpleNamespace(slot_index=index, battery_mode="charge", ev_action="off") for index in range(12)),
+        battery_soc_trace=tuple([base.soc_kw] + [trajectory_peak] * 12),
+    )
     slots = [Slot(index, index * 5, 5, 1 / 12, 0, 10, 0) for index in range(12)]
     options = dict(mode="shadow", ev_soc=0, import_limit_w=6000, terminal_min=base.reserve, initially_on=False, initial_off_minutes=10, pause=15, restart=25, arrival=0, deadline=60, off_minutes=10, load_cap=10)
     before = _controls(base)
     original = _native_windows(base, result, slots)
-    baseline = {name: _replay(base, options, result, slots, original, scenario) for name, scenario in (("nominal", 0), ("pv10", 1))}
-    windows, checks = _replay_candidate(base, options, result, slots)
+    replay_calls = []
+
+    def replay_with_ceiling(_base, _options, _result, _slots, windows, scenario):
+        """Capture the exact bound and mark the full paired horizon as independently checked."""
+        replay_calls.append((windows, scenario))
+        return {"passed": True, "reasons": [], "checked_minutes": 60}
+
+    with patch("car_charging_plan._replay", side_effect=replay_with_ceiling):
+        windows, checks = _replay_candidate(base, options, result, slots)
     target = windows[2][0] * 100 / base.soc_max
-    peak_percent = max(max(check["_charge_peak_kwh"]) for check in baseline.values()) * 100 / base.soc_max
-    assert peak_percent + 1 <= target < peak_percent + 2.0001 and target < 100
+    expected = math.floor(trajectory_peak * 100 / base.soc_max + 1e-9)
+    assert target == expected and target <= trajectory_peak * 100 / base.soc_max and target < 100
     assert original[2] == [base.soc_max]
-    for scenario, check in checks.items():
+    for index, (scenario, check) in enumerate(checks.items()):
         assert check["passed"] and "_charge_peak_kwh" not in check
-        assert check["final_battery_kwh"] == baseline[scenario]["final_battery_kwh"]
-        assert check["horizon_energy_cost"] == baseline[scenario]["horizon_energy_cost"]
-        assert all(abs(row["charge_target_percent"] - target) < 1e-9 for row in check["_preview_rows"])
+        assert check["checked_minutes"] == 60
+        assert replay_calls[index][1] == index
+        assert replay_calls[index][0][2] == windows[2]
     assert _controls(base) == before
 
 
 def test_reduced_target_failure_cannot_reuse_full_target(base):
     """A second replay rejection stays rejected; the first passed result cannot leak."""
     actions = [SimpleNamespace(slot_index=0, battery_mode="charge", ev_action="off")]
-    result = SimpleNamespace(actions=actions)
+    result = SimpleNamespace(actions=actions, battery_soc_trace=(base.soc_max * 0.5, base.soc_max * 0.5))
     slots = [Slot(0, 0, 5, 0, 0, 10, 0)]
     reference = {"passed": True, "reasons": [], "_charge_peak_kwh": [base.soc_max * 0.5]}
     rejected = {"passed": False, "reasons": ["site_import_exceeded"], "_charge_peak_kwh": [base.soc_max * 0.5]}
-    with patch("car_charging_plan._replay", side_effect=[deepcopy(reference), deepcopy(reference), deepcopy(reference), deepcopy(rejected)]):
+    with patch("car_charging_plan._replay", side_effect=[deepcopy(reference), deepcopy(rejected)]):
         windows, checks = _replay_candidate(base, {"mode": "shadow"}, result, slots)
-    assert round(windows[2][0] * 100 / base.soc_max) == 51
+    assert round(windows[2][0] * 100 / base.soc_max) == 50
     assert checks["pv10"]["passed"] is False
     assert all("_charge_peak_kwh" not in check for check in checks.values())
+
+
+def test_charge_ceiling_uses_each_solver_charge_run_and_preserves_full_target(base):
+    """Each contiguous charge run gets its solver-trace ceiling before paired replay."""
+    _setup(base, minutes=20)
+    base.car_charging_limit = [0] * len(base.car_charging_limit)
+    actions = tuple(SimpleNamespace(slot_index=index, battery_mode=mode, ev_action="off", discharge_limit_kw=None) for index, mode in enumerate(("charge", "charge", "demand", "charge")))
+    trace = (base.soc_max * 0.4, base.soc_max * 0.65, base.soc_max * 0.70, base.soc_max * 0.68, base.soc_max)
+    result = SimpleNamespace(actions=actions, battery_soc_trace=trace)
+    slots = [Slot(index, index * 5, 5, 0.1, 0, 10, 0) for index in range(4)]
+    options = {"mode": "shadow", "grid_charge_support_w": 0}
+    observed_limits = []
+
+    def replay_with_limit(_base, _options, _result, _slots, windows, _scenario):
+        """Record only the discrete ceilings presented to native replay."""
+        observed_limits.append(windows[2])
+        return {"passed": True, "reasons": [], "checked_minutes": 20}
+
+    with patch("car_charging_plan._replay", side_effect=replay_with_limit) as replay:
+        windows, checks = _replay_candidate(base, options, result, slots)
+
+    assert [round(limit * 100 / base.soc_max) for limit in windows[2]] == [70, 100]
+    assert observed_limits == [windows[2], windows[2]]
+    assert replay.call_count == 2
+    assert all(check["passed"] for check in checks.values())
+
+
+def test_charge_ceiling_and_window_label_split_at_tariff_boundary(base):
+    """A later cheap-band peak cannot authorize an early expensive-band target."""
+    from car_charging_plan import _candidate_commands
+
+    _setup(base, minutes=20)
+    base.car_charging_limit = [0] * len(base.car_charging_limit)
+    actions = tuple(SimpleNamespace(slot_index=index, battery_mode="charge", ev_action="off", discharge_limit_kw=None) for index in range(4))
+    trace = (base.soc_max * 0.80, base.soc_max * 0.85, base.soc_max * 0.889, base.soc_max * 0.94, base.soc_max)
+    result = SimpleNamespace(actions=actions, battery_soc_trace=trace)
+    slots = [Slot(index, index * 5, 5, 0.1, 0, 19.1 if index < 2 else 8.1, 0) for index in range(4)]
+    options = {"mode": "shadow", "grid_charge_support_w": 0}
+
+    with patch("car_charging_plan._replay", return_value={"passed": True, "reasons": [], "checked_minutes": 20}):
+        windows, checks = _replay_candidate(base, options, result, slots)
+
+    assert [(window["start"], window["end"], window["average"]) for window in windows[1]] == [
+        (base.minutes_now, base.minutes_now + 10, 19.1),
+        (base.minutes_now + 10, base.minutes_now + 20, 8.1),
+    ]
+    assert [round(limit * 100 / base.soc_max) for limit in windows[2]] == [88, 100]
+    commands = _candidate_commands(base, result, slots, windows)
+    assert [command["target_soc"] for command in commands] == [88, 88, 100, 100]
+    assert all(check["passed"] for check in checks.values())
+
+
+def test_solver_charge_ceiling_keeps_hold_window_aligned(base):
+    """Interleaved Hold windows keep their native reserve limit between charge ceilings."""
+    _setup(base, minutes=15)
+    base.car_charging_limit = [0] * len(base.car_charging_limit)
+    actions = tuple(SimpleNamespace(slot_index=index, battery_mode=mode, ev_action="off", discharge_limit_kw=None) for index, mode in enumerate(("charge", "hold", "charge")))
+    trace = (base.soc_max * 0.4, base.soc_max * 0.6, base.soc_max * 0.55, base.soc_max * 0.8)
+    result = SimpleNamespace(actions=actions, battery_soc_trace=trace)
+    slots = [Slot(index, index * 5, 5, 0.1, 0, 10, 0) for index in range(3)]
+
+    with patch("car_charging_plan._replay", return_value={"passed": True, "reasons": [], "checked_minutes": 15}):
+        windows, checks = _replay_candidate(base, {"mode": "shadow"}, result, slots)
+
+    assert len(windows[1]) == len(windows[2]) == 3
+    assert [round(limit * 100 / base.soc_max) for limit in windows[2]] == [60, round(base.reserve * 100 / base.soc_max), 80]
+    assert all(check["passed"] for check in checks.values())
+
+
+def test_non_finite_solver_charge_trajectory_fails_closed(base):
+    """A malformed solver SOC bound cannot be replaced by an inflated ceiling."""
+    actions = (SimpleNamespace(slot_index=0, battery_mode="charge", ev_action="off", discharge_limit_kw=None),)
+    result = SimpleNamespace(actions=actions, battery_soc_trace=(20.0, float("nan")))
+    slots = [Slot(0, 0, 5, 0.1, 0, 10, 0)]
+
+    try:
+        _replay_candidate(base, {"mode": "shadow"}, result, slots)
+    except ValueError as exc:
+        assert "charge" in str(exc).lower() or "soc" in str(exc).lower()
+    else:
+        raise AssertionError("Non-finite solver trajectory produced an executable charge ceiling")
 
 
 def test_table_limit_uses_real_candidate_target():
@@ -94,13 +188,13 @@ def test_conservative_search_miss_gets_bounded_retry(base):
 
 
 def test_apply_ceiling_contract_is_not_changed(base):
-    """The presentation request cannot silently change the commissioned apply contract."""
-    result = SimpleNamespace(actions=[SimpleNamespace(slot_index=0, battery_mode="charge", ev_action="off")])
+    """Apply commands are bounded by the solver trace too; full SOC remains valid when actually planned."""
+    result = SimpleNamespace(actions=[SimpleNamespace(slot_index=0, battery_mode="charge", ev_action="off")], battery_soc_trace=(base.soc_max * 0.5, base.soc_max * 0.5))
     slots = [Slot(0, 0, 5, 0, 0, 10, 0)]
-    reference = {"passed": True, "reasons": [], "_charge_peak_kwh": [base.soc_max * 0.5]}
+    reference = {"passed": True, "reasons": []}
     with patch("car_charging_plan._replay", side_effect=[deepcopy(reference), deepcopy(reference)]) as replay:
         windows, checks = _replay_candidate(base, {"mode": "apply"}, result, slots)
-    assert windows[2] == [base.soc_max] and replay.call_count == 2
+    assert windows[2] == [base.soc_max * 0.5] and replay.call_count == 2
     assert all("_charge_peak_kwh" not in check for check in checks.values())
 
 
@@ -136,6 +230,10 @@ def run_car_planning_targets_tests(base):
     """Run replay-target and rejection-message regressions through the native harness."""
     for test in (
         test_charge_ceiling_is_replayed_not_cosmetic,
+        test_charge_ceiling_uses_each_solver_charge_run_and_preserves_full_target,
+        test_charge_ceiling_and_window_label_split_at_tariff_boundary,
+        test_solver_charge_ceiling_keeps_hold_window_aligned,
+        test_non_finite_solver_charge_trajectory_fails_closed,
         test_reduced_target_failure_cannot_reuse_full_target,
         test_conservative_search_miss_gets_bounded_retry,
         test_apply_ceiling_contract_is_not_changed,

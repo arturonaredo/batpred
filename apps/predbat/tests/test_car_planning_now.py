@@ -82,6 +82,11 @@ def test_now_never_substitutes_asap_or_cost_fallback(base):
     _set_entity(base, PRIORITY_ENTITY, "asap")
     later = evaluate_car_charging(base, publish=False)
     assert later["status"] == "candidate" and later["proposed_ev_windows"][0]["start"] > base.minutes_now, later
+    # Keep support authorised but below the EV + house load; immediate
+    # battery-backed charging would then breach the current domestic floor.
+    base.import_limit = 6000.0
+    car_settings(base)["import_limit_w"] = 6000.0
+    _set_entity(base, "number.test_support", "6000")
     _set_entity(base, PRIORITY_ENTITY, "now")
     report = evaluate_car_charging(base, publish=False)
     assert report["status"] == "no_plan_found" and "immediate_start_not_validated" in report["execution_blockers"], report
