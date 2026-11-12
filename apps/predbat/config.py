@@ -2813,6 +2813,7 @@ APPS_SCHEMA = {
         "type": "sensor_list",
         "sensor_type": "dict|list",
     },
+    "load_forecast_replaces": {"type": "dict"},
     "ge_cloud_data": {"type": "boolean"},
     "ge_cloud_serial": {"type": "string", "empty": False},
     "ge_cloud_key": {"type": "string", "empty": False},

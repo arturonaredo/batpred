@@ -231,13 +231,39 @@ Add a **load_forecast** entry in `apps.yaml` to configure Predbat to use the [Pr
     - predheat.heat_energy$external
 ```
 
-### Exclude Heat Pump load
+### Replace space-heating history with the Predheat forecast
 
-If your **load_today** sensor in `apps.yaml` already contains your heat pump load then when Predbat forecasts your house load, the heat pump load will be double counted - once from historical house load data, and once from the Predheat forecast.
+If the `load_today` sensor includes space-heating energy, adding the Predheat forecast without replacing that
+component would count it twice. Use `load_forecast_replaces` to pair the forecast with the existing heating energy
+counter. Keep `load_today` pointed at the original whole-house sensor; this feature does not alter raw load or
+cost accounting.
 
-To resolve this you need to use **car_charging_energy** to [exclude heat pump load](car-charging.md#filtering-car-charging-energy-from-house-load) from the historical house load energy. e.g.:
+If the counter measures only space heating:
 
 ```yaml
-  car_charging_energy:
-    - 'sensor.ashp_energy_today'
+  load_forecast:
+    - predheat.heat_energy$external
+  load_forecast_replaces:
+    predheat.heat_energy$external: sensor.space_heating_energy_total
 ```
+
+If the counter also includes hot water or other use, add the history of the actual space-heating active state:
+
+```yaml
+  load_forecast_replaces:
+    predheat.heat_energy$external:
+      energy: sensor.heating_energy_total
+      active: binary_sensor.space_heating_active
+```
+
+Only samples recorded while the active sensor was `on` are subtracted. `off`, `unknown`, and unavailable periods
+stay in the historical base, intentionally preferring possible over-prediction to removing ACS or uncertain
+energy. An isolated unavailable interval in the energy counter keeps the original whole-house load for only the
+affected buckets; the rest of the traceable history can still be replaced. A stale/invalid forecast, short active
+history, or counter inconsistency keeps the complete historical load. Automatic history (`days_previous_auto`)
+must be enabled, and configured `load_forecast_only` must be false when extra forecasts are fetched (Predbat may
+set its runtime flag true later after building the weighted-history forecast). See
+[Load Forecast](apps-yaml.md#replace-a-component-of-the-historical-load-with-its-forecast) for freshness,
+coverage, and history requirements.
+
+Do not use `car_charging_energy` for heating: that setting affects EV load filtering and vehicle accounting.

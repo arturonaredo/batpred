@@ -4586,13 +4586,14 @@ class Fetch:
         holiday_minutes, _ = minute_data(history[0], history_days, now_utc, "state", "last_updated", backwards=True)
         return holiday_minutes or None
 
-    def sample_load_history_bucket(self, minute_previous, holiday_minutes, max_holiday_index):
+    def sample_load_history_bucket(self, minute_previous, holiday_minutes, max_holiday_index, replacement_mask=None):
         """
         Read one 5-minute load history bucket (minute_previous minutes ago) for the weighted-bucket forecast.
 
-        Returns (sample, holiday_active), or None for a zero (missing-data) bucket - those are skipped entirely
-        so gaps in the history do not drag the estimate down. base_in_raw=False keeps raw at the true measured
-        load so genuine gaps are detected even when a base load is configured (the sample still has it applied).
+        Returns (sample, holiday_active, replaced_energy_removed), or None for a zero (missing-data) bucket - those
+        are skipped entirely so gaps in the history do not drag the estimate down. base_in_raw=False keeps raw at
+        the true measured load so genuine gaps are detected even when a base load is configured (the sample still
+        has it applied).
 
         holiday_active is the holiday state at the moment this individual sample was recorded. A sample older
         than the holiday history we hold is treated as not on holiday, the same default minute_data gives for a
@@ -4602,32 +4603,51 @@ class Fetch:
         sample, raw = self.get_filtered_load_minute(self.load_minutes, minute_previous, historical=False, step=PREDICT_STEP, base_in_raw=False)
         if raw <= 0:
             return None
+        heating_removed = 0.0
+        if replacement_mask:
+            replacements = getattr(self, "__load_forecast_replacements", [])
+            heating_energy = 0.0
+            for replace, replacement in zip(replacement_mask, replacements):
+                if not replace:
+                    continue
+                energy = replacement["energy_minutes"]
+                energy_valid = replacement.get("energy_valid_minutes")
+                active = replacement.get("active_minutes")
+                for offset in range(PREDICT_STEP):
+                    minute = minute_previous + offset
+                    if (energy_valid is None or energy_valid.get(minute, 0) == 1) and (active is None or active.get(minute, 0) == 1):
+                        heating_energy += self.get_from_incrementing(energy, minute)
+            sample_after_replacement = max(sample - heating_energy, self.base_load * PREDICT_STEP / 60.0)
+            heating_removed = max(sample - sample_after_replacement, 0.0)
+            sample = sample_after_replacement
         if holiday_minutes is None or minute_previous > max_holiday_index:
             holiday_active = False
         else:
             holiday_active = holiday_minutes.get(minute_previous, 0) > 0
-        return sample, holiday_active
+        return sample, holiday_active, heating_removed
 
-    def recorded_load_average(self, num_days, holiday_minutes, max_holiday_index):
+    def recorded_load_average(self, num_days, holiday_minutes, max_holiday_index, replacement_mask=None):
         """
         Average 5-minute load over every bucket recorded in the search window, today so far included, kept apart
         by holiday state. Used to fill forecast slots whose time of day has never been recorded (batpred#5548).
 
-        Returns {holiday_active: average kWh per 5 minutes} for each state with at least
-        LOAD_FORECAST_RECORDED_MIN_MINUTES of recorded load, so the first few minutes after an install cannot
-        set the whole forecast on their own.
+        Returns {holiday_active: (average kWh per 5 minutes, average replaced-component kWh)} for each state
+        with at least LOAD_FORECAST_RECORDED_MIN_MINUTES of recorded load, so the first few minutes after an
+        install cannot set the whole forecast on their own.
         """
         totals = {False: 0.0, True: 0.0}
+        removed_totals = {False: 0.0, True: 0.0}
         counts = {False: 0, True: 0}
         for minute_previous in range(0, (num_days + 1) * 24 * 60, PREDICT_STEP):
-            bucket = self.sample_load_history_bucket(minute_previous, holiday_minutes, max_holiday_index)
+            bucket = self.sample_load_history_bucket(minute_previous, holiday_minutes, max_holiday_index, replacement_mask=replacement_mask)
             if bucket is None:
                 continue
-            sample, holiday_active = bucket
+            sample, holiday_active, removed = bucket
             totals[holiday_active] += sample
+            removed_totals[holiday_active] += removed
             counts[holiday_active] += 1
         min_buckets = LOAD_FORECAST_RECORDED_MIN_MINUTES // PREDICT_STEP
-        return {state: totals[state] / counts[state] for state in totals if counts[state] >= min_buckets}
+        return {state: (totals[state] / counts[state], removed_totals[state] / counts[state]) for state in totals if counts[state] >= min_buckets}
 
     def compute_load_forecast_history(self, now_utc):
         """
@@ -4664,7 +4684,10 @@ class Fetch:
 
         Returns a cumulative-from-midnight kWh dict (same format as the ML load forecast), or {} if no data.
         """
+        replacements = getattr(self, "__load_forecast_replacements", [])
         if not self.load_minutes:
+            if replacements:
+                self.log("Load forecast replacement application: status=not_applied reason=raw_house_history_missing accepted_pairs={}".format(len(replacements)))
             return {}
         # Search window comes from max_days_previous (derived from days_previous), bounded by available history.
         # load_minutes_age counts whole 24-hour periods, so it is still 0 at 14:00 for a 20:00 install yesterday;
@@ -4705,50 +4728,66 @@ class Fetch:
         has_history = False
         today_slots = 0
         average_slots = 0
-        recorded_average = None  # built on first use - only slots no previous day covers need it
+        recorded_average = {}  # cached by replacement coverage - only slots no previous day covers need it
         base_step = self.base_load * PREDICT_STEP / 60.0
+        replacement_forward_covered_minutes = 0
+        future_weighted_component_removed = 0.0
         for minute_absolute in range(0, horizon_end, PREDICT_STEP):
             tod = minute_absolute % (24 * 60)  # time of day of this slot
             # Holiday state of the day this slot falls on, not of today. holiday_days_left counts whole days
             # remaining including today and is decremented at midnight, so the day you travel home (and every
             # day after it) is planned against non-holiday history while you are still away.
             slot_holiday = self.holiday_days_left > (minute_absolute // (24 * 60))
+            replacement_mask = tuple(minute_absolute >= self.minutes_now and minute_absolute >= replacement["coverage_start"] and minute_absolute + PREDICT_STEP <= replacement["coverage_end"] for replacement in replacements)
+            replace_this_future_bucket = minute_absolute >= self.minutes_now and any(replacement_mask)
+            if replace_this_future_bucket:
+                replacement_forward_covered_minutes += PREDICT_STEP
             match_total = 0.0
             match_weight = 0.0
+            match_removed_total = 0.0
             all_total = 0.0
             all_weight = 0.0
+            all_removed_total = 0.0
+            weighted_removed = 0.0
             for d in range(1, num_days + 1):
                 # Sample d whole days ago at this slot's time of day. Counting in whole days from today keeps
                 # each day distinct and handles midnight crossings (the slot may be tomorrow or later).
                 minute_previous = (self.minutes_now - tod) + d * 24 * 60
-                bucket = self.sample_load_history_bucket(minute_previous, holiday_minutes, max_holiday_index)
+                bucket = self.sample_load_history_bucket(minute_previous, holiday_minutes, max_holiday_index, replacement_mask=replacement_mask)
                 if bucket is None:
                     continue
-                sample, holiday_active = bucket
+                sample, holiday_active, removed = bucket
                 all_total += sample * day_static_weight[d]
                 all_weight += day_static_weight[d]
+                all_removed_total += removed * day_static_weight[d]
                 if holiday_active == slot_holiday:
                     weight = day_age_weight[d] if slot_holiday else day_static_weight[d]
                     match_total += sample * weight
                     match_weight += weight
+                    match_removed_total += removed * weight
             if all_weight == 0 and tod <= self.minutes_now:
                 # No previous day recorded this time of day, but today already has (new install, batpred#5548).
                 # A time of day still ahead of us today would be a future minute, so it is never read.
-                bucket = self.sample_load_history_bucket(self.minutes_now - tod, holiday_minutes, max_holiday_index)
+                bucket = self.sample_load_history_bucket(self.minutes_now - tod, holiday_minutes, max_holiday_index, replacement_mask=replacement_mask)
                 if bucket is not None:
-                    sample, holiday_active = bucket
+                    sample, holiday_active, removed = bucket
                     all_total, all_weight = sample, 1.0
+                    all_removed_total = removed
                     if holiday_active == slot_holiday:
                         match_total, match_weight = sample, 1.0
+                        match_removed_total = removed
                     today_slots += 1
             if match_weight > 0:
                 per_step[minute_absolute] = match_total / match_weight
+                weighted_removed = match_removed_total / match_weight
                 has_history = True
             elif all_weight > 0:
                 # Nothing in the window shares this slot's holiday state. Rather than leaving holiday mode inert
                 # (a normalised mean cannot express "all of my data is wrong"), fall back to every day scaled by
                 # the assumed holiday ratio - or divided by it when we are home and the whole window was holiday.
-                per_step[minute_absolute] = (all_total / all_weight) * (holiday_load_scaling if slot_holiday else 1.0 / holiday_load_scaling)
+                holiday_scale = holiday_load_scaling if slot_holiday else 1.0 / holiday_load_scaling
+                per_step[minute_absolute] = (all_total / all_weight) * holiday_scale
+                weighted_removed = (all_removed_total / all_weight) * holiday_scale
                 has_history = True
             elif minute_absolute < self.minutes_now:
                 # Elapsed today with nothing recorded (before the install). load_today_comparison counts these as
@@ -4758,23 +4797,40 @@ class Fetch:
             else:
                 # Nothing recorded at this time of day yet: project the average of everything recorded so far,
                 # with the same holiday matching and scaling as above, or base load until there is enough of it.
-                if recorded_average is None:
-                    recorded_average = self.recorded_load_average(num_days, holiday_minutes, max_holiday_index)
-                if slot_holiday in recorded_average:
-                    per_step[minute_absolute] = recorded_average[slot_holiday]
-                elif (not slot_holiday) in recorded_average:
-                    per_step[minute_absolute] = recorded_average[not slot_holiday] * (holiday_load_scaling if slot_holiday else 1.0 / holiday_load_scaling)
+                if replacement_mask not in recorded_average:
+                    recorded_average[replacement_mask] = self.recorded_load_average(num_days, holiday_minutes, max_holiday_index, replacement_mask=replacement_mask)
+                recorded_average_for_mask = recorded_average[replacement_mask]
+                if slot_holiday in recorded_average_for_mask:
+                    per_step[minute_absolute], weighted_removed = recorded_average_for_mask[slot_holiday]
+                elif (not slot_holiday) in recorded_average_for_mask:
+                    holiday_scale = holiday_load_scaling if slot_holiday else 1.0 / holiday_load_scaling
+                    average_sample, average_removed = recorded_average_for_mask[not slot_holiday]
+                    per_step[minute_absolute] = average_sample * holiday_scale
+                    weighted_removed = average_removed * holiday_scale
                 else:
                     per_step[minute_absolute] = base_step
+                    if replace_this_future_bucket:
+                        future_weighted_component_removed += weighted_removed
                     continue
                 has_history = True
                 average_slots += 1
+            if replace_this_future_bucket:
+                future_weighted_component_removed += weighted_removed
 
         if not has_history:
             # Nothing recorded at all - leave the forecast to the days_previous fallback
+            if replacements:
+                self.log("Load forecast replacement application: status=not_applied reason=weighted_house_history_empty accepted_pairs={}".format(len(replacements)))
             return {}
         if today_slots or average_slots:
             self.log("Load forecast: no previous-day history for some times of day, {} slots filled from today's load at the same time and {} from the average of all recorded load".format(today_slots, average_slots))
+
+        if replacements:
+            self.log(
+                "Load forecast replacement application: status=applied mode=weighted_house_history accepted_pairs={} paired_forecast=added future_covered_minutes={} future_weighted_space_heating_removed_kWh={:.4f} future_weighted_component_removed_kWh={:.4f} raw_house_history=unchanged ev_accounting=unchanged".format(
+                    len(replacements), replacement_forward_covered_minutes, future_weighted_component_removed, future_weighted_component_removed
+                )
+            )
 
         # Convert per-step kWh buckets into a cumulative-from-midnight dict, filling every minute by linear
         # interpolation across each 5-minute span so get_from_incrementing(..., backwards=False) reproduces
@@ -4815,28 +4871,424 @@ class Fetch:
 
     def fetch_extra_load_forecast(self, now_utc, ml_forecast=None):
         """
-        Fetch extra load forecast, this is future load data
+        Fetch extra load forecast, this is future load data.
+
+        An optional load_forecast_replaces mapping pairs one exact forecast source with the
+        cumulative energy sensor whose history it replaces. A paired source is accepted only
+        when its forecast and meter histories can be validated. Its forecast is re-anchored at
+        the first covered future minute, so it cannot alter elapsed-day comparisons. Heating
+        history is subtracted later, and only for forward buckets covered by that source.
         """
         load_forecast_final = {}
         load_forecast_array = []
+        load_forecast_replacements = []
+        # The double-underscore key is excluded from debug/MCP state snapshots; it holds live history arrays.
+        setattr(self, "__load_forecast_replacements", load_forecast_replacements)
+
+        entity_ids = self.get_arg("load_forecast", [], indirect=False)
+        if isinstance(entity_ids, str):
+            entity_ids = [entity_ids]
+        if not isinstance(entity_ids, list):
+            entity_ids = []
+
+        source_counts = {}
+        for source in entity_ids:
+            if isinstance(source, str):
+                source_counts[source] = source_counts.get(source, 0) + 1
+
+        replacements_config = self.get_arg("load_forecast_replaces", {}, indirect=False)
+        replacement_specs = {}
+        invalid_replacement_sources = set()
+
+        replacement_fallback_reasons = {}
+
+        def record_replacement_fallback(reason):
+            """Count a non-secret, stable reason for retaining the complete history."""
+            replacement_fallback_reasons[reason] = replacement_fallback_reasons.get(reason, 0) + 1
+
+        if replacements_config is None:
+            replacements_config = {}
+        if not isinstance(replacements_config, dict):
+            self.log("Warn: load_forecast_replaces must be a mapping; paired forecasts will be ignored")
+            record_replacement_fallback("invalid_mapping")
+            replacements_config = {}
+            requested_replacement_pairs = 1
+        else:
+            requested_replacement_pairs = len(replacements_config)
+
+        for source_ref, spec in replacements_config.items():
+            if not isinstance(source_ref, str) or not source_ref:
+                self.log("Warn: Ignoring invalid load_forecast_replaces source key")
+                record_replacement_fallback("invalid_source_key")
+                continue
+            if source_ref not in source_counts:
+                self.log("Warn: load_forecast_replaces source {} is not present in load_forecast; ignoring mapping".format(source_ref))
+                record_replacement_fallback("source_not_listed")
+                continue
+            if source_counts[source_ref] != 1:
+                self.log("Warn: load_forecast source {} is listed more than once; rejecting its replacement to avoid double counting".format(source_ref))
+                invalid_replacement_sources.add(source_ref)
+                record_replacement_fallback("duplicate_forecast_source")
+                continue
+
+            if isinstance(spec, str):
+                energy_entity = spec
+                active_entity = None
+            elif isinstance(spec, dict) and set(spec).issubset({"energy", "active"}):
+                energy_entity = spec.get("energy")
+                active_entity = spec.get("active")
+            else:
+                self.log("Warn: Invalid load_forecast_replaces mapping for {}; expected an energy entity or energy/active mapping".format(source_ref))
+                invalid_replacement_sources.add(source_ref)
+                record_replacement_fallback("invalid_mapping_value")
+                continue
+
+            if not isinstance(energy_entity, str) or not is_entity_id(energy_entity):
+                self.log("Warn: Invalid history energy entity for load forecast replacement {}; ignoring paired source".format(source_ref))
+                invalid_replacement_sources.add(source_ref)
+                record_replacement_fallback("invalid_energy_entity")
+                continue
+            if active_entity is not None and (not isinstance(active_entity, str) or not is_entity_id(active_entity)):
+                self.log("Warn: Invalid active-state entity for load forecast replacement {}; ignoring paired source".format(source_ref))
+                invalid_replacement_sources.add(source_ref)
+                record_replacement_fallback("invalid_active_entity")
+                continue
+            replacement_specs[source_ref] = {"energy_entity": energy_entity, "active_entity": active_entity}
+
+        # A replacement counter must be a separate measurement, not the whole-house series,
+        # an EV meter or iBoost. Sharing one counter between pairs would subtract it twice.
+        def configured_entities(key):
+            """Return configured entity IDs without attributes, including list-valued settings."""
+            value = self.get_arg(key, None, indirect=False)
+            if isinstance(value, str):
+                value = [value]
+            if not isinstance(value, list):
+                return set()
+            return {item.partition("$")[0].lower() for item in value if isinstance(item, str) and is_entity_id(item.partition("$")[0])}
+
+        protected_entities = set()
+        for setting in ("load_today", "car_charging_energy", "iboost_energy_today"):
+            protected_entities.update(configured_entities(setting))
+        energy_source_counts = {}
+        for source_ref, spec in replacement_specs.items():
+            energy_source_counts[spec["energy_entity"].lower()] = energy_source_counts.get(spec["energy_entity"].lower(), 0) + 1
+        for source_ref, spec in replacement_specs.items():
+            if spec["energy_entity"].lower() in protected_entities:
+                self.log("Warn: History energy entity for {} is already used by load_today, EV or iBoost; rejecting replacement".format(source_ref))
+                invalid_replacement_sources.add(source_ref)
+                record_replacement_fallback("counter_overlaps_house_ev_or_iboost")
+            elif energy_source_counts[spec["energy_entity"].lower()] > 1:
+                self.log("Warn: History energy entity for {} is reused by multiple forecast pairs; rejecting those replacements".format(source_ref))
+                invalid_replacement_sources.add(source_ref)
+                record_replacement_fallback("counter_reused_by_multiple_pairs")
+
+        if replacement_specs and (not getattr(self, "load_forecast_history", False) or getattr(self, "load_forecast_only", False)):
+            self.log("Warn: load_forecast_replaces requires days_previous_auto without load_forecast_only; using complete historical load")
+            invalid_replacement_sources.update(replacement_specs)
+            record_replacement_fallback("automatic_history_disabled_or_forecast_only")
+
+        def recorder_rows(history):
+            """Return the single entity's history rows or an empty list for a missing history."""
+            if isinstance(history, list) and history and isinstance(history[0], list):
+                return history[0]
+            return []
+
+        def parse_timestamp(value):
+            """Parse one HA timestamp without discarding recorder precision."""
+            return str2time(str(value))
+
+        required_history_minutes = max(int((self.max_days_previous - 1) * 24 * 60), 24 * 60)
+        # Extra forecasts are fetched before house history and its age are loaded this cycle.
+        # Cover the configured search window; the later sampler will use only available house data.
+        history_days_to_sample = max(self.max_days_previous - 1, 0)
+        sampling_history_minutes = max(
+            required_history_minutes,
+            history_days_to_sample * 24 * 60 + max(int(self.minutes_now), 0) + PREDICT_STEP,
+        )
+        history_array_size = max(self.max_days_previous * 24 * 60 + 2, sampling_history_minutes)
+
+        def fetch_history_energy(entity_id):
+            """Convert the kWh meter and mark only intervals with traceable counter history."""
+            raw = self.get_state_wrapper(entity_id=entity_id, raw=True)
+            attributes = raw.get("attributes", {}) if isinstance(raw, dict) else {}
+            if not isinstance(attributes, dict) or attributes.get("unit_of_measurement") != "kWh":
+                raise ValueError("history counter must declare kWh")
+            try:
+                current_value = float(raw.get("state"))
+            except (TypeError, ValueError):
+                raise ValueError("history counter state is not numeric")
+            if not isfinite(current_value) or current_value < 0:
+                raise ValueError("history counter state is invalid")
+
+            history = self.get_history_wrapper(entity_id=entity_id, days=self.max_days_previous, required=False)
+            rows = recorder_rows(history)
+            if not rows:
+                raise ValueError("history counter has no recorder data")
+            parsed = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    raise ValueError("history counter has an invalid row")
+                try:
+                    updated = parse_timestamp(row.get("last_updated"))
+                except (TypeError, ValueError):
+                    raise ValueError("history counter has an invalid timestamp")
+                row_attributes = row.get("attributes", {})
+                row_unit = row_attributes.get("unit_of_measurement") if isinstance(row_attributes, dict) else None
+                if row_unit not in (None, "kWh"):
+                    raise ValueError("history counter history is not in kWh")
+                value = None
+                state = row.get("state")
+                if state not in (None, "unknown", "unavailable"):
+                    try:
+                        candidate = float(state)
+                    except (TypeError, ValueError):
+                        candidate = float("nan")
+                    if isfinite(candidate) and candidate >= 0:
+                        value = candidate
+                clean_row = None
+                if value is not None:
+                    clean_row = dict(row)
+                    clean_row["state"] = value
+                    clean_row["last_updated"] = updated.isoformat()
+                    clean_row["attributes"] = dict(row_attributes) if isinstance(row_attributes, dict) else {}
+                    clean_row["attributes"]["unit_of_measurement"] = "kWh"
+                parsed.append((updated, clean_row, value))
+            parsed.sort(key=lambda item: item[0])
+            if any(after[0] <= before[0] for before, after in zip(parsed, parsed[1:])):
+                raise ValueError("history counter timestamps are duplicated")
+            valid_rows = [item for item in parsed if item[2] is not None]
+            if not valid_rows:
+                raise ValueError("history counter has no numeric recorder data")
+            if valid_rows[0][0] > now_utc - timedelta(minutes=required_history_minutes):
+                raise ValueError("history counter does not cover the complete automatic-history window")
+            if parsed[-1][2] is None:
+                raise ValueError("history counter ends with an unavailable state")
+            if abs(valid_rows[-1][2] - current_value) > 0.0001:
+                raise ValueError("history counter does not agree with its current state")
+            ordered_rows = [item[1] for item in valid_rows]
+            series, _ = minute_data(
+                ordered_rows,
+                self.max_days_previous,
+                now_utc,
+                "state",
+                "last_updated",
+                backwards=True,
+                smoothing=True,
+                clean_increment=True,
+                required_unit="kWh",
+            )
+            if not series or any(not isfinite(value) or value < 0 for value in series.values()):
+                raise ValueError("history counter could not be converted safely")
+
+            # A recorder state gap makes the counter delta across it temporally ambiguous. Mark that
+            # interval untrusted rather than discarding the whole pair or spreading its delta into
+            # space-heating subtraction. Ordinary adjacent samples and zero-delta periods remain usable.
+            trusted_minutes = set()
+            trusted_minutes.update(range(max(int((now_utc - valid_rows[-1][0]).total_seconds() // 60), 0)))
+            for before, after in zip(parsed, parsed[1:]):
+                if before[2] is None or after[2] is None:
+                    continue
+                if after[0] - before[0] > timedelta(minutes=60) and abs(after[2] - before[2]) > 0.0001:
+                    continue
+                before_index = int((now_utc - before[0]).total_seconds() // 60)
+                after_index = int((now_utc - after[0]).total_seconds() // 60)
+                trusted_minutes.update(range(max(after_index, 0), min(before_index, sampling_history_minutes)))
+
+            trusted_history = {minute: 1.0 for minute in trusted_minutes if 0 <= minute < sampling_history_minutes}
+            trusted_history_minutes = MinuteArray(trusted_history, history_array_size)
+            covered_minutes = sum(1 for minute in trusted_history if minute < required_history_minutes)
+            uncovered_minutes = max(required_history_minutes - covered_minutes, 0)
+            return MinuteArray(series, history_array_size), trusted_history_minutes, covered_minutes, uncovered_minutes
+
+        def fetch_active_history(entity_id):
+            """Convert a binary active-state history; only explicit on minutes permit subtraction."""
+            raw = self.get_state_wrapper(entity_id=entity_id, raw=True)
+            current_state = raw.get("state") if isinstance(raw, dict) else None
+            if not isinstance(current_state, str) or current_state.lower() not in ("on", "off", "unknown", "unavailable"):
+                raise ValueError("active-state sensor has an invalid current state")
+
+            history = self.get_history_wrapper(entity_id=entity_id, days=self.max_days_previous, required=False)
+            rows = recorder_rows(history)
+            if not rows:
+                raise ValueError("active-state sensor has no recorder data")
+            parsed = []
+            for row in rows:
+                if not isinstance(row, dict) or "state" not in row:
+                    raise ValueError("active-state history contains an invalid row")
+                try:
+                    updated = parse_timestamp(row.get("last_updated"))
+                except (TypeError, ValueError):
+                    raise ValueError("active-state history has an invalid timestamp")
+                state = str(row["state"]).lower()
+                if state not in ("on", "off", "unknown", "unavailable"):
+                    raise ValueError("active-state history has an invalid state")
+                # Unknown/unavailable is deliberately inactive: preserve that energy in the
+                # baseline rather than risking the loss of ACS or heating from an uncertain state.
+                active = 1.0 if state == "on" else 0.0
+                parsed.append((updated, active))
+            parsed.sort(key=lambda item: item[0])
+            if any(after[0] <= before[0] for before, after in zip(parsed, parsed[1:])):
+                raise ValueError("active-state history timestamps are duplicated")
+            ambiguous_transition_minutes = {before[0].replace(second=0, microsecond=0) for before, after in zip(parsed, parsed[1:]) if before[0].replace(second=0, microsecond=0) == after[0].replace(second=0, microsecond=0) and before[1] != after[1]}
+            if parsed[0][0] > now_utc - timedelta(minutes=required_history_minutes):
+                raise ValueError("active-state history does not cover the complete automatic-history window")
+            current_active = 1.0 if current_state.lower() == "on" else 0.0
+            if parsed[-1][1] != current_active:
+                raise ValueError("active-state history does not agree with its current state")
+            state_rows = [{"state": state, "last_updated": updated.isoformat()} for updated, state in parsed]
+            series, _ = minute_data(
+                state_rows,
+                self.max_days_previous,
+                now_utc,
+                "state",
+                "last_updated",
+                backwards=True,
+                smoothing=False,
+                clean_increment=False,
+            )
+            if not series or any(value not in (0.0, 1.0) for value in series.values()):
+                raise ValueError("active-state history could not be converted safely")
+            # minute_data intentionally collapses recorder timestamps to minute buckets. If an
+            # on/off transition happened inside one bucket, its energy cannot be attributed safely;
+            # preserve that meter minute instead of treating the final state as active for all of it.
+            oldest_history_minute = parsed[0][0].replace(second=0, microsecond=0)
+            oldest_history_index = int((now_utc - oldest_history_minute).total_seconds() / 60)
+            if parsed[0][0] != oldest_history_minute and parsed[0][1] == 1.0:
+                ambiguous_transition_minutes.add(oldest_history_minute)
+            for minute in range(max(oldest_history_index + 1, 0), min(sampling_history_minutes, len(series))):
+                series[minute] = 0.0
+            for updated in ambiguous_transition_minutes:
+                minute = int((now_utc - updated).total_seconds() / 60)
+                if 0 <= minute < len(series):
+                    series[minute] = 0.0
+            covered_minutes = min(required_history_minutes, max(int((now_utc - parsed[0][0]).total_seconds() // 60), 0))
+            return MinuteArray(series, history_array_size), covered_minutes
+
+        def prepare_replacement(source_ref, data):
+            """Validate a paired source and return its future-only series and history metadata."""
+            spec = replacement_specs[source_ref]
+            entity_id, _, attribute = source_ref.partition("$")
+            raw = self.get_state_wrapper(entity_id=entity_id, raw=True)
+            if not isinstance(raw, dict):
+                raise ValueError("forecast entity state metadata is unavailable")
+            state = raw.get("state")
+            if state is None or str(state).lower() in ("unknown", "unavailable", "none"):
+                raise ValueError("forecast entity is unavailable")
+            raw_attributes = raw.get("attributes", {})
+            if not isinstance(raw_attributes, dict) or raw_attributes.get("unit_of_measurement") != "kWh":
+                raise ValueError("forecast entity must declare kWh")
+            try:
+                published = str2time(str(raw.get("last_updated")))
+            except (TypeError, ValueError):
+                raise ValueError("forecast publication timestamp is unavailable")
+            age = now_utc - published
+            if age > timedelta(minutes=15) or age < -timedelta(minutes=5):
+                raise ValueError("forecast is stale or dated in the future")
+
+            if isinstance(data, dict):
+                data = [{"energy": value, "last_updated": key} for key, value in data.items()]
+            if not isinstance(data, list) or len(data) < 2:
+                raise ValueError("forecast has fewer than two timestamped samples")
+            parsed = []
+            for item in data:
+                if not isinstance(item, dict) or "energy" not in item:
+                    raise ValueError("forecast contains an invalid sample")
+                item_attributes = item.get("attributes", {})
+                item_unit = item_attributes.get("unit_of_measurement") if isinstance(item_attributes, dict) else None
+                if item_unit not in (None, "kWh"):
+                    raise ValueError("forecast sample is not in kWh")
+                if isinstance(item["energy"], bool):
+                    raise ValueError("forecast energy is not numeric")
+                try:
+                    value = float(item["energy"])
+                    updated = parse_timestamp(item.get("last_updated"))
+                except (TypeError, ValueError):
+                    raise ValueError("forecast contains an invalid value or timestamp")
+                if not isfinite(value) or value < 0:
+                    raise ValueError("forecast contains non-finite or negative energy")
+                parsed.append((updated, value))
+            parsed.sort(key=lambda item: item[0])
+            if any(after[0] <= before[0] for before, after in zip(parsed, parsed[1:])):
+                raise ValueError("forecast timestamps are duplicated or unordered")
+            if any(after[1] < before[1] for before, after in zip(parsed, parsed[1:])):
+                raise ValueError("forecast cumulative energy is not monotonic")
+            if any((after[0] - before[0]) > timedelta(minutes=60) for before, after in zip(parsed, parsed[1:])):
+                raise ValueError("forecast has a coverage gap longer than one hour")
+
+            forecast_rows = [{"energy": value, "last_updated": updated.isoformat()} for updated, value in parsed]
+            forecast, _ = minute_data(
+                forecast_rows,
+                self.forecast_days + 1,
+                self.midnight_utc,
+                "energy",
+                "last_updated",
+                backwards=False,
+                clean_increment=False,
+                smoothing=True,
+                divide_by=1.0,
+                scale=1.0,
+                required_unit="kWh",
+            )
+            coverage_start_raw = int((parsed[0][0] - self.midnight_utc).total_seconds() // 60)
+            coverage_end_raw = int((parsed[-1][0] - self.midnight_utc).total_seconds() // 60)
+            coverage_start = int(math.ceil(coverage_start_raw / PREDICT_STEP)) * PREDICT_STEP
+            coverage_end = int(coverage_end_raw // PREDICT_STEP) * PREDICT_STEP
+            anchor = max(coverage_start, self.minutes_now)
+            if coverage_end <= anchor or anchor not in forecast or coverage_end not in forecast:
+                raise ValueError("forecast does not cover a future interval")
+            anchor_value = forecast[anchor]
+            end_value = forecast[coverage_end]
+            for minute in list(forecast):
+                if minute < anchor:
+                    forecast[minute] = 0.0
+                elif minute <= coverage_end:
+                    forecast[minute] = max(forecast[minute] - anchor_value, 0.0)
+                else:
+                    forecast[minute] = max(end_value - anchor_value, 0.0)
+
+            energy_minutes, energy_valid_minutes, energy_covered_minutes, energy_uncovered_minutes = fetch_history_energy(spec["energy_entity"])
+            if spec["active_entity"]:
+                active_minutes, active_covered_minutes = fetch_active_history(spec["active_entity"])
+            else:
+                active_minutes, active_covered_minutes = None, 0
+            metadata = {
+                "source": source_ref,
+                "energy_entity": spec["energy_entity"],
+                "active_entity": spec["active_entity"],
+                "energy_minutes": energy_minutes,
+                "energy_valid_minutes": energy_valid_minutes,
+                "active_minutes": active_minutes,
+                "counter_history_covered_minutes": energy_covered_minutes,
+                "counter_history_uncovered_minutes": energy_uncovered_minutes,
+                "active_history_covered_minutes": active_covered_minutes,
+                "coverage_start": coverage_start,
+                "coverage_end": coverage_end,
+                "forecast_age_minutes": age.total_seconds() / 60.0,
+                "future_forecast_covered_minutes": max(coverage_end - max(coverage_start, self.minutes_now), 0),
+            }
+            return forecast, metadata
 
         # Add ML forecast if available
         if ml_forecast:
             load_forecast_array.append(ml_forecast)
 
-        if "load_forecast" in self.args:
-            entity_ids = self.get_arg("load_forecast", indirect=False)
-            if isinstance(entity_ids, str):
-                entity_ids = [entity_ids]
-
+        if entity_ids:
             for entity_id in entity_ids:
                 if not entity_id:
                     self.log("Warn: Unable to fetch load forecast data, check your load_forecast setting in apps.yaml")
                     continue
+                if not isinstance(entity_id, str):
+                    self.log("Warn: Invalid load_forecast source; expected an entity reference")
+                    continue
+
+                if entity_id in invalid_replacement_sources:
+                    self.log("Warn: Skipping paired load forecast {} and retaining complete historical load".format(entity_id))
+                    continue
 
                 attribute = None
-                if "$" in entity_id:
-                    entity_id, attribute = entity_id.split("$")
+                source_ref = entity_id
+                if "$" in source_ref:
+                    entity_id, _, attribute = source_ref.partition("$")
                 try:
                     self.log("Loading extra load forecast from {}, attribute {}".format(entity_id, attribute))
                     data = self.get_state_wrapper(entity_id=entity_id, attribute=attribute)
@@ -4844,33 +5296,77 @@ class Fetch:
                     self.log("Error: Unable to fetch load forecast data from sensor {}, exception {}".format(entity_id, e))
                     data = None
 
-                # Convert format from dict to array
-                if isinstance(data, dict):
-                    data_array = []
-                    for key, value in data.items():
-                        data_array.append({"energy": value, "last_updated": key})
-                    data = data_array
+                if source_ref in replacement_specs:
+                    try:
+                        load_forecast, replacement = prepare_replacement(source_ref, data)
+                        load_forecast_replacements.append(replacement)
+                        self.log(
+                            "Load forecast replacement binding accepted: source={} energy={} active={} forecast_age_minutes={:.1f} counter_history_covered_minutes={} counter_history_uncovered_minutes={} active_history_covered_minutes={} future_forecast_covered_minutes={}".format(
+                                replacement["source"],
+                                replacement["energy_entity"],
+                                replacement["active_entity"] or "none",
+                                replacement["forecast_age_minutes"],
+                                replacement["counter_history_covered_minutes"],
+                                replacement["counter_history_uncovered_minutes"],
+                                replacement["active_history_covered_minutes"],
+                                replacement["future_forecast_covered_minutes"],
+                            )
+                        )
+                    except (KeyError, TypeError, ValueError) as e:
+                        self.log("Warn: Rejecting paired load forecast {}: {}; retaining complete historical load".format(source_ref, e))
+                        record_replacement_fallback(str(e))
+                        continue
+                else:
+                    # Convert format from dict to array
+                    if isinstance(data, dict):
+                        data_array = []
+                        for key, value in data.items():
+                            data_array.append({"energy": value, "last_updated": key})
+                        data = data_array
 
-                # Load data
-                load_forecast, _ = minute_data(
-                    data,
-                    self.forecast_days + 1,
-                    self.midnight_utc,
-                    "energy",
-                    "last_updated",
-                    backwards=False,
-                    clean_increment=False,
-                    smoothing=True,
-                    divide_by=1.0,
-                    scale=1.0,
-                    required_unit="kWh",
-                )
+                    # Load data using the existing, unchanged path for unpaired sources.
+                    load_forecast, _ = minute_data(
+                        data,
+                        self.forecast_days + 1,
+                        self.midnight_utc,
+                        "energy",
+                        "last_updated",
+                        backwards=False,
+                        clean_increment=False,
+                        smoothing=True,
+                        divide_by=1.0,
+                        scale=1.0,
+                        required_unit="kWh",
+                    )
 
                 if load_forecast:
                     self.log("Loaded the load forecast from {} load sensor; from midnight {}kWh to now {}kWh to midnight {}kwh".format(entity_id, load_forecast.get(0, 0), load_forecast.get(self.minutes_now, 0), load_forecast.get(24 * 60, 0)))
                     load_forecast_array.append(load_forecast)
                 else:
                     self.log("Warn: Unable to load the load forecast from {}. Skipping forecast source.".format(entity_id))
+
+        if requested_replacement_pairs:
+            accepted_replacement_pairs = len(load_forecast_replacements)
+            fallback_replacement_pairs = max(requested_replacement_pairs - accepted_replacement_pairs, 0)
+            fallback_summary = ",".join("{}={}".format(reason.replace(" ", "_"), count) for reason, count in sorted(replacement_fallback_reasons.items())) or "none"
+            counter_history_covered_minutes = sum(item["counter_history_covered_minutes"] for item in load_forecast_replacements)
+            counter_history_uncovered_minutes = sum(item["counter_history_uncovered_minutes"] for item in load_forecast_replacements)
+            active_history_covered_minutes = sum(item["active_history_covered_minutes"] for item in load_forecast_replacements)
+            future_forecast_covered_minutes = sum(item["future_forecast_covered_minutes"] for item in load_forecast_replacements)
+            self.log(
+                "Load forecast replacement binding summary: requested_pairs={} accepted_pairs={} fallback_pairs={} counter_history_covered_minutes={} counter_history_uncovered_minutes={} active_history_covered_minutes={} future_forecast_covered_minutes={} fallback_reasons={}".format(
+                    requested_replacement_pairs,
+                    accepted_replacement_pairs,
+                    fallback_replacement_pairs,
+                    counter_history_covered_minutes,
+                    counter_history_uncovered_minutes,
+                    active_history_covered_minutes,
+                    future_forecast_covered_minutes,
+                    fallback_summary,
+                )
+            )
+            if accepted_replacement_pairs == 0:
+                self.log("Load forecast replacement application: status=fallback_full_history accepted_pairs=0 fallback_pairs={} reason={}".format(fallback_replacement_pairs, fallback_summary if fallback_summary != "none" else "no_pair_accepted"))
 
         # Add all the load forecasts together
         for load in load_forecast_array:
