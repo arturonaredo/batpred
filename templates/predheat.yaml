@@ -80,9 +80,25 @@ predbat:
     # put 1.0 for condensing gas boilers, or around 4.0 for heat pumps
     heating_cop: 1.0
 
-    # Current flow temperature setting
+    # Current flow temperature setting
     flow_temp: number.boiler_heatingtemp
     flow_difference_target: 40
+
+    # Optional bounded model; configure only with coefficients calibrated for your system.
+    # When valid, it takes precedence over weather_compensation above. Both inputs are
+    # clamped to the trained ranges, so values outside them are held at an edge, not extrapolated.
+    # These generic example values are illustrative only; replace every field before enabling.
+    #weather_compensation_model:
+    #  flow_reference: 35.0
+    #  external_reference: 10.0
+    #  external_coefficient: -1.5
+    #  target_reference: 20.0
+    #  target_coefficient: 2.0
+    #  min_flow: 25.0
+    #  external_min: 0.0
+    #  external_max: 15.0
+    #  target_min: 18.0
+    #  target_max: 22.0
 
     # Sets the conversion factors between the delta T50°C and other delta T values
     #delta_correction:

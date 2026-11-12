@@ -11,6 +11,7 @@
 """Tests for the Predheat scheduler, its predheat_enable gate (#4670) and the smart thermostat pre-heat model."""
 
 import asyncio
+import math
 from datetime import datetime, timedelta, timezone
 
 import pytz
@@ -24,6 +25,18 @@ SIM_MINUTES = SIM_DAYS * 24 * 60
 BASE_TEMP = 16.0
 # 06:00-09:00 at 20 °C and 17:00-22:00 at 21 °C on both days
 DAILY_PERIODS = [(360, 540, 20.0), (1020, 1320, 21.0), (1800, 1980, 20.0), (2460, 2760, 21.0)]
+WEATHER_MODEL_EXAMPLE = {
+    "flow_reference": 32.2,
+    "external_reference": 15.0,
+    "external_coefficient": -1.92,
+    "target_reference": 20.0,
+    "target_coefficient": 3.6,
+    "min_flow": 30.0,
+    "external_min": 8.0,
+    "external_max": 18.0,
+    "target_min": 18.5,
+    "target_max": 21.0,
+}
 
 
 class FakeComponents:
@@ -169,14 +182,24 @@ def _setpoint(periods, minute):
     return BASE_TEMP
 
 
-def _make_simulation(my_predbat, periods, smart_thermostat=True, max_minutes=None):
+def _make_simulation(my_predbat, periods, smart_thermostat=True, max_minutes=None, predheat_config=None):
     """Build a PredHeat with a fixed thermal model and a two day setpoint schedule, ready for run_simulation().
 
     With days_previous [2] get_historical() reads forecast minute m from history index 2880 - m, so the
     target history is laid out back to front to replay the schedule. Published sensors are captured in
     predheat.published instead of being written to HA.
     """
-    predheat = PredHeat(my_predbat)
+    missing = object()
+    original_predheat_args = my_predbat.args.get("predheat", missing)
+    if predheat_config is not None:
+        my_predbat.args["predheat"] = predheat_config
+    try:
+        predheat = PredHeat(my_predbat)
+    finally:
+        if original_predheat_args is missing:
+            my_predbat.args.pop("predheat", None)
+        else:
+            my_predbat.args["predheat"] = original_predheat_args
     predheat.prefix = "predheat"
     predheat.published = {}
     predheat.set_state = lambda entity_id, state=None, attributes=None: predheat.published.__setitem__(entity_id, attributes or {})
@@ -883,5 +906,125 @@ def test_predheat_heat_to_temp_off_marker(my_predbat):
     if state != 32.0 or results.get(first_stamp) != 32.0:
         print("  ERROR: heating to 0 C in °F expected state and first result 32.0, got {} and {}".format(repr(state), repr(results.get(first_stamp))))
         failed = True
+    return failed
+
+
+def test_predheat_weather_compensation_model(my_predbat):
+    """Bounded target-aware weather compensation, diagnostics, and legacy fallback."""
+    failed = False
+    print("**** Running Predheat empirical weather compensation tests ****")
+    original_log = my_predbat.log
+    captured = []
+    my_predbat.log = lambda msg, quiet=True: captured.append(msg)
+
+    try:
+        print("Test: target-aware affine model changes with forecast weather and smart-thermostat target")
+        predheat = _make_simulation(
+            my_predbat,
+            [(360, 540, 21.0)],
+            predheat_config={
+                "weather_compensation": {8: 40.0, 18: 30.0},
+                "weather_compensation_model": dict(WEATHER_MODEL_EXAMPLE),
+                "smart_thermostat": True,
+            },
+        )
+        if not predheat.weather_compensation_model_enabled:
+            print("  ERROR: valid weather_compensation_model was not enabled")
+            failed = True
+
+        predheat.temperatures = {minute: 10.0 if minute < 10 or 300 <= minute < 310 else 7.0 if 330 <= minute < 340 else 16.0 for minute in range(0, SIM_MINUTES, 5)}
+        first_pass = {minute: 21.0 if 420 <= minute < 540 else BASE_TEMP for minute in range(0, SIM_MINUTES, 5)}
+        predheat.run_simulation(BASE_TEMP, True, last_predict_minute=first_pass, save="best")
+
+        def result_at(entity_id, minute):
+            timestamp = (predheat.midnight_utc + timedelta(minutes=minute)).strftime(TIME_FORMAT)
+            return predheat.published[entity_id]["results"][timestamp]
+
+        flow = predheat.published["predheat.flow_temp"]
+        expected_flow = [(0, 36.4), (10, 30.0), (300, 45.4), (310, 33.88), (330, 49.24)]
+        for minute, expected in expected_flow:
+            got = result_at("predheat.flow_temp", minute)
+            if got != expected:
+                print("  ERROR: predicted flow at minute {} was {}, expected {}".format(minute, got, expected))
+                failed = True
+
+        if result_at("predheat.target_temp", 300) != 21.0 or result_at("predheat.target_temp", 310) != 21.0:
+            print("  ERROR: flow forecast did not use the smart-thermostat-adjusted target")
+            failed = True
+        if flow.get("model") != "bounded_target_aware_affine_v1":
+            print("  ERROR: flow diagnostics did not identify the active model: {}".format(flow))
+            failed = True
+        if flow.get("external_min") != WEATHER_MODEL_EXAMPLE["external_min"] or flow.get("target_max") != WEATHER_MODEL_EXAMPLE["target_max"]:
+            print("  ERROR: flow diagnostics did not expose the trained input limits")
+            failed = True
+        if flow.get("external_clamped_minutes", 0) < 5 or flow.get("target_clamped_minutes", 0) < 5:
+            print("  ERROR: expected separate positive external and target clamp counts, got {}".format(flow))
+            failed = True
+        if not all(math.isfinite(value) for value in flow["results"].values()):
+            print("  ERROR: non-finite flow reached the published heat forecast")
+            failed = True
+
+        print("Test: absent empirical model preserves the legacy outdoor-only table")
+        legacy = _make_simulation(
+            my_predbat,
+            [(0, SIM_MINUTES, 21.0)],
+            predheat_config={"weather_compensation": {8: 40.0, 18: 30.0}},
+        )
+        legacy.temperatures = {minute: 10.0 for minute in range(0, SIM_MINUTES, 5)}
+        legacy.run_simulation(BASE_TEMP, True, save="best")
+        if legacy.weather_compensation_model_enabled or legacy.published["predheat.flow_temp"]["results"].get((legacy.midnight_utc + timedelta(minutes=0)).strftime(TIME_FORMAT)) != 38.0:
+            print("  ERROR: absent-model forecast did not retain legacy weather compensation")
+            failed = True
+
+        fixed = _make_simulation(my_predbat, [(0, SIM_MINUTES, 21.0)], predheat_config={})
+        fixed.run_simulation(BASE_TEMP, True, save="best")
+        if fixed.weather_compensation_model_enabled or fixed.published["predheat.flow_temp"]["results"].get((fixed.midnight_utc + timedelta(minutes=0)).strftime(TIME_FORMAT)) != fixed.flow_temp:
+            print("  ERROR: absent-model forecast did not retain the fixed flow temperature")
+            failed = True
+
+        print("Test: invalid model mappings warn and fall back without aborting simulation")
+        warning_count = len(captured)
+        null_model = _make_simulation(my_predbat, [(0, SIM_MINUTES, 21.0)], predheat_config={"weather_compensation_model": None})
+        if null_model.weather_compensation_model_enabled or not any("weather_compensation_model disabled - expected a mapping" in message for message in captured[warning_count:]):
+            print("  ERROR: explicitly configured null model did not warn that it is invalid")
+            failed = True
+
+        invalid_models = [
+            [],
+            None,
+            {key: value for key, value in WEATHER_MODEL_EXAMPLE.items() if key != "target_coefficient"},
+            {**WEATHER_MODEL_EXAMPLE, "unexpected": 1.0},
+            {**WEATHER_MODEL_EXAMPLE, "flow_reference": True},
+            {**WEATHER_MODEL_EXAMPLE, "external_coefficient": float("nan")},
+            {**WEATHER_MODEL_EXAMPLE, "target_coefficient": float("inf")},
+            {**WEATHER_MODEL_EXAMPLE, "external_min": 19.0},
+            {**WEATHER_MODEL_EXAMPLE, "min_flow": 0.0},
+            {**WEATHER_MODEL_EXAMPLE, "external_coefficient": 1e308},
+            {**WEATHER_MODEL_EXAMPLE, "external_coefficient": 10**10000},
+        ]
+        for invalid in invalid_models:
+            candidate = _make_simulation(
+                my_predbat,
+                [(0, SIM_MINUTES, 21.0)],
+                predheat_config={
+                    "weather_compensation": {8: 40.0, 18: 30.0},
+                    "weather_compensation_model": invalid,
+                },
+            )
+            if candidate.weather_compensation_model_enabled:
+                print("  ERROR: invalid model mapping was enabled: {}".format(invalid))
+                failed = True
+            candidate.temperatures = {minute: 10.0 for minute in range(0, SIM_MINUTES, 5)}
+            candidate.run_simulation(BASE_TEMP, True, save="best")
+            timestamp = (candidate.midnight_utc + timedelta(minutes=0)).strftime(TIME_FORMAT)
+            if candidate.published["predheat.flow_temp"]["results"].get(timestamp) != 38.0:
+                print("  ERROR: invalid model did not fall back to the existing table")
+                failed = True
+
+        if not any("weather_compensation_model" in message.lower() and "warn" in message.lower() for message in captured):
+            print("  ERROR: invalid model mappings did not produce a warning")
+            failed = True
+    finally:
+        my_predbat.log = original_log
 
     return failed

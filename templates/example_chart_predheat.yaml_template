@@ -90,6 +90,17 @@ series:
       Object.entries(entity.attributes.results)) { res.push([new
       Date(key).getTime(), value]); } return res.sort((a, b) => { return a[0] -
       b[0]  })
+  - entity: predheat.flow_temp
+    stroke_width: 2
+    curve: stepline
+    name: Predicted flow temperature used
+    show:
+      in_header: raw
+    data_generator: >
+      let res = []; for (const [key, value] of
+      Object.entries(entity.attributes.results)) { res.push([new
+      Date(key).getTime(), value]); } return res.sort((a, b) => { return a[0] -
+      b[0]  })
   - entity: predheat.heat_energy
     stroke_width: 1
     curve: smooth

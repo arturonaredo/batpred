@@ -48,6 +48,7 @@ from tests.test_predheat import (
     test_predheat_volume_temp,
     test_predheat_volume_temp_persistence,
     test_predheat_heat_to_temp_off_marker,
+    test_predheat_weather_compensation_model,
 )
 from tests.test_predheat_climate_scheduler import test_predheat_climate_scheduler
 from tests.test_debug_enable_auto_scope import test_debug_enable_auto_scope
@@ -729,6 +730,7 @@ def main():
         ("predheat_volume_temp_persistence", test_predheat_volume_temp_persistence, "Predheat persisted volume temperature range tests", False),
         ("predheat_heat_to_temp_off", test_predheat_heat_to_temp_off_marker, "Predheat heat_to_temp off-marker tests (#6078)", False),
         ("predheat_climate_scheduler", test_predheat_climate_scheduler, "Predheat Climate Scheduler regression tests", False),
+        ("predheat_weather_compensation_model", test_predheat_weather_compensation_model, "Bounded target-aware Predheat flow-temperature model", False),
         ("debug_enable_auto_scope", test_debug_enable_auto_scope, "debug_enable auto-disable-after-N-hours tests (#4438 review)", False),
         ("charge_hold", run_charge_hold_tests, "Charge freeze hold modelling tests", False),
         ("basic_rates", test_basic_rates, "Basic rates tests", False),

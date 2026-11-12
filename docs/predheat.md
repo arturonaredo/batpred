@@ -222,6 +222,59 @@ Predheat will fill in the gaps between the points provided.
 
 IMPORTANT: The weather compensation curve must have a low value of -20 degrees C and a high value of 20 degrees C. You can have whatever other points you want between the upper and lower bounds and Predheat will fill in the gaps, but if you don't have -20 and 20 Predheat will error when it tries to calculate the weather-adjusted flow temperature.
 
+#### Bounded target-aware empirical flow model
+
+As an alternative to the outdoor-only `weather_compensation` table, an optional
+`weather_compensation_model` mapping can predict flow temperature from both the
+forecast outdoor temperature and Predheat's future room target. When a valid
+mapping is configured it takes precedence over `weather_compensation`; otherwise
+Predheat keeps using the existing table, or the fixed `flow_temp` setting if no
+table is configured. Omitting the mapping preserves the existing prediction
+path.
+
+The mapping must contain exactly these numeric fields:
+
+| Field | Meaning |
+| --- | --- |
+| `flow_reference` | Flow temperature at both reference temperatures, °C |
+| `external_reference` | Outdoor reference temperature, °C |
+| `external_coefficient` | Flow-temperature change per outdoor degree |
+| `target_reference` | Room-target reference temperature, °C |
+| `target_coefficient` | Flow-temperature change per target degree |
+| `min_flow` | Positive lower flow-temperature floor, °C |
+| `external_min`, `external_max` | Trained outdoor-temperature bounds, °C |
+| `target_min`, `target_max` | Trained room-target bounds, °C |
+
+The prediction is `max(min_flow, flow_reference + external_coefficient *
+(external_temperature - external_reference) + target_coefficient * (room_target - target_reference))`.
+Both inputs are clamped to their configured trained bounds before evaluation:
+outside the range the model holds at the nearest edge and does not extrapolate.
+`predheat.flow_temp` publishes the flow-temperature series actually used by the
+simulation (the existing `predheat.heat_to_temp` remains the room target). Its
+attributes identify the selected model/source, the bounds, and separate counts
+of forecast minutes clamped for outdoor temperature and room target. The series
+is sampled every ten minutes, like the other Predheat prediction charts.
+
+This is an opt-in forecast model, not a command to the boiler or heat pump and
+not evidence that weather outside the training bounds has been validated. The
+parameters are system-specific; do not copy example values as a calibration.
+For example, the following generic values show the required shape only:
+
+```yaml
+  predheat:
+    weather_compensation_model:
+      flow_reference: 35.0
+      external_reference: 10.0
+      external_coefficient: -1.5
+      target_reference: 20.0
+      target_coefficient: 2.0
+      min_flow: 25.0
+      external_min: 0.0
+      external_max: 15.0
+      target_min: 18.0
+      target_max: 22.0
+```
+
 ### Link Predheat to Predbat
 
 Add a **load_forecast** entry in `apps.yaml` to configure Predbat to use the [Predheat load forecast](apps-yaml.md#load-forecast):
