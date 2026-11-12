@@ -177,9 +177,25 @@ def _reset_apply_fields(base):
 
 
 def _stage_apply(base, *, pv=5, minutes=60, mode="apply", apply_verified=True):
-    """Configure the apply fixture via the parent's _apply_inputs helper."""
+    """Configure apply inputs and a safe current-cycle native COST reference."""
     _setup(base, pv=pv, minutes=minutes)
     _apply_inputs(base)
+    # COST apply now requires a paired comparison against the ordinary native
+    # battery plan. Give every execution-gate test the same deterministic,
+    # current-cycle reference instead of relying on an unavailable plan.
+    base.import_limit = 12000.0
+    car_settings(base)["import_limit_w"] = 12000.0
+    # An equal tariff keeps the paired safe native plan as the accepted
+    # alternative and exercises the local DEYE binary 0/100 target contract.
+    base.rate_import.update({base.minutes_now + minute: 10 for minute in range(base.forecast_minutes)})
+    base.plan_valid = True
+    base.plan_last_updated = base.now_utc
+    base.plan_last_updated_minutes = base.minutes_now
+    base.plan_made_by_version = "synthetic-current-cycle"
+    base.charge_window_best = [{"start": base.minutes_now + 40, "end": base.minutes_now + 45, "average": 10, "target": base.soc_max}]
+    base.charge_limit_best = [base.soc_max]
+    base.export_window_best = []
+    base.export_limits_best = []
     if mode != "apply":
         car_settings(base)["mode"] = mode
     if not apply_verified:
@@ -526,8 +542,8 @@ def test_apply_blocked_by_future_relay_timestamp(base):
     }, base.car_charging_report
 
 
-def test_apply_blocked_by_cooldown_within_599_seconds(base):
-    """599s after the relay flipped OFF the cooldown blocks an ev_on request."""
+def test_apply_blocks_stale_cost_proof_after_cooldown_input_changes(base):
+    """A 599s relay change invalidates the paired COST evidence before dispatch."""
     _evaluate(base)
     adapter, _ = _make_adapter()
     inverter, spy = _make_inverter(base, adapter)
@@ -540,40 +556,34 @@ def test_apply_blocked_by_cooldown_within_599_seconds(base):
     result = execute_car_charging_plan(base)
     assert isinstance(result, tuple) and result[0] == "EV blocked", result
     assert spy["args"] == []
-    assert base.car_charging_report["execution_reason"] == "ev_cooldown"
+    assert base.car_charging_report["execution_reason"] == "economic_inputs_changed"
 
 
 def test_apply_allowed_after_cooldown_600_seconds(base):
-    """Exactly 600s after the relay flipped OFF the cooldown is satisfied."""
+    """The unchanged fixture relay has completed its exact 600s cooldown."""
     _evaluate(base)
     adapter, _ = _make_adapter()
     inverter, spy = _make_inverter(base, adapter)
-    long_off = _now_utc(base) - timedelta(seconds=600)
     payload = base.ha_interface.dummy_items["binary_sensor.test_relay"]
-    payload["last_changed"] = long_off
-    payload["last_updated"] = long_off + timedelta(seconds=1)
+    assert (_now_utc(base) - payload["last_changed"]).total_seconds() == 600
     _freeze_command_ev(base.car_charging_pending, ev_on=True)
     result = execute_car_charging_plan(base)
     assert spy["args"], result
     assert result[0] in ("Demand", "Charging", "Freeze charging"), result
 
 
-def test_apply_freeze_skips_cooldown_entirely(base):
-    """Freeze commands bypass the cooldown gate; ev_on=False is irrelevant here."""
+def test_apply_blocks_unauthorised_freeze_command_change(base):
+    """COST evidence rejects a post-plan freeze mutation before dispatch."""
     _evaluate(base)
     adapter, _ = _make_adapter()
     inverter, spy = _make_inverter(base, adapter)
-    recent_off = _now_utc(base) - timedelta(seconds=30)
-    payload = base.ha_interface.dummy_items["binary_sensor.test_relay"]
-    payload["last_changed"] = recent_off
-    payload["last_updated"] = recent_off + timedelta(seconds=1)
-    # Freeze + ev_on=False bypasses the cooldown entirely (no EV energising).
     base.car_charging_pending["commands"][0]["freeze"] = True
     base.car_charging_pending["commands"][0]["target_soc"] = 0
     base.car_charging_pending["commands"][0]["ev_on"] = False
     result = execute_car_charging_plan(base)
-    assert spy["args"], result
-    assert result[0] == "Freeze charging", result
+    assert isinstance(result, tuple) and result[0] == "EV blocked", result
+    assert spy["args"] == []
+    assert base.car_charging_report["execution_reason"] == "candidate_commands_changed"
 
 
 def test_apply_blocked_by_relay_state_invalid(base):
@@ -623,8 +633,8 @@ def test_apply_blocked_by_manual_floor_violation(base):
     }, base.car_charging_report
 
 
-def test_apply_blocked_by_invalid_power_below_zero(base):
-    """``power_w < 0`` is rejected; the cap does not clamp the rejection."""
+def test_apply_blocks_tampered_power_below_zero(base):
+    """A post-plan negative power mutation fails the bound COST command proof."""
     _evaluate(base)
     adapter, _ = _make_adapter()
     inverter, spy = _make_inverter(base, adapter)
@@ -632,11 +642,11 @@ def test_apply_blocked_by_invalid_power_below_zero(base):
     result = execute_car_charging_plan(base)
     assert isinstance(result, tuple) and result[0] == "EV blocked", result
     assert spy["args"] == []
-    assert base.car_charging_report["execution_reason"] == "discharge_power_out_of_range"
+    assert base.car_charging_report["execution_reason"] == "candidate_commands_changed"
 
 
-def test_apply_blocked_by_power_above_8192(base):
-    """``power_w > 8192`` is rejected — no clamping to the cap."""
+def test_apply_blocks_tampered_power_above_cap(base):
+    """A post-plan over-cap power mutation fails the bound COST command proof."""
     _evaluate(base)
     adapter, _ = _make_adapter()
     inverter, spy = _make_inverter(base, adapter)
@@ -644,11 +654,11 @@ def test_apply_blocked_by_power_above_8192(base):
     result = execute_car_charging_plan(base)
     assert isinstance(result, tuple) and result[0] == "EV blocked", result
     assert spy["args"] == []
-    assert base.car_charging_report["execution_reason"] == "discharge_power_out_of_range"
+    assert base.car_charging_report["execution_reason"] == "candidate_commands_changed"
 
 
-def test_apply_blocked_by_nonfinite_power(base):
-    """``power_w = float('inf')`` is rejected."""
+def test_apply_blocks_nonfinite_tampered_power(base):
+    """Non-finite command data fails JSON validation before any actuator write."""
     _evaluate(base)
     adapter, _ = _make_adapter()
     inverter, spy = _make_inverter(base, adapter)
@@ -656,11 +666,11 @@ def test_apply_blocked_by_nonfinite_power(base):
     result = execute_car_charging_plan(base)
     assert isinstance(result, tuple) and result[0] == "EV blocked", result
     assert spy["args"] == []
-    assert base.car_charging_report["execution_reason"] == "discharge_power_out_of_range"
+    assert base.car_charging_report["execution_reason"] == "execution_validation_failed"
 
 
-def test_apply_blocked_by_bool_power(base):
-    """``power_w is True`` is rejected (booleans are not accepted as numbers)."""
+def test_apply_blocks_tampered_boolean_power(base):
+    """A post-plan boolean power mutation fails the bound COST command proof."""
     _evaluate(base)
     adapter, _ = _make_adapter()
     inverter, spy = _make_inverter(base, adapter)
@@ -668,11 +678,11 @@ def test_apply_blocked_by_bool_power(base):
     result = execute_car_charging_plan(base)
     assert isinstance(result, tuple) and result[0] == "EV blocked", result
     assert spy["args"] == []
-    assert base.car_charging_report["execution_reason"] == "discharge_power_out_of_range"
+    assert base.car_charging_report["execution_reason"] == "candidate_commands_changed"
 
 
-def test_apply_blocked_by_invalid_target_soc(base):
-    """``target_soc`` not in {0, 100} is rejected."""
+def test_apply_blocks_tampered_target_soc(base):
+    """A post-plan target mutation fails the bound COST command proof."""
     _evaluate(base)
     adapter, _ = _make_adapter()
     inverter, spy = _make_inverter(base, adapter)
@@ -680,11 +690,11 @@ def test_apply_blocked_by_invalid_target_soc(base):
     result = execute_car_charging_plan(base)
     assert isinstance(result, tuple) and result[0] == "EV blocked", result
     assert spy["args"] == []
-    assert base.car_charging_report["execution_reason"] == "invalid_target"
+    assert base.car_charging_report["execution_reason"] == "candidate_commands_changed"
 
 
-def test_apply_blocked_by_freeze_with_nonzero_target(base):
-    """``freeze=True`` together with ``target_soc != 0`` is rejected."""
+def test_apply_blocks_tampered_freeze_target(base):
+    """A post-plan contradictory freeze target fails the bound COST command proof."""
     _evaluate(base)
     adapter, _ = _make_adapter()
     inverter, spy = _make_inverter(base, adapter)
@@ -693,11 +703,11 @@ def test_apply_blocked_by_freeze_with_nonzero_target(base):
     result = execute_car_charging_plan(base)
     assert isinstance(result, tuple) and result[0] == "EV blocked", result
     assert spy["args"] == []
-    assert base.car_charging_report["execution_reason"] == "invalid_hold_target"
+    assert base.car_charging_report["execution_reason"] == "candidate_commands_changed"
 
 
-def test_apply_blocked_by_nonboolean_freeze_flag(base):
-    """``freeze`` not exactly bool is rejected."""
+def test_apply_blocks_tampered_freeze_flag(base):
+    """A post-plan non-boolean freeze flag fails the bound COST command proof."""
     _evaluate(base)
     adapter, _ = _make_adapter()
     inverter, spy = _make_inverter(base, adapter)
@@ -705,11 +715,11 @@ def test_apply_blocked_by_nonboolean_freeze_flag(base):
     result = execute_car_charging_plan(base)
     assert isinstance(result, tuple) and result[0] == "EV blocked", result
     assert spy["args"] == []
-    assert base.car_charging_report["execution_reason"] == "invalid_command_boolean"
+    assert base.car_charging_report["execution_reason"] == "candidate_commands_changed"
 
 
-def test_apply_blocked_by_command_timeline_mismatch(base):
-    """A command whose ``start`` is not the first planned step is rejected."""
+def test_apply_blocks_tampered_command_timeline(base):
+    """A post-plan command-timeline mutation fails the bound COST command proof."""
     _evaluate(base)
     adapter, _ = _make_adapter()
     inverter, spy = _make_inverter(base, adapter)
@@ -717,28 +727,32 @@ def test_apply_blocked_by_command_timeline_mismatch(base):
     result = execute_car_charging_plan(base)
     assert isinstance(result, tuple) and result[0] == "EV blocked", result
     assert spy["args"] == []
-    assert base.car_charging_report["execution_reason"] == "command_timeline_mismatch"
+    assert base.car_charging_report["execution_reason"] == "candidate_commands_changed"
 
 
 def test_apply_blocked_by_wallclock_crossing_command_end(base):
     """``now >= last command end`` (``command_authority_expired``) blocks apply.
 
-    Without changing ``minutes_now`` (the parent solver bound) we mutate the
-    staged command's end to force the expiry check, simulating a wallclock
-    that crossed the command boundary during a dispatch attempt.
+    Without changing ``minutes_now`` (the parent solver bound), advance only
+    the executor clock to the exact five-minute boundary. The unchanged COST
+    evidence remains within its TTL while the current command has expired.
     """
     _evaluate(base)
     adapter, _ = _make_adapter()
     inverter, spy = _make_inverter(base, adapter)
-    base.car_charging_pending["commands"][0]["end"] = base.minutes_now
-    result = execute_car_charging_plan(base)
+    crossed = _now_utc(base) + timedelta(minutes=5)
+    clock_reads = {"count": 0}
+
+    def execution_clock():
+        """Keep observation validation current, then advance dispatch to the slot boundary."""
+        clock_reads["count"] += 1
+        return _now_utc(base) if clock_reads["count"] == 1 else crossed
+
+    with patch.object(car_charging_execute, "_clock", side_effect=execution_clock):
+        result = execute_car_charging_plan(base)
     assert isinstance(result, tuple) and result[0] == "EV blocked", result
     assert spy["args"] == []
-    assert base.car_charging_report["execution_reason"] in {
-        "command_expired_during_dispatch",
-        "current_command_expired",
-        "command_timeline_mismatch",
-    }, base.car_charging_report
+    assert base.car_charging_report["execution_reason"] == "current_command_expired", base.car_charging_report
 
 
 def test_apply_blocked_by_no_pending_candidate(base):
@@ -802,10 +816,7 @@ def test_apply_blocked_by_incomplete_command_horizon(base):
     result = execute_car_charging_plan(base)
     assert isinstance(result, tuple) and result[0] == "EV blocked", result
     assert spy["args"] == []
-    assert base.car_charging_report["execution_reason"] in {
-        "incomplete_command_horizon",
-        "native_checks_failed",
-    }, base.car_charging_report
+    assert base.car_charging_report["execution_reason"] == "candidate_commands_changed", base.car_charging_report
 
 
 def test_apply_blocked_when_inverter_returns_false(base):
@@ -820,33 +831,20 @@ def test_apply_blocked_when_inverter_returns_false(base):
     assert base.car_charging_report["execution_enabled"] is False
 
 
-def test_success_demand_charge_hold_statuses(base):
-    """Demand, charge and freeze each produce the matching status and call the inverter."""
-    cases = [
-        {"target_soc": 0, "freeze": False, "expected": "Demand"},
-        {"target_soc": 100, "freeze": False, "expected": "Charging"},
-        {"target_soc": 0, "freeze": True, "expected": "Freeze charging"},
-        {"target_soc": 0, "freeze": False, "expected": "Demand", "power_w": 4000},
-    ]
-    for case in cases:
-        _evaluate(base)
-        base.car_charging_pending["commands"][0]["target_soc"] = case["target_soc"]
-        base.car_charging_pending["commands"][0]["freeze"] = case["freeze"]
-        base.car_charging_pending["commands"][0]["ev_on"] = False
-        if "power_w" in case:
-            base.car_charging_pending["commands"][0]["power_w"] = case["power_w"]
-        adapter, _ = _make_adapter()
-        inverter, spy = _make_inverter(base, adapter)
-        result = execute_car_charging_plan(base)
-        assert spy["args"], (case, result)
-        assert result[0] == case["expected"], (case, result)
-        report = base.car_charging_report
-        assert report["execution_enabled"] is True, (case, report)
-        assert report["ready_to_activate"] is False, (case, report)
-        assert report["hardware_confirmed"] is False, (case, report)
-        assert report["status"] == "applied", (case, report)
-        if "power_w" in case:
-            assert spy["args"][-1]["discharge_power_w"] == case["power_w"], (case, spy["args"])
+def test_apply_dispatches_exact_economically_authorised_command(base):
+    """Apply dispatches the staged COST command unchanged and records observation-only status."""
+    report = _evaluate(base)
+    assert report["status"] == "candidate" and report["economic_comparison"]["accepted"] is True, report
+    command = deepcopy(base.car_charging_pending["commands"][0])
+    adapter, _ = _make_adapter()
+    inverter, spy = _make_inverter(base, adapter)
+    result = execute_car_charging_plan(base)
+    assert result[0] == ("Freeze charging" if command["freeze"] else "Charging" if command["target_soc"] else "Demand"), result
+    assert spy["args"] == [{"target_soc": command["target_soc"], "freeze": command["freeze"], "discharge_power_w": command["power_w"]}]
+    assert base.car_charging_report["execution_enabled"] is True
+    assert base.car_charging_report["ready_to_activate"] is False
+    assert base.car_charging_report["hardware_confirmed"] is False
+    assert base.car_charging_report["status"] == "applied"
 
 
 def test_stale_observation_state_blocks_even_with_fresh_last_updated(base):
@@ -915,14 +913,15 @@ def test_success_with_ev_on_publishes_on(base):
     assert item["attributes"]["hardware_confirmed"] is False
 
 
-def test_success_with_ev_off_publishes_off(base):
-    """An accepted command and ``ev_on=False`` flips the EV slot binary sensor OFF."""
+def test_apply_blocks_tampered_ev_off_command_and_publishes_off(base):
+    """Changing the staged EV decision invalidates the proof and keeps publication OFF."""
     _evaluate(base)
     base.car_charging_pending["commands"][0]["ev_on"] = False
     adapter, _ = _make_adapter()
     inverter, _ = _make_inverter(base, adapter)
     result = execute_car_charging_plan(base)
-    assert isinstance(result, tuple), result
+    assert isinstance(result, tuple) and result[0] == "EV blocked", result
+    assert base.car_charging_report["execution_reason"] == "candidate_commands_changed"
     sensor_key = "binary_sensor." + base.prefix + "_car_charging_slot"
     item = base.dashboard_values.get(sensor_key)
     assert item is not None
@@ -1055,7 +1054,6 @@ def test_execution_fingerprint_is_configuration_independent_of_pending(base):
 def test_inverter_rate_intent_cleared_on_apply(base):
     """Any legacy quick-rebalance intent is cleared so apply's commands are not clobbered."""
     _evaluate(base)
-    base.car_charging_pending["commands"][0]["ev_on"] = False
     adapter, _ = _make_adapter()
     inverter, _ = _make_inverter(base, adapter)
     base.inverter_rate_intent = {0: {"charge_rate": 1500, "discharge_rate": 0}}
@@ -1122,20 +1120,20 @@ def run_car_planning_apply_tests(base):
         test_apply_blocked_by_stale_soc_observation,
         test_apply_blocked_by_future_connection_observation,
         test_apply_blocked_by_future_relay_timestamp,
-        test_apply_blocked_by_cooldown_within_599_seconds,
+        test_apply_blocks_stale_cost_proof_after_cooldown_input_changes,
         test_apply_allowed_after_cooldown_600_seconds,
-        test_apply_freeze_skips_cooldown_entirely,
+        test_apply_blocks_unauthorised_freeze_command_change,
         test_apply_blocked_by_relay_state_invalid,
         test_apply_blocked_by_import_limit_mismatch,
         test_apply_blocked_by_manual_floor_violation,
-        test_apply_blocked_by_invalid_power_below_zero,
-        test_apply_blocked_by_power_above_8192,
-        test_apply_blocked_by_nonfinite_power,
-        test_apply_blocked_by_bool_power,
-        test_apply_blocked_by_invalid_target_soc,
-        test_apply_blocked_by_freeze_with_nonzero_target,
-        test_apply_blocked_by_nonboolean_freeze_flag,
-        test_apply_blocked_by_command_timeline_mismatch,
+        test_apply_blocks_tampered_power_below_zero,
+        test_apply_blocks_tampered_power_above_cap,
+        test_apply_blocks_nonfinite_tampered_power,
+        test_apply_blocks_tampered_boolean_power,
+        test_apply_blocks_tampered_target_soc,
+        test_apply_blocks_tampered_freeze_target,
+        test_apply_blocks_tampered_freeze_flag,
+        test_apply_blocks_tampered_command_timeline,
         test_apply_blocked_by_wallclock_crossing_command_end,
         test_apply_blocked_by_no_pending_candidate,
         test_apply_blocked_by_native_check_failure_in_report,
@@ -1143,11 +1141,11 @@ def run_car_planning_apply_tests(base):
         test_apply_blocked_by_changed_configuration_during_dispatch,
         test_apply_blocked_by_incomplete_command_horizon,
         test_apply_blocked_when_inverter_returns_false,
-        test_success_demand_charge_hold_statuses,
+        test_apply_dispatches_exact_economically_authorised_command,
         test_stale_observation_state_blocks_even_with_fresh_last_updated,
         test_pending_false_and_exception_revokes_old_receipt,
         test_success_with_ev_on_publishes_on,
-        test_success_with_ev_off_publishes_off,
+        test_apply_blocks_tampered_ev_off_command_and_publishes_off,
         test_publish_car_planning_ev_after_accepted_publishes_immediately,
         test_publish_car_planning_ev_after_ttl_revokes_old_receipt,
         test_publish_car_planning_ev_with_permission_off_revokes,

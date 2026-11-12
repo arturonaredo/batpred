@@ -48,6 +48,13 @@ def test_priority_dropdown_replans_and_preserves_target(base):
     publish_car_charging_slot(base)
     assert base.car_charging_execution is None and len(writes) == count
     assert base.dashboard_values["binary_sensor." + base.prefix + "_car_charging_slot"]["state"] == "off"
+    stale = evaluate_car_charging(base, publish=False)
+    assert stale["status"] == "economic_rejected" and stale["native_reference_status"] == "unavailable", stale
+    # Model the ordinary planner completing the cycle invalidated above.
+    base.plan_valid = True
+    base.plan_last_updated = base.now_utc
+    base.plan_last_updated_minutes = base.minutes_now
+    base.plan_made_by_version = "synthetic-current-cycle"
     second = evaluate_car_charging(base, publish=False)
     assert second["status"] == "candidate" and second["ev_charging_priority"] == "cost", second
     assert second["proposed_ev_windows"][0]["start"] > first["proposed_ev_windows"][0]["start"]

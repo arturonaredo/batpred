@@ -366,9 +366,9 @@ def test_grid_support_replay_rejects_hidden_reserve_tail(base):
     assert abs(check["peak_import_w"] - 6500) < 1e-6 and check["checked_minutes"] == 5
 
 
-def test_grid_support_domestic_targets_follow_solar(base):
-    """Future PV changes domestic charging, but cannot replace the unchanged earlier EV deadline."""
-    plans = []
+def test_grid_support_capped_plan_fails_closed_without_pv_and_accepts_solar(base):
+    """A solver-derived ceiling cannot bypass the cap; PV can make the same EV block safe."""
+    safe_solar_plan = None
     for sunny in (False, True):
         _support_fixture(base)
         base.forecast_minutes = base.end_record = 360
@@ -381,14 +381,21 @@ def test_grid_support_domestic_targets_follow_solar(base):
         base.pv_forecast_minute_step = base.pv_forecast_minute10_step = {minute: 4 / 12 if sunny and minute >= 180 else 0 for minute in range(0, 360, 5)}
         with patch("car_charging_plan._observation_clock", return_value=base.now_utc):
             options = _options(base)
-        chosen, _ = _continuous_grid_support_shadow(base, options)
+        chosen, attempts = _continuous_grid_support_shadow(base, options)
+        if not sunny:
+            assert chosen is None
+            assert attempts and all(not attempt["native_passed"] for attempt in attempts)
+            assert any("site_import_exceeded" in reasons for attempt in attempts for reasons in attempt["native_reasons"].values())
+            continue
+
         assert chosen is not None
         result, slots, windows, checks = chosen
         assert all(check["passed"] and check["final_ev_kwh"] >= 3 for check in checks.values())
         assert all(window["end"] <= base.minutes_now + 60 for window in windows[0])
         assert all(limit < base.soc_max for limit in windows[2])
-        plans.append(sum(action.battery_charge_kwh for action in result.actions if action.pv_kwh == 0))
-    assert plans[1] < plans[0]
+        assert any(action.pv_kwh > 0 for action in result.actions)
+        safe_solar_plan = result
+    assert safe_solar_plan is not None
 
 
 def test_initial_demand_is_a_scoped_search_constraint():
@@ -452,6 +459,220 @@ def test_self_consumption_preference_is_paired_and_explicit(base):
                 pass
             else:
                 raise AssertionError("Non-boolean source preference accepted")
+
+
+def test_joint_native_reference_reuses_identical_ev_pattern_and_native_battery_windows(base):
+    """The cost baseline is the current native battery schedule plus the candidate EV schedule."""
+    from car_charging_household import _replay_native_joint_plan
+
+    _setup(base, minutes=10)
+    slots = [Slot(index, index * 5, 5, 0.1, 0, 10, 0) for index in range(2)]
+    candidate = SimpleNamespace(
+        actions=(
+            SimpleNamespace(slot_index=0, battery_mode="demand", ev_action="on", discharge_limit_kw=None),
+            SimpleNamespace(slot_index=1, battery_mode="demand", ev_action="off", discharge_limit_kw=None),
+        )
+    )
+    ev_windows = _native_windows(base, candidate, slots)[0]
+    snapshot = {
+        "plan_valid": True,
+        "charge_windows": [{"start": base.minutes_now + 5, "end": base.minutes_now + 10}],
+        "charge_limits": [base.soc_max],
+    }
+    replayed = []
+
+    def capture_replay(_base, _options, result, observed_slots, windows, scenario):
+        """Record the replay contract without replacing its schedule construction."""
+        replayed.append((result, observed_slots, windows, scenario))
+        return {"passed": True, "reasons": [], "checked_minutes": 10}
+
+    with patch("car_charging_plan._replay", side_effect=capture_replay):
+        result, windows, checks = _replay_native_joint_plan(base, {}, snapshot, candidate, slots, ev_windows)
+
+    assert windows[0] == ev_windows
+    assert [(action.battery_mode, action.ev_action) for action in result.actions] == [("demand", "on"), ("charge", "off")]
+    assert [item[2][0] for item in replayed] == [ev_windows, ev_windows]
+    assert [item[3] for item in replayed] == [0, 1]
+    assert all(check["passed"] for check in checks.values())
+
+
+def test_joint_cost_improvement_uses_raw_paired_vectors_and_switch_floor():
+    """Numerical noise, one-scenario savings, and extra switching cannot qualify COST."""
+    from car_charging_household import _joint_cost_improvement
+
+    reference = {"nominal": 100.0, "pv10": 110.0}
+    assert _joint_cost_improvement({"nominal": 98.5, "pv10": 109.5}, reference, 2, 0) is False
+    assert _joint_cost_improvement({"nominal": 98.5, "pv10": 110.0}, reference, 0, 0) is True
+    assert _joint_cost_improvement({"nominal": 99.5, "pv10": 109.5}, reference, 0, 0) is False
+    assert _joint_cost_improvement({"nominal": 101.0, "pv10": 90.0}, reference, 0, 0) is False
+    assert _joint_cost_improvement({"nominal": 96.9, "pv10": 110.0}, reference, 2, 0) is True
+
+
+def test_incident_shaped_early_100_at_19_1_is_rejected_for_native_88_at_8_1(base):
+    """Synthetic paired replay rejects early full charging against a cheaper 88% native band."""
+    from car_charging_plan import _search_joint_cost_candidates
+
+    _setup(base, minutes=10)
+    base.metric_battery_cycle = 0
+    base.metric_battery_value_scaling = 0
+    base.battery_value_rate = lambda _minute: 0
+    base.rate_import.update({base.minutes_now: 19.1, base.minutes_now + 5: 8.1})
+    options = {"beam": 512, "mode": "apply", "ev_charging_priority": "cost", "control_model": "deye_solarman"}
+    slots = [Slot(0, 0, 5, 0, 0, 19.1, 0), Slot(1, 5, 5, 0, 0, 8.1, 0)]
+    candidate = SimpleNamespace(
+        status="feasible",
+        total_cost=0,
+        actions=(
+            SimpleNamespace(slot_index=0, battery_mode="charge", ev_action="off", discharge_limit_kw=None),
+            SimpleNamespace(slot_index=1, battery_mode="demand", ev_action="on", discharge_limit_kw=None),
+        ),
+    )
+    ev_windows = _native_windows(base, candidate, slots)[0]
+    candidate_windows = (
+        ev_windows,
+        [{"start": base.minutes_now, "end": base.minutes_now + 5, "average": 19.1}],
+        [base.soc_max],
+    )
+    candidate_checks = {name: {"passed": True, "reasons": [], "checked_minutes": 10, "horizon_energy_cost": 19.1, "battery_cycle_kwh": 0, "final_battery_kwh": 10, "final_ev_kwh": 1} for name in ("nominal", "pv10")}
+    reference_checks = {name: {"passed": True, "reasons": [], "checked_minutes": 10, "horizon_energy_cost": 8.1, "battery_cycle_kwh": 0, "final_battery_kwh": 10, "final_ev_kwh": 1} for name in ("nominal", "pv10")}
+    native_snapshot = {
+        "plan_valid": True,
+        "charge_windows": [{"start": base.minutes_now + 5, "end": base.minutes_now + 10, "average": 8.1, "target": base.soc_max * 0.88}],
+        "charge_limits": [base.soc_max * 0.88],
+    }
+    reference_actions = []
+
+    def replay(_base, _options, result, _slots, windows, scenario):
+        """Return complete generic-horizon evidence, keeping the candidate EV reservation fixed."""
+        assert windows[0] == ev_windows
+        if result.status == "ordinary_native_joint_reference":
+            reference_actions.append([(action.battery_mode, action.ev_action) for action in result.actions])
+            return deepcopy(reference_checks["nominal" if scenario == 0 else "pv10"])
+        raise AssertionError("Unexpected replay source in synthetic reference test")
+
+    with (
+        patch("car_charging_plan._replay_candidate", return_value=(candidate_windows, candidate_checks)),
+        patch("car_charging_plan._replay", side_effect=replay),
+    ):
+        selected, attempts = _search_joint_cost_candidates(base, options, native_snapshot, (candidate, slots), [])
+
+    assert selected is not None and selected["source"] == "native_reference_alternative"
+    assert native_snapshot["charge_limits"] == [base.soc_max * 0.88]
+    assert candidate_windows[2] == [base.soc_max]  # early proposed full target, not incident replay evidence
+    assert selected["commands"][0]["target_soc"] == 0
+    assert selected["commands"][1]["target_soc"] == 88
+    assert selected["economic_comparison"]["proposed_candidate_costs"] == {"nominal": 19.1, "pv10": 19.1}
+    assert selected["economic_comparison"]["candidate_costs"] == {"nominal": 8.1, "pv10": 8.1}
+    assert selected["economic_comparison"]["battery_plan_improvement"] is False
+    assert selected["economic_comparison"]["same_ev_delivery"] is True
+    assert reference_actions == [[("demand", "off"), ("charge", "on")]] * 2
+    assert attempts[0]["economic_rejection"] == "no_material_battery_improvement"
+
+
+def test_joint_cost_search_keeps_configured_and_continuous_candidates_when_512_fails(base):
+    """A failed unrestricted refinement cannot erase an earlier continuous winner or its reasons."""
+    from car_charging_plan import _search_joint_cost_candidates
+
+    _setup(base, minutes=10)
+    base.metric_battery_cycle = 0
+    base.metric_battery_value_scaling = 0
+    base.battery_value_rate = lambda _minute: 0
+    options = {"beam": 128, "mode": "apply", "ev_charging_priority": "cost", "control_model": "deye_solarman"}
+    slots = [Slot(index, index * 5, 5, 0.1, 0, 10, 0) for index in range(2)]
+
+    def make_result(label, mode="demand"):
+        """Build a distinguishable result without depending on solver rank."""
+        actions = tuple(SimpleNamespace(slot_index=index, battery_mode=mode, ev_action="off", discharge_limit_kw=None) for index in range(2))
+        return SimpleNamespace(status="feasible", actions=actions, total_cost=label, diagnostics=SimpleNamespace(ev_delivered_total_kwh=0, pv_curtailed_total_kwh=0), label=label)
+
+    configured = make_result("configured")
+    continuous = make_result("continuous", "charge")
+    refined = make_result("refined")
+    safe_checks = {name: {"passed": True, "reasons": [], "checked_minutes": 10, "horizon_energy_cost": 98.0, "battery_cycle_kwh": 0, "final_battery_kwh": 0, "final_ev_kwh": 3} for name in ("nominal", "pv10")}
+    baseline_checks = {name: {"passed": True, "reasons": [], "checked_minutes": 10, "horizon_energy_cost": 100.0, "battery_cycle_kwh": 0, "final_battery_kwh": 0, "final_ev_kwh": 3} for name in ("nominal", "pv10")}
+    refined_failure = {name: {"passed": False, "reasons": ["site_import_exceeded"], "checked_minutes": 10} for name in ("nominal", "pv10")}
+    windows = ([], [], [])
+    continuous_attempt = {
+        "beam_width": 128,
+        "native_passed": True,
+        "_candidate": (continuous, slots, windows, safe_checks, {**options, "beam": 128}, "continuous_block"),
+    }
+    baseline_result = SimpleNamespace(status="ordinary_native_joint_reference", actions=tuple(SimpleNamespace(slot_index=i, battery_mode="demand", ev_action="off", discharge_limit_kw=None) for i in range(2)))
+    build_calls = []
+
+    def build(_base, trial):
+        """Return only the unrestricted 512 refinement requested by the search."""
+        build_calls.append(trial["beam"])
+        return refined, slots
+
+    def replay(_base, _trial, result, _slots):
+        """Keep configured evidence and make only the wider replay unsafe."""
+        return windows, baseline_checks if result is configured else refined_failure
+
+    with (
+        patch("car_charging_plan.build_candidate", side_effect=build),
+        patch("car_charging_plan._replay_candidate", side_effect=replay),
+        patch("car_charging_household._replay_native_joint_plan", return_value=(baseline_result, ([], [], []), baseline_checks)),
+    ):
+        selected, attempts = _search_joint_cost_candidates(
+            base,
+            options,
+            {"plan_valid": True, "charge_windows": [], "charge_limits": []},
+            (configured, slots),
+            [continuous_attempt],
+        )
+
+    assert build_calls == [512]
+    assert selected["source"] == "continuous_block"
+    assert [attempt["beam_width"] for attempt in attempts if "beam_width" in attempt] == [128, 128, 512]
+    assert attempts[-1]["native_reasons"] == {"nominal": ["site_import_exceeded"], "pv10": ["site_import_exceeded"]}
+
+
+def test_joint_cost_search_retains_equal_native_battery_plan_for_ev_delivery(base):
+    """An equal-cost, paired-safe native battery schedule remains an executable EV alternative."""
+    from car_charging_plan import _search_joint_cost_candidates
+
+    _setup(base, minutes=10)
+    base.metric_battery_cycle = 0
+    base.metric_battery_value_scaling = 0
+    base.battery_value_rate = lambda _minute: 0
+    options = {"beam": 512, "mode": "apply", "ev_charging_priority": "cost", "control_model": "deye_solarman"}
+    slots = [Slot(index, index * 5, 5, 0.1, 0, 10, 0) for index in range(2)]
+    result = SimpleNamespace(
+        status="feasible",
+        actions=tuple(SimpleNamespace(slot_index=index, battery_mode="demand", ev_action="on" if index == 0 else "off", discharge_limit_kw=None) for index in range(2)),
+        total_cost=-1000,
+        diagnostics=SimpleNamespace(ev_delivered_total_kwh=1, pv_curtailed_total_kwh=0),
+    )
+    checks = {name: {"passed": True, "reasons": [], "checked_minutes": 10, "horizon_energy_cost": 100, "battery_cycle_kwh": 0, "final_battery_kwh": 5, "final_ev_kwh": 3, "validated_ev_target_kwh": 3} for name in ("nominal", "pv10")}
+    windows = ([{"start": base.minutes_now, "end": base.minutes_now + 5, "kwh": 1}], [], [])
+    native_result = SimpleNamespace(
+        status="ordinary_native_joint_reference",
+        actions=tuple(SimpleNamespace(slot_index=index, battery_mode="demand", ev_action="on" if index == 0 else "off", discharge_limit_kw=None) for index in range(2)),
+        total_cost=None,
+        diagnostics=SimpleNamespace(ev_delivered_total_kwh=1, pv_curtailed_total_kwh=0),
+    )
+
+    with (
+        patch("car_charging_plan._replay_candidate", return_value=(windows, checks)),
+        patch("car_charging_household._replay_native_joint_plan", return_value=(native_result, windows, checks)),
+    ):
+        selected, attempts = _search_joint_cost_candidates(
+            base,
+            options,
+            {"plan_valid": True, "charge_windows": [], "charge_limits": []},
+            (result, slots),
+            [],
+        )
+
+    assert selected["source"] == "native_reference_alternative"
+    assert selected["commands"] == [
+        {"start": base.minutes_now, "end": base.minutes_now + 5, "target_soc": 0, "freeze": False, "power_w": None, "ev_on": True},
+        {"start": base.minutes_now + 5, "end": base.minutes_now + 10, "target_soc": 0, "freeze": False, "power_w": None, "ev_on": False},
+    ]
+    assert selected["economic_comparison"]["battery_plan_improvement"] is False
+    assert selected["economic_comparison"]["status"] == "native_reference_alternative"
+    assert any(attempt.get("economic_rejection") == "no_material_battery_improvement" for attempt in attempts)
 
 
 def _household_template_fixture(base, minutes=360, economic_fallback=True):
@@ -797,6 +1018,7 @@ def test_joint_search_miss_attempts_opted_in_household_fallback(base):
     _set_entity(base, "binary_sensor.combined_test_relay", "off", last_changed=base.now_utc - timedelta(minutes=10))
     fallback_report = {"status": "candidate", "domestic_only": True, "native_checks": {}}
     no_candidate = SimpleNamespace(actions=(), status="bounded_no_plan", total_cost=None)
+    base.car_charging_pending = {"report": {"status": "candidate"}, "commands": [{"ev_on": True}]}
 
     with (
         patch("car_charging_plan._observation_clock", return_value=base.now_utc),
@@ -807,9 +1029,13 @@ def test_joint_search_miss_attempts_opted_in_household_fallback(base):
         report = evaluate_car_charging(base, publish=False)
 
     assert fallback.call_count == 1
+    assert fallback.call_args.args[2] == "joint_candidate_economic_rejected"
     assert report is fallback_report
-    assert report["joint_candidate_rejection"]["status"] == "no_plan_found"
+    assert report["joint_candidate_rejection"]["status"] == "economic_rejected"
     assert report["joint_candidate_rejection"]["search_beam_attempts"]
+    assert report["joint_candidate_rejection"]["joint_economic_search_attempts"]
+    assert all(attempt["native_reasons"] == {"nominal": ["solver_no_plan"], "pv10": ["solver_no_plan"]} for attempt in report["joint_candidate_rejection"]["joint_economic_search_attempts"])
+    assert base.car_charging_pending is None
 
 
 def test_household_native_cost_refinement_runs_both_beams_and_includes_cycle_and_terminal_value(base):
@@ -1384,13 +1610,18 @@ def run_car_planning_grid_support_tests(base):
         test()
     test_grid_support_options_fail_closed(base)
     test_grid_support_continuous_candidate_is_paired(base)
+    test_joint_native_reference_reuses_identical_ev_pattern_and_native_battery_windows(base)
+    test_joint_cost_improvement_uses_raw_paired_vectors_and_switch_floor()
+    test_joint_cost_search_keeps_configured_and_continuous_candidates_when_512_fails(base)
+    test_joint_cost_search_retains_equal_native_battery_plan_for_ev_delivery(base)
     test_cost_priority_shortlist_retains_baseline_and_samples_ties()
     test_cost_priority_shortlist_keeps_cheaper_starts_and_other_priorities()
     test_cost_priority_tie_search_samples_late_candidate()
     test_cost_priority_compares_safe_initial_demand_with_ordinary_candidate()
     test_apply_cost_refines_representative_starts_even_after_a_feasible_result()
     test_grid_support_replay_rejects_hidden_reserve_tail(base)
-    test_grid_support_domestic_targets_follow_solar(base)
+    test_grid_support_capped_plan_fails_closed_without_pv_and_accepts_solar(base)
+    test_incident_shaped_early_100_at_19_1_is_rejected_for_native_88_at_8_1(base)
     test_initial_demand_is_a_scoped_search_constraint()
     test_self_consumption_preference_is_paired_and_explicit(base)
     test_household_demand_comparison_uses_an_all_demand_baseline(base)

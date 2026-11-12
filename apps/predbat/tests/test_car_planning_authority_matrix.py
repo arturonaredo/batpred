@@ -34,9 +34,25 @@ def _set_observation_stamp(base, entity_id, stamp):
     _set_state(base, entity_id, stamp.isoformat(), last_updated=base.now_utc, last_changed=base.now_utc)
 
 
+def _set_current_native_reference(base):
+    """Provide the safe equal-tariff native reference required by COST admission."""
+    base.import_limit = 12000.0
+    car_settings(base)["import_limit_w"] = 12000.0
+    base.rate_import.update({base.minutes_now + minute: 10 for minute in range(base.forecast_minutes)})
+    base.plan_valid = True
+    base.plan_last_updated = base.now_utc
+    base.plan_last_updated_minutes = base.minutes_now
+    base.plan_made_by_version = "synthetic-current-cycle"
+    base.charge_window_best = [{"start": base.minutes_now + 40, "end": base.minutes_now + 45, "average": 10, "target": base.soc_max}]
+    base.charge_limit_best = [base.soc_max]
+    base.export_window_best = []
+    base.export_limits_best = []
+
+
 def _stage_local_candidate(base):
     """Stage a genuine native candidate and fake only the local inverter boundary."""
     _apply_inputs(base)
+    _set_current_native_reference(base)
     report = evaluate_car_charging(base, publish=False)
     assert report["status"] == "candidate", report
     adapter, _ = _make_adapter()
@@ -64,6 +80,7 @@ def test_permission_connection_authority_matrix():
         base = _fresh_base()
         with patch("car_charging_plan._observation_clock", side_effect=lambda: base.now_utc), patch("car_charging_execute._clock", side_effect=lambda: base.now_utc):
             _apply_inputs(base)
+            _set_current_native_reference(base)
             settings = car_settings(base)
             if warning:
                 settings["connection_warning_states"] = [warning]
@@ -207,13 +224,14 @@ def test_target_complete_stop_waits_for_observed_relay_off():
     base = _fresh_base()
     with patch("car_charging_plan._observation_clock", side_effect=lambda: base.now_utc), patch("car_charging_execute._clock", side_effect=lambda: base.now_utc):
         _apply_inputs(base)
+        _set_current_native_reference(base)
         settings = car_settings(base)
+        _set_state(base, settings["relay_entity"], "on")
         base.car_charging_limit[0] = 0
         report = evaluate_car_charging(base, publish=False)
         assert report["status"] == "candidate", report
         assert not report["proposed_ev_windows"], report
         assert all(not command["ev_on"] for command in base.car_charging_pending["commands"])
-        _set_state(base, settings["relay_entity"], "on")
         adapter, _ = _make_adapter()
         _, actuator = _make_inverter(base, adapter)
 
@@ -358,6 +376,7 @@ def test_native_charger_control_ownership():
     base = _fresh_base()
     with patch("car_charging_plan._observation_clock", side_effect=lambda: base.now_utc), patch("car_charging_execute._clock", side_effect=lambda: base.now_utc):
         _apply_inputs(base)
+        _set_current_native_reference(base)
         base.args.update({setting: False for _, setting, _ in controls})
         assert evaluate_car_charging(base, publish=False)["status"] == "candidate"
         adapter, _ = _make_adapter()

@@ -9,6 +9,8 @@ from car_charging_config import read_car_charging_config
 
 from copy import copy, deepcopy
 from datetime import datetime, timezone
+import hashlib
+import json
 import math
 
 from const import PREDICT_STEP, PREDBAT_MAX_CARS
@@ -665,12 +667,64 @@ def _native_windows(base, result, slots):
             ev_windows.append({"start": start, "end": end, "kwh": energy, "average": slot.import_price, "cost": energy * slot.import_price, "octopus": False})
         if action.battery_mode in ("charge", "hold"):
             target = base.soc_max if action.battery_mode == "charge" else base.reserve
-            if charge_windows and charge_windows[-1]["end"] == start and limits[-1] == target:
+            # A combined display window must never inherit the first slot's tariff
+            # label when later slots cross into a different import-price band.
+            # Adjacent equal-mode segments remain continuous native control; this
+            # boundary is for local intent/economics, not an OFF/ON transition.
+            if charge_windows and charge_windows[-1]["end"] == start and limits[-1] == target and charge_windows[-1]["average"] == slot.import_price:
                 charge_windows[-1]["end"] = end
             else:
                 charge_windows.append({"start": start, "end": end, "average": slot.import_price})
                 limits.append(target)
     return ev_windows, charge_windows, limits
+
+
+def _solver_charge_run_limits(base, result, slots):
+    """Map each native rate/control segment to its local conservative solver-SOC ceiling."""
+    actions = getattr(result, "actions", None)
+    trace = getattr(result, "battery_soc_trace", None)
+    if not isinstance(actions, (tuple, list)) or not actions:
+        return []
+    charge_indices = [index for index, action in enumerate(actions) if getattr(action, "battery_mode", None) == "charge"]
+    if not charge_indices:
+        return []
+    if not isinstance(trace, (tuple, list)) or len(trace) != len(actions) + 1 or len(slots) != len(actions):
+        raise ValueError("Invalid solver battery SOC trajectory for charge ceiling")
+    capacity = _number(base.soc_max, "charge_ceiling_capacity", 0.001)
+    soc_trace = [_number(value, "solver_charge_soc", 0, capacity) for value in trace]
+    native_windows = _native_windows(base, result, slots)[1]
+    limits = []
+    for window in native_windows:
+        covered = []
+        for index, (action, slot) in enumerate(zip(actions, slots)):
+            start = base.minutes_now + slot.start_min
+            end = start + slot.duration_min
+            overlaps = window["start"] < end and window["end"] > start
+            if overlaps and not (window["start"] <= start and end <= window["end"]):
+                raise ValueError("Native charge ceiling segment is not aligned to solver slots")
+            if overlaps:
+                covered.append(index)
+        if not covered or covered != list(range(covered[0], covered[-1] + 1)):
+            raise ValueError("Native charge ceiling segment has an incomplete solver trace")
+        modes = {getattr(actions[index], "battery_mode", None) for index in covered}
+        if len(modes) != 1 or next(iter(modes)) not in ("charge", "hold"):
+            raise ValueError("Native charge ceiling segment mixes unsupported battery modes")
+        mode = next(iter(modes))
+        if mode == "hold":
+            # Hold remains pinned to the existing native reserve target.
+            limits.append(_number(base.reserve, "charge_ceiling_hold_target", 0, capacity))
+            continue
+        for left, right in zip(covered, covered[1:]):
+            previous = slots[left]
+            current = slots[right]
+            if previous.start_min + previous.duration_min != current.start_min:
+                raise ValueError("Non-contiguous solver charge SOC segment")
+        peak = max(soc_trace[covered[0] : covered[-1] + 2])
+        percent = 100 if peak == capacity else math.floor(peak * 100 / capacity + 1e-9)
+        limits.append(capacity * percent / 100)
+    if len(limits) != len(native_windows):
+        raise ValueError("Solver charge ceilings do not match native control segments")
+    return limits
 
 
 def _replay(base, options, result, slots, windows, scenario):
@@ -793,25 +847,16 @@ def _replay(base, options, result, slots, windows, scenario):
 
 
 def _replay_candidate(base, options, result, slots):
-    """Reduce shadow and opted-in grid-support ceilings to paired peaks plus one percent.
-
-    These are real candidate limits, not cosmetic row values. Replay both scenarios
-    again with the reduced limits and accept only their independent native checks.
-    A ceiling cannot override domestic minima, hardware rates or any execution gate.
-    """
+    """Replay commands capped by solver-derived charge-run trajectories in both scenarios."""
     windows = _native_windows(base, result, slots)
+    charge_limits = _solver_charge_run_limits(base, result, slots)
+    if charge_limits:
+        if len(charge_limits) != len(windows[1]):
+            raise ValueError("Solver charge SOC runs do not match native charge windows")
+        windows = (windows[0], windows[1], charge_limits)
     checks = {name: _replay(base, options, result, slots, windows, scenario) for name, scenario in (("nominal", 0), ("pv10", 1))}
-    peaks = {name: check.pop("_charge_peak_kwh", None) for name, check in checks.items()}
-    if (options.get("mode") == "shadow" or options.get("grid_charge_support_w")) and all(check["passed"] for check in checks.values()) and all(isinstance(value, list) and len(value) == len(windows[1]) for value in peaks.values()):
-        limits = []
-        for index, original in enumerate(windows[2]):
-            peak = max(peaks[name][index] for name in ("nominal", "pv10"))
-            target = min(100, math.ceil(peak * 100 / base.soc_max + 1)) * base.soc_max / 100
-            limits.append(target if original == base.soc_max else original)
-        windows = (windows[0], windows[1], limits)
-        checks = {name: _replay(base, options, result, slots, windows, scenario) for name, scenario in (("nominal", 0), ("pv10", 1))}
-        for check in checks.values():
-            check.pop("_charge_peak_kwh", None)
+    for check in checks.values():
+        check.pop("_charge_peak_kwh", None)
     return windows, checks
 
 
@@ -974,26 +1019,30 @@ def _continuous_grid_support_shadow(base, options):
                 trial = {**options, "beam": search_beam, "forecast_basis": "envelope", "ev_continuous_block": (start, start + duration), "initial_demand_only": initial_demand}
                 result, slots = build_candidate(base, trial)
                 passed = False
+                native_reasons = {"nominal": ["solver_no_plan"], "pv10": ["solver_no_plan"]}
                 if result.actions:
                     _validate_candidate_modes(options, result)
                     windows, checks = _replay_candidate(base, trial, result, slots)
                     passed = all(check["passed"] for check in checks.values())
+                    native_reasons = _check_reasons(checks)
                     if passed and (best is None or result.total_cost < best[0].total_cost - 1e-9):
                         best = result, slots, windows, checks
                         selected = len(attempts)
-                attempts.append(
-                    {
-                        "start_offset": start,
-                        "end_offset": start + duration,
-                        "beam_width": search_beam,
-                        "quality_refinement": search_beam != configured_beam,
-                        "solver_status": result.status,
-                        "solver_objective": result.total_cost,
-                        "native_passed": passed,
-                        "initial_demand_only": initial_demand,
-                        "priority_reason": reason,
-                    }
-                )
+                attempt = {
+                    "start_offset": start,
+                    "end_offset": start + duration,
+                    "beam_width": search_beam,
+                    "quality_refinement": search_beam != configured_beam,
+                    "solver_status": result.status,
+                    "solver_objective": result.total_cost,
+                    "native_passed": passed,
+                    "native_reasons": native_reasons,
+                    "initial_demand_only": initial_demand,
+                    "priority_reason": reason,
+                }
+                if passed:
+                    attempt["_candidate"] = (result, slots, windows, checks, trial, "continuous_block")
+                attempts.append(attempt)
                 # Demand-first is a tie preference for COST, not permission to defer
                 # economically useful charging again on every five-minute replan.
                 if passed and (priority != "cost" or not initial_demand):
@@ -1015,6 +1064,215 @@ def _continuous_grid_support_shadow(base, options):
     if selected is not None:
         attempts[selected]["selected"] = True
     return best, attempts
+
+
+def _battery_mode_switches(result):
+    """Count battery-mode transitions in a complete slot sequence."""
+    modes = [getattr(action, "battery_mode", None) for action in getattr(result, "actions", ())]
+    return sum(left != right for left, right in zip(modes, modes[1:]))
+
+
+def _candidate_commands(base, result, slots, windows):
+    """Render exact five-minute native commands from the independently replayed windows."""
+    from car_charging_replay import discharge_limit_w
+
+    commands = []
+    for action, slot in zip(result.actions, slots):
+        start = base.minutes_now + slot.start_min
+        end = start + slot.duration_min
+        target = next((round(limit * 100 / base.soc_max) for window, limit in zip(windows[1], windows[2]) if window["start"] <= start < window["end"]), 0)
+        commands.append(
+            {
+                "start": start,
+                "end": end,
+                "target_soc": target if action.battery_mode == "charge" else 0,
+                "freeze": action.battery_mode == "hold",
+                "power_w": discharge_limit_w(base, action),
+                "ev_on": action.ev_action == "on",
+            }
+        )
+    return commands
+
+
+def _check_reasons(checks):
+    """Keep bounded exact replay rejection codes without publishing solver objects."""
+    return {name: list(check.get("reasons", [])) if isinstance(check, dict) and isinstance(check.get("reasons", []), list) else ["replay_evidence_invalid"] for name, check in checks.items()}
+
+
+def _digest(value):
+    """Hash deterministic JSON evidence without permitting NaN or private repr fallbacks."""
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False, default=str).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _search_joint_cost_candidates(base, options, native_snapshot, configured_candidate, continuous_attempts):
+    """Compare all bounded COST candidates with a paired replay of the current native battery plan."""
+    from car_charging_household import (
+        JOINT_COST_EXTRA_SWITCH_FLOOR,
+        JOINT_COST_IMPROVEMENT_FLOOR,
+        _joint_cost_improvement,
+        _native_adjusted_cost,
+        _paired_passed,
+        _replay_native_joint_plan,
+    )
+
+    if options.get("ev_charging_priority") != "cost":
+        return None, [{"source": "joint_cost_search", "economic_rejection": "priority_mode_preserved"}]
+
+    attempts = []
+    accepted = []
+    sources = []
+    if configured_candidate and len(configured_candidate) == 2 and configured_candidate[0] is not None:
+        sources.append((configured_candidate[0], configured_candidate[1], options, "configured_beam", options["beam"], None, None, {}))
+    for attempt in continuous_attempts:
+        internal = attempt.get("_candidate") if isinstance(attempt, dict) else None
+        if isinstance(internal, tuple) and len(internal) == 6:
+            result, slots, windows, checks, trial, source = internal
+            metadata = {key: value for key, value in attempt.items() if key != "_candidate"}
+            sources.append((result, slots, trial, source, trial.get("beam", attempt.get("beam_width")), windows, checks, metadata))
+
+    configured_beam = options["beam"]
+    if configured_beam < 512:
+        refinement_options = {key: value for key, value in options.items() if key not in ("ev_continuous_block", "initial_demand_only")}
+        refinement_options.update(beam=512, forecast_basis="envelope")
+        refined_result, refined_slots = build_candidate(base, refinement_options)
+        sources.append((refined_result, refined_slots, refinement_options, "unrestricted_beam_512", 512, None, None, {}))
+
+    for result, slots, trial, source, beam, saved_windows, saved_checks, metadata in sources:
+        attempt_record = {**metadata, "source": source, "beam_width": beam, "solver_status": getattr(result, "status", "unknown")}
+        if not getattr(result, "actions", None):
+            attempt_record.update(native_passed=False, native_reasons={"nominal": ["solver_no_plan"], "pv10": ["solver_no_plan"]})
+            attempts.append(attempt_record)
+            continue
+        _validate_candidate_modes(trial, result)
+        if saved_windows is None or saved_checks is None:
+            candidate_windows, candidate_checks = _replay_candidate(base, trial, result, slots)
+        else:
+            candidate_windows, candidate_checks = saved_windows, saved_checks
+        candidate_passed = _paired_passed(candidate_checks, base.forecast_minutes)
+        attempt_record.update(native_passed=candidate_passed, native_reasons=_check_reasons(candidate_checks))
+        candidate_costs = _native_adjusted_cost(base, candidate_checks) if candidate_passed else None
+        if candidate_costs is None:
+            attempt_record["economic_rejection"] = "candidate_native_replay_unsafe_or_incomplete"
+            attempts.append(attempt_record)
+            continue
+        if native_snapshot is None:
+            attempt_record["economic_rejection"] = "native_reference_unavailable"
+            attempt_record["reference_reasons"] = {"nominal": ["current_native_plan_unavailable"], "pv10": ["current_native_plan_unavailable"]}
+            attempts.append(attempt_record)
+            continue
+
+        try:
+            reference_result, reference_windows, reference_checks = _replay_native_joint_plan(base, trial, native_snapshot, result, slots, candidate_windows[0])
+        except (ValueError, TypeError, KeyError, AttributeError):
+            attempt_record["economic_rejection"] = "native_reference_replay_failed"
+            attempt_record["reference_reasons"] = {"nominal": ["native_reference_replay_failed"], "pv10": ["native_reference_replay_failed"]}
+            attempts.append(attempt_record)
+            continue
+        reference_passed = _paired_passed(reference_checks, base.forecast_minutes)
+        attempt_record.update(reference_passed=reference_passed, reference_reasons=_check_reasons(reference_checks))
+        reference_costs = _native_adjusted_cost(base, reference_checks) if reference_passed else None
+        if reference_costs is None:
+            attempt_record["economic_rejection"] = "native_reference_unsafe_or_incomplete"
+            attempts.append(attempt_record)
+            continue
+        same_ev_delivery = all(
+            isinstance(candidate_checks[name].get("final_ev_kwh"), (int, float)) and isinstance(reference_checks[name].get("final_ev_kwh"), (int, float)) and abs(candidate_checks[name]["final_ev_kwh"] - reference_checks[name]["final_ev_kwh"]) <= 0.002
+            for name in ("nominal", "pv10")
+        )
+        if not same_ev_delivery:
+            attempt_record["economic_rejection"] = "native_reference_ev_delivery_mismatch"
+            attempts.append(attempt_record)
+            continue
+
+        candidate_switches = _battery_mode_switches(result)
+        reference_switches = _battery_mode_switches(reference_result)
+        improved = _joint_cost_improvement(candidate_costs, reference_costs, candidate_switches, reference_switches)
+        deltas = {name: candidate_costs[name] - reference_costs[name] for name in ("nominal", "pv10")}
+        reference_fingerprint = _digest(
+            {
+                "native_snapshot": native_snapshot,
+                "ev_windows": candidate_windows[0],
+                "reference_costs": reference_costs,
+                "reference_checks": {name: {key: check.get(key) for key in ("passed", "checked_minutes", "reasons", "horizon_energy_cost", "battery_cycle_kwh", "final_battery_kwh", "final_ev_kwh")} for name, check in reference_checks.items()},
+            }
+        )
+        comparison = {
+            "status": "componentwise_improvement" if improved else "native_reference_alternative",
+            "reference_kind": "current_cycle_native_battery_plan_paired_with_identical_ev_windows",
+            "reference_fingerprint": reference_fingerprint,
+            "reference_charge_windows": deepcopy(native_snapshot["charge_windows"]),
+            "reference_charge_limits": deepcopy(native_snapshot["charge_limits"]),
+            "reference_costs": deepcopy(reference_costs),
+            "reference_checks": {name: {key: check.get(key) for key in ("passed", "checked_minutes", "reasons", "horizon_energy_cost", "battery_cycle_kwh", "final_battery_kwh", "final_ev_kwh")} for name, check in reference_checks.items()},
+            "candidate_costs": deepcopy(candidate_costs),
+            "candidate_minus_reference": deltas,
+            "componentwise_non_regression": all(deltas[name] <= 0.002 for name in ("nominal", "pv10")),
+            "positive_improvement": improved,
+            "battery_plan_improvement": improved,
+            "improvement_floor": JOINT_COST_IMPROVEMENT_FLOOR,
+            "extra_mode_switch_floor": JOINT_COST_EXTRA_SWITCH_FLOOR,
+            "candidate_battery_mode_switches": candidate_switches,
+            "reference_battery_mode_switches": reference_switches,
+            "same_ev_delivery": True,
+            "comparison_basis": "raw_paired_native_horizon_cost_plus_cycle_cost_minus_terminal_soc_value",
+            "search_scope": "best_accepted_among_configured_beam_512_and_bounded_continuous_candidates_not_global_optimum",
+        }
+        if improved:
+            accepted.append(
+                {
+                    "source": source,
+                    "result": result,
+                    "slots": slots,
+                    "windows": candidate_windows,
+                    "checks": candidate_checks,
+                    "options": trial,
+                    "commands": _candidate_commands(base, result, slots, candidate_windows),
+                    "economic_comparison": comparison,
+                    "sort_costs": candidate_costs,
+                    "reference_result": reference_result,
+                    "reference_windows": reference_windows,
+                    "reference_checks": reference_checks,
+                    "native_reference_snapshot": deepcopy(native_snapshot),
+                }
+            )
+            attempt_record.update(economic_accepted=True, economic_comparison=deepcopy(comparison))
+        else:
+            attempt_record["economic_rejection"] = "no_material_battery_improvement"
+            # Safe ordinary battery commands remain a first-class alternative for this exact EV schedule.
+            alternative_comparison = deepcopy(comparison)
+            alternative_comparison.update(
+                status="native_reference_alternative",
+                proposed_candidate_costs=deepcopy(candidate_costs),
+                candidate_costs=deepcopy(reference_costs),
+                candidate_minus_reference={"nominal": 0.0, "pv10": 0.0},
+                componentwise_non_regression=True,
+                positive_improvement=False,
+                battery_plan_improvement=False,
+            )
+            accepted.append(
+                {
+                    "source": "native_reference_alternative",
+                    "result": reference_result,
+                    "slots": slots,
+                    "windows": reference_windows,
+                    "checks": reference_checks,
+                    "options": trial,
+                    "commands": _candidate_commands(base, reference_result, slots, reference_windows),
+                    "economic_comparison": alternative_comparison,
+                    "sort_costs": reference_costs,
+                    "reference_result": reference_result,
+                    "reference_windows": reference_windows,
+                    "reference_checks": reference_checks,
+                    "native_reference_snapshot": deepcopy(native_snapshot),
+                }
+            )
+        attempts.append(attempt_record)
+
+    if not accepted:
+        return None, attempts
+    selected = min(accepted, key=lambda item: (max(item["sort_costs"].values()), sum(item["sort_costs"].values()), item["source"] != "native_reference_alternative"))
+    return selected, attempts
 
 
 def _empty_report(status):
@@ -1194,10 +1452,19 @@ def evaluate_car_charging(base, publish=True):
         report.update(evidence)
         _forecast_inputs(model_base, options)
         stage = "solver"
+        joint_cost_mode = options["mode"] == "apply" and options["ev_charging_priority"] == "cost"
+        native_snapshot = None
+        if joint_cost_mode:
+            from car_charging_household import _snapshot_native_plan
+
+            native_snapshot = _snapshot_native_plan(base)
         result, slots = build_candidate(model_base, options)
+        configured_candidate = (result, slots)
         continuous = None
+        continuous_attempts = []
         if options["grid_charge_support_w"]:
-            continuous, report["continuous_block_attempts"] = _continuous_grid_support_shadow(model_base, options)
+            continuous, continuous_attempts = _continuous_grid_support_shadow(model_base, options)
+            report["continuous_block_attempts"] = [{key: value for key, value in attempt.items() if key != "_candidate"} for attempt in continuous_attempts]
             if continuous is not None:
                 result, slots = continuous[:2]
             report["ev_run_strategy"] = "single_continuous_block_preferred_no_restart_calibration" if continuous is not None else "ordinary_bounded_search"
@@ -1215,24 +1482,86 @@ def evaluate_car_charging(base, publish=True):
             selected_search = next((attempt for attempt in report.get("continuous_block_attempts", []) if attempt.get("selected")), {})
             report["configured_search_beam_width"] = options["beam"]
             report["search_beam_attempts"] = [{"beam_width": selected_search.get("beam_width", options["beam"]), "solver_status": result.status}]
-            if not result.actions and options["beam"] < 512:
+            if not result.actions and options["beam"] < 512 and not joint_cost_mode:
                 # A bounded search miss is not infeasibility. One explicit, reported
                 # retry retains the exact capabilities/inputs and stays within the cap.
                 retry_options = {**options, "beam": 512}
                 result, slots = build_candidate(model_base, retry_options)
                 report["search_beam_attempts"].append({"beam_width": 512, "solver_status": result.status})
             _validate_candidate_modes(options, result)
+        economic_selected = None
+        economic_attempts = []
+        if joint_cost_mode:
+            stage = "paired_economics"
+            economic_selected, economic_attempts = _search_joint_cost_candidates(model_base, options, native_snapshot, configured_candidate, continuous_attempts)
+            if economic_selected is None:
+                report.update(
+                    status="economic_rejected",
+                    execution_reason="no_eligible_paired_economic_candidate",
+                    reason="COST execution requires a complete safe paired native reference and material per-scenario improvement, or its safe native alternative",
+                    joint_economic_search_attempts=economic_attempts,
+                    native_reference_status="unavailable" if native_snapshot is None else "unsafe_or_incomplete_or_not_materially_better",
+                    search_scope="best_accepted_among_configured_beam_512_and_bounded_continuous_candidates_not_global_optimum",
+                    execution_enabled=False,
+                    ready_to_activate=False,
+                    bounded_search=True,
+                )
+                if settings.get("household_fallback") is True and settings.get("household_economic_fallback") is True:
+                    from car_charging_household import evaluate_household_fallback
+
+                    fallback_report = evaluate_household_fallback(base, settings, "joint_candidate_economic_rejected")
+                    if isinstance(fallback_report, dict):
+                        fallback_report["joint_candidate_rejection"] = {
+                            "status": report["status"],
+                            "execution_reason": report["execution_reason"],
+                            "native_reference_status": report["native_reference_status"],
+                            "search_scope": report["search_scope"],
+                            "search_beam_attempts": deepcopy(report.get("search_beam_attempts", [])),
+                            "joint_economic_search_attempts": deepcopy(economic_attempts),
+                        }
+                        pending = getattr(base, "car_charging_pending", None)
+                        if isinstance(pending, dict) and pending.get("domestic_only") is True:
+                            pending["report"] = deepcopy(fallback_report)
+                        report = fallback_report
+                _publish_report(base, report, publish)
+                return report
+            result = economic_selected["result"]
+            slots = economic_selected["slots"]
+            windows = economic_selected["windows"]
+            checks = economic_selected["checks"]
+            options = economic_selected["options"]
+            report["economic_comparison"] = deepcopy(economic_selected["economic_comparison"])
+            report["selected_candidate_source"] = economic_selected["source"]
+            report["joint_economic_search_attempts"] = economic_attempts
+            report["search_beam_attempts"] = [
+                {
+                    "source": attempt.get("source"),
+                    "beam_width": attempt.get("beam_width"),
+                    "solver_status": attempt.get("solver_status"),
+                    "native_passed": attempt.get("native_passed"),
+                    "native_reasons": attempt.get("native_reasons"),
+                    "reference_passed": attempt.get("reference_passed"),
+                    "reference_reasons": attempt.get("reference_reasons"),
+                    "economic_rejection": attempt.get("economic_rejection"),
+                    "economic_accepted": attempt.get("economic_accepted"),
+                }
+                for attempt in economic_attempts
+            ]
         if not result.actions:
             report["status"] = "conditional_no_plan_found" if stale_hypothesis else "no_plan_found"
             report["execution_blockers"] = list(blockers)
             report["entity_observations"] = entity_observations
             report["initial_execution_state_assumption"] = "relay_value_and_elapsed_off_time" if options["entity_config"]["relay_entity"] else "assumed_off_for_minimum_cooldown_no_relay"
         else:
-            stage = "native_replay"
-            windows, checks = continuous[2:] if continuous is not None else _replay_candidate(model_base, options, result, slots)
-            selected_basis = "envelope" if continuous is not None else "nominal"
-            attempts = [{"forecast_basis": selected_basis, "solver_status": result.status, "native_passed": all(check["passed"] for check in checks.values())}]
-            if options["control_model"] in ("deye_tou", "deye_solarman") and not attempts[0]["native_passed"]:
+            if economic_selected is not None:
+                selected_basis = options.get("forecast_basis", "envelope")
+                attempts = economic_attempts
+            else:
+                stage = "native_replay"
+                windows, checks = continuous[2:] if continuous is not None else _replay_candidate(model_base, options, result, slots)
+                selected_basis = "envelope" if continuous is not None else "nominal"
+                attempts = [{"forecast_basis": selected_basis, "solver_status": result.status, "native_passed": all(check["passed"] for check in checks.values())}]
+            if economic_selected is None and options["control_model"] in ("deye_tou", "deye_solarman") and not attempts[0]["native_passed"]:
                 # One bounded retry uses the forecast envelope and PV10 charge
                 # delivery assumption. Native nominal AND PV10 still validate
                 # the same full-rate commands; this is not charge modulation.
@@ -1315,12 +1644,12 @@ def evaluate_car_charging(base, publish=True):
                 proposed_discharge_power_limits=power_limits,
                 deye_command_check=command_check,
                 solver_forecast_basis=selected_basis,
-                solver_objective=result.total_cost,
-                solver_grid_cost=sum(action.grid_import_kwh * action.import_price - action.grid_export_kwh * action.export_price for action in result.actions),
+                solver_objective=getattr(result, "total_cost", None),
+                solver_grid_cost=(sum(action.grid_import_kwh * action.import_price - action.grid_export_kwh * action.export_price for action in result.actions) if all(hasattr(action, "grid_import_kwh") for action in result.actions) else None),
                 cost_unit=base.currency_symbols[1],
                 cost_convention="solver_objective_includes_cycle_cost_and_terminal_credit; native_horizon_energy_cost_excludes_both_and_standing_charge",
                 ev_window_convention="full_step_power_reservation_not_partial_target_energy",
-                charge_limit_convention="paired_native_replay_window_peak_plus_one_percentage_point_revalidated" if options["mode"] == "shadow" or options["grid_charge_support_w"] else "native_full_capacity_ceiling",
+                charge_limit_convention="solver_charge_run_peak_floor_whole_percent_then_paired_native_replay" if windows[1] else "no_charge_windows",
                 initial_execution_state_assumption="relay_value_and_elapsed_off_time" if options["entity_config"]["relay_entity"] else "assumed_off_for_minimum_cooldown_no_relay",
                 ev_initial_state={
                     "initially_on": options["initially_on"],
@@ -1330,11 +1659,13 @@ def evaluate_car_charging(base, publish=True):
                     "ev_soc_kwh": options["ev_soc"],
                 },
                 entity_observations=entity_observations,
-                solver_ev_ac_kwh=result.diagnostics.ev_delivered_total_kwh,
-                solver_pv_curtailed_kwh=result.diagnostics.pv_curtailed_total_kwh,
+                solver_ev_ac_kwh=getattr(getattr(result, "diagnostics", None), "ev_delivered_total_kwh", sum(window.get("kwh", 0) for window in windows[0])),
+                solver_pv_curtailed_kwh=getattr(getattr(result, "diagnostics", None), "pv_curtailed_total_kwh", None),
                 bounded_search=True,
                 execution_blockers=list(blockers),
             )
+            if economic_selected is not None:
+                report["cost_convention"] = "paired_raw_nominal_pv10_horizon_energy_plus_battery_cycle_cost_minus_terminal_soc_value; positive_floor_and_per_scenario_non_regression"
             if options["grid_charge_support_w"] and all(check["passed"] for check in checks.values()):
                 delivered = min(check["final_ev_kwh"] for check in checks.values())
                 requested = model_base.car_charging_limit[0]
@@ -1352,7 +1683,7 @@ def evaluate_car_charging(base, publish=True):
                 from car_charging_execute import execution_fingerprint, command_fingerprint
 
                 report["apply_candidate_staged"] = True
-                base.car_charging_pending = {
+                pending = {
                     "report": deepcopy(report),
                     "options": deepcopy(options),
                     "commands": deepcopy(command_steps),
@@ -1360,9 +1691,41 @@ def evaluate_car_charging(base, publish=True):
                     "initial_battery_soc_kwh": base.soc_kw,
                     "fingerprint": execution_fingerprint(base),
                 }
-                if options["grid_charge_support_w"]:
-                    base.car_charging_pending["command_fingerprint"] = command_fingerprint(command_steps)
-                    base.car_charging_pending["replay_inputs"] = deepcopy((result, slots, windows))
+                if options["grid_charge_support_w"] or economic_selected is not None:
+                    pending["command_fingerprint"] = command_fingerprint(command_steps)
+                    pending["replay_inputs"] = deepcopy((result, slots, windows))
+                if economic_selected is not None:
+                    from car_charging_execute import economic_evidence_fingerprint, economic_generation_id, economic_input_fingerprint, economic_plan_fingerprint
+
+                    comparison = report["economic_comparison"]
+                    reference_snapshot = economic_selected["native_reference_snapshot"]
+                    reference_fingerprint = comparison["reference_fingerprint"]
+                    input_fingerprint = economic_input_fingerprint(base, options, reference_snapshot)
+                    generation_id = economic_generation_id(base, options, reference_snapshot, reference_fingerprint)
+                    command_hash = command_fingerprint(command_steps)
+                    plan_fingerprint = economic_plan_fingerprint(command_steps, windows, checks, result.actions)
+                    evidence = {
+                        "generation_id": generation_id,
+                        "command_fingerprint": command_hash,
+                        "plan_fingerprint": plan_fingerprint,
+                        "reference_fingerprint": reference_fingerprint,
+                        "candidate_costs": deepcopy(comparison["candidate_costs"]),
+                        "reference_costs": deepcopy(comparison["reference_costs"]),
+                        "input_fingerprint": input_fingerprint,
+                    }
+                    evidence["evidence_fingerprint"] = economic_evidence_fingerprint(
+                        generation_id,
+                        command_hash,
+                        plan_fingerprint,
+                        reference_fingerprint,
+                        evidence["candidate_costs"],
+                        evidence["reference_costs"],
+                        input_fingerprint,
+                    )
+                    comparison.update(generation_id=generation_id, plan_fingerprint=plan_fingerprint, command_fingerprint=command_hash, input_fingerprint=input_fingerprint, accepted=True, evidence=deepcopy(evidence))
+                    pending.update(economic_evidence=deepcopy(evidence), native_reference_snapshot=deepcopy(reference_snapshot))
+                    pending["report"] = deepcopy(report)
+                base.car_charging_pending = pending
         partial_authorised = options["mode"] == "apply" and settings.get("ev_partial_target_authorised") is True and bool(options["grid_charge_support_w"])
         if (options["mode"] == "shadow" or partial_authorised) and report["status"] in ("no_plan_found", "conditional_no_plan_found", "native_rejected", "conditional_native_rejected"):
             stage = "partial_shadow_search"
