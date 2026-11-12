@@ -2729,6 +2729,56 @@ Set **load_forecast_only** to `true` if you do not wish to use the Predbat forec
     - sensor.givtcp_{geserial}_load_energy_today_kwh_prediction$results
 ```
 
+### Replace a component of the historical load with its forecast
+
+When a forecast represents a component already included in `load_today` (for example, space heating),
+`load_forecast_replaces` can pair that exact forecast source with the energy counter whose history contains
+the same component. Predbat subtracts the paired history only from future `days_previous_auto` buckets covered
+by the forecast, then adds the forecast there. Elapsed-day history and raw house/EV metering are unchanged.
+
+The mapping key must exactly match one entry in `load_forecast`. The value can be a counter entity ID when
+that counter measures only the forecasted component:
+
+```yaml
+  load_forecast:
+    - predheat.heat_energy$external
+  load_forecast_replaces:
+    predheat.heat_energy$external: sensor.space_heating_energy_total
+```
+
+If the energy counter also includes other uses, such as domestic hot water, provide an `active` history sensor.
+Only minutes recorded as `on` are subtracted; `off`, `unknown`, and unavailable states remain in the historical
+base, which may conservatively leave some heating in that base rather than remove unrelated energy:
+
+```yaml
+  load_forecast_replaces:
+    predheat.heat_energy$external:
+      energy: sensor.heating_energy_total
+      active: binary_sensor.space_heating_active
+```
+
+The energy counter must report kWh and its numeric history must reach the start of the automatic-history
+lookback. The optional active-state history must cover that complete lookback (the `days_previous` window; its
+unknown/off samples do not authorize subtraction). An isolated `unknown`/`unavailable` interval in the energy
+counter is masked locally: Predbat retains the whole-house historical sample for buckets crossing that gap while
+still using the other traceable history. The binding summary reports the resulting covered-history minutes.
+
+The paired forecast must report kWh, have a Home Assistant state update within the last 15 minutes, be monotonic,
+and have no timestamp gap over one hour. Predbat uses only the forecast's covered future intervals; uncovered
+intervals keep their complete historical load. A stale or structurally invalid forecast, invalid units, short
+lookback, or counter/state inconsistency rejects the pair and retains the complete historical contribution. A
+paired mapping is ignored unless `days_previous_auto` is enabled and the configured `load_forecast_only` mode is
+false when extra forecasts are fetched; the internal runtime flag may later become true after Predbat constructs
+the weighted-history forecast. Other, unpaired `load_forecast` entries retain their existing behavior.
+
+The logs include an aggregate binding summary (accepted/fallback pair counts and reasons), per-pair counter/state
+coverage and uncovered minutes, future forecast coverage, and the weighted future component energy actually removed.
+The application line reports either an applied weighted-history replacement or `status=fallback_full_history`; the
+latter is explicitly a fallback, not an application success.
+
+This option does not change `load_today`, historical cost accounting, or any EV energy/SoC/session input. Do not
+put a heating counter in `car_charging_energy` to use this feature.
+
 ## Balance Inverters
 
 When you have two or more inverters it's possible they get out of sync so they are at different charge levels or they start to cross-charge (one discharges into another).
