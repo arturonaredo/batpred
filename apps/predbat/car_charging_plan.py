@@ -771,6 +771,7 @@ def _replay(base, options, result, slots, windows, scenario):
     try:
         from car_charging_view import build_replay_preview
 
+        model.plan_preview_row_minutes = options.get("battery_min_window_minutes", 30)
         check["_preview_rows"] = build_replay_preview(model, pred, result, slots, scenario)
     except Exception as exc:
         check["preview_unavailable"] = True
