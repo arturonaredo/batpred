@@ -221,11 +221,9 @@ pred_bat:
   #  - mobile_app_your_phone
   #watch_list:
   #  - '+[car_charging_planned]'
-  #  - '+[car_charging_soc]'
   #  - '{octopus_intelligent_slot}'
   #  - '{octopus_ready_time}'
   #  - '{octopus_charge_limit}'
-  #  - '{octopus_saving_session}'
 
   # Leave clock corrections at zero unless required by your installation.
   # These adjust Predbat's plan times, not the six physical program boundaries.
