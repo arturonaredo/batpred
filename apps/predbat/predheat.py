@@ -19,6 +19,7 @@ compensation curves, and thermal models to predict heating energy
 requirements and costs for heat pump systems.
 """
 
+from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from bisect import bisect_right
 import math
@@ -33,6 +34,20 @@ TEMPERATURE_UNIT = "°C"  # The heat model works in °C: its efficiency tables, 
 TEMPERATURE_LABELS = {"C": "°C", "F": "°F", "K": "K"}  # The unit to publish for each temperature scale
 # Target setpoint (°C) used when no target-temperature history is available.
 DEFAULT_TARGET_TEMPERATURE = 21.5
+WEATHER_COMPENSATION_MODEL_NAME = "bounded_target_aware_affine_v1"
+WEATHER_COMPENSATION_MODEL_MAX_FLOW = 100.0
+WEATHER_COMPENSATION_MODEL_FIELDS = {
+    "flow_reference",
+    "external_reference",
+    "external_coefficient",
+    "target_reference",
+    "target_coefficient",
+    "min_flow",
+    "external_min",
+    "external_max",
+    "target_min",
+    "target_max",
+}
 
 
 """
@@ -118,6 +133,99 @@ class PredHeat:
                 new_table[key] = last_value
         return new_table
 
+    def load_weather_compensation_model(self):
+        """Read and validate the optional bounded empirical weather-flow model once at startup."""
+        missing = object()
+        model = self.get_arg("weather_compensation_model", missing, domain="predheat")
+        if model is missing:
+            return None
+
+        def invalid(reason):
+            """Warn and leave the existing fixed/table flow-temperature path active."""
+            self.log("Warn: Predheat: weather_compensation_model disabled - {}".format(reason))
+            return None
+
+        if not isinstance(model, Mapping):
+            return invalid("expected a mapping")
+
+        supplied_fields = set(model.keys())
+        missing_fields = WEATHER_COMPENSATION_MODEL_FIELDS - supplied_fields
+        unknown_fields = supplied_fields - WEATHER_COMPENSATION_MODEL_FIELDS
+        if missing_fields or unknown_fields:
+            reasons = []
+            if missing_fields:
+                reasons.append("missing required fields {}".format(sorted(missing_fields)))
+            if unknown_fields:
+                reasons.append("unknown fields {}".format(sorted(str(field) for field in unknown_fields)))
+            return invalid("; ".join(reasons))
+
+        validated = {}
+        for field in WEATHER_COMPENSATION_MODEL_FIELDS:
+            value = model[field]
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return invalid("{} must be a finite number".format(field))
+            try:
+                value = float(value)
+            except (OverflowError, ValueError):
+                return invalid("{} must be a finite number".format(field))
+            if not math.isfinite(value):
+                return invalid("{} must be a finite number".format(field))
+            validated[field] = value
+
+        if validated["min_flow"] <= 0 or validated["min_flow"] > WEATHER_COMPENSATION_MODEL_MAX_FLOW:
+            return invalid("min_flow must be positive and no greater than 100 C")
+        if validated["flow_reference"] <= 0 or validated["flow_reference"] > WEATHER_COMPENSATION_MODEL_MAX_FLOW:
+            return invalid("flow_reference must be positive and no greater than 100 C")
+        if validated["external_min"] < -100 or validated["external_max"] > 100 or validated["external_min"] > validated["external_max"]:
+            return invalid("external bounds must be ordered and within -100..100 C")
+        if validated["target_min"] < 0 or validated["target_max"] > 50 or validated["target_min"] > validated["target_max"]:
+            return invalid("target bounds must be ordered and within 0..50 C")
+        if not validated["external_min"] <= validated["external_reference"] <= validated["external_max"]:
+            return invalid("external_reference must be within the trained external bounds")
+        if not validated["target_min"] <= validated["target_reference"] <= validated["target_max"]:
+            return invalid("target_reference must be within the trained target bounds")
+
+        for external_temp in (validated["external_min"], validated["external_max"]):
+            for target_temp in (validated["target_min"], validated["target_max"]):
+                flow_temp = validated["flow_reference"]
+                flow_temp += validated["external_coefficient"] * (external_temp - validated["external_reference"])
+                flow_temp += validated["target_coefficient"] * (target_temp - validated["target_reference"])
+                if not math.isfinite(flow_temp):
+                    return invalid("model overflows within its trained domain")
+                flow_temp = max(validated["min_flow"], flow_temp)
+                if not math.isfinite(flow_temp) or flow_temp <= 0 or flow_temp > WEATHER_COMPENSATION_MODEL_MAX_FLOW:
+                    return invalid("predicted flow must remain positive and no greater than 100 C")
+
+        return validated
+
+    def predict_weather_compensation_model(self, external_temp, target_temp):
+        """Return bounded flow temperature and per-input clamp flags, or None for invalid inputs."""
+        if not self.weather_compensation_model_enabled:
+            return None
+        if isinstance(external_temp, bool) or isinstance(target_temp, bool):
+            return None
+        try:
+            external_temp = float(external_temp)
+            target_temp = float(target_temp)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(external_temp) or not math.isfinite(target_temp):
+            return None
+
+        model = self.weather_compensation_model
+        bounded_external = min(max(external_temp, model["external_min"]), model["external_max"])
+        bounded_target = min(max(target_temp, model["target_min"]), model["target_max"])
+        flow_temp = model["flow_reference"]
+        flow_temp += model["external_coefficient"] * (bounded_external - model["external_reference"])
+        flow_temp += model["target_coefficient"] * (bounded_target - model["target_reference"])
+        if not math.isfinite(flow_temp):
+            return None
+        flow_temp = max(model["min_flow"], flow_temp)
+        if not math.isfinite(flow_temp) or flow_temp <= 0 or flow_temp > WEATHER_COMPENSATION_MODEL_MAX_FLOW:
+            return None
+
+        return flow_temp, external_temp != bounded_external, target_temp != bounded_target
+
     def __init__(self, base):
         self.base = base
         self.log = base.log
@@ -146,6 +254,8 @@ class PredHeat:
         self.delta_correction = DELTA_CORRECTION.copy()
         self.weather_compensation = {}
         self.weather_compensation_enabled = False
+        self.weather_compensation_model = None
+        self.weather_compensation_model_enabled = False
         # Plan-axis minute of the real start of today: 0 except on a clock-change day (GH#5760), set by update_pred()
         self.day_start_minute = 0
         self.hysteresis_on = abs(self.get_arg("hysteresis", 0.5, domain="predheat"))
@@ -170,6 +280,9 @@ class PredHeat:
                 self.weather_compensation[key] = value
             self.weather_compensation_enabled = True
 
+        self.weather_compensation_model = self.load_weather_compensation_model()
+        self.weather_compensation_model_enabled = self.weather_compensation_model is not None
+
         # Fill gaps in tables
         self.delta_correction = self.fill_table_gaps(self.delta_correction)
         self.gas_efficiency = self.fill_table_gaps(self.gas_efficiency)
@@ -184,6 +297,8 @@ class PredHeat:
 
         if self.weather_compensation_enabled:
             self.log("Predheat: Weather compensation {}".format(self.weather_compensation))
+        if self.weather_compensation_model_enabled:
+            self.log("Predheat: Bounded target-aware weather compensation model enabled")
 
     def minutes_to_time(self, updated, now):
         """
@@ -621,6 +736,14 @@ class PredHeat:
         heat_energy_predict_stamp = {}
         heat_to_predict_stamp = {}
         heat_to_predict_temperature = {}
+        flow_temp_predict_stamp = {}
+        flow_temp_predict_temperature = {}
+        external_clamped_minutes = 0
+        target_clamped_minutes = 0
+        any_input_clamped_minutes = 0
+        weather_model_active = self.weather_compensation_model_enabled
+        weather_model_runtime_fallback = False
+        weather_model_runtime_warning_logged = False
         heating_on = False
         next_volume_temp = volume_temp
         volume_temp_stamp = {}
@@ -726,7 +849,27 @@ class PredHeat:
                 out_temp = min(max(out_temp, -20), 20)
                 heat_to = target_temp
 
-                if self.weather_compensation_enabled:
+                if weather_model_active:
+                    model_result = self.predict_weather_compensation_model(external_temp, target_temp)
+                    if model_result is None:
+                        weather_model_active = False
+                        weather_model_runtime_fallback = True
+                        if not weather_model_runtime_warning_logged:
+                            self.log("Warn: Predheat: weather_compensation_model input/output was invalid; using the existing flow-temperature path for this prediction")
+                            weather_model_runtime_warning_logged = True
+                        if self.weather_compensation_enabled:
+                            flow_temp = self.weather_compensation.get(out_temp)
+                        else:
+                            flow_temp = self.flow_temp
+                    else:
+                        flow_temp, external_was_clamped, target_was_clamped = model_result
+                        if external_was_clamped:
+                            external_clamped_minutes += PREDICT_STEP
+                        if target_was_clamped:
+                            target_clamped_minutes += PREDICT_STEP
+                        if external_was_clamped or target_was_clamped:
+                            any_input_clamped_minutes += PREDICT_STEP
+                elif self.weather_compensation_enabled:
                     flow_temp = self.weather_compensation.get(out_temp)
                 else:
                     flow_temp = self.flow_temp
@@ -780,6 +923,7 @@ class PredHeat:
                 external_temp_predict_stamp[stamp] = dp2(external_temp)
                 target_temp_predict_stamp[stamp] = dp2(target_temp)
                 heat_to_predict_stamp[stamp] = dp2(heat_to) if heat_to is not None else None
+                flow_temp_predict_stamp[stamp] = dp2(flow_temp)
                 heat_energy_predict_stamp[stamp] = dp2(heat_energy)
                 volume_temp_stamp[stamp] = dp2(volume_temp)
                 cost_stamp[stamp] = dp2(cost)
@@ -793,6 +937,7 @@ class PredHeat:
             target_temp_predict_minute[minute] = dp2(target_temp)
             internal_temp_predict_minute[minute] = dp2(internal_temp)
             heat_to_predict_temperature[minute] = dp2(heat_to) if heat_to is not None else None
+            flow_temp_predict_temperature[minute] = dp2(flow_temp)
             heat_energy_predict_minute[minute] = dp2(heat_energy)
             cost_minute[minute] = dp2(cost)
 
@@ -833,6 +978,39 @@ class PredHeat:
                 state=self.display_temperature(internal_temp_predict_minute[60 * 8]),
                 attributes={"friendly_name": "Internal Temperature Predicted +8hrs", "state_class": "measurement", "unit_of_measurement": self.display_unit},
             )
+            flow_temp_attributes = {
+                "results": self.display_series(flow_temp_predict_stamp),
+                "friendly_name": "Predicted Heating Flow Temperature",
+                "state_class": "measurement",
+                "unit_of_measurement": self.display_unit,
+            }
+            if self.weather_compensation_model_enabled:
+                model = self.weather_compensation_model
+                flow_temp_attributes.update(
+                    {
+                        "model": WEATHER_COMPENSATION_MODEL_NAME,
+                        "source": "predheat.weather_compensation_model",
+                        "model_active": weather_model_active,
+                        "external_min": model["external_min"],
+                        "external_max": model["external_max"],
+                        "target_min": model["target_min"],
+                        "target_max": model["target_max"],
+                        "min_flow": model["min_flow"],
+                        "external_clamped_minutes": external_clamped_minutes,
+                        "target_clamped_minutes": target_clamped_minutes,
+                        "any_input_clamped_minutes": any_input_clamped_minutes,
+                        "runtime_fallback": weather_model_runtime_fallback,
+                    }
+                )
+            else:
+                flow_temp_attributes.update(
+                    {
+                        "model": "legacy_weather_compensation_table" if self.weather_compensation_enabled else "fixed_flow_temp",
+                        "source": "predheat.weather_compensation" if self.weather_compensation_enabled else "predheat.flow_temp",
+                        "model_active": False,
+                    }
+                )
+            self.set_state(self.prefix + ".flow_temp", state=self.display_temperature(flow_temp_predict_temperature[0]), attributes=flow_temp_attributes)
             self.set_state(
                 self.prefix + ".heat_energy",
                 state=self.heat_energy_today,
