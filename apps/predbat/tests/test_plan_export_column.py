@@ -49,9 +49,15 @@ class PlanExportColumnTests(unittest.TestCase):
         """The debug heading and cells obey the same visibility decision."""
         self.assertNotIn("Export c", render_plan([0], debug=True))
 
-    def test_editable_zero_export_retains_controls(self):
-        """Do not hide the only means of editing an otherwise zero rate."""
-        self.assertIn("Export c", render_plan([0], editable=True))
+    def test_native_zero_export_hidden_in_normal_view(self):
+        """The native household view must not bring the zero column back."""
+        html = render_plan([0], editable=True)
+        self.assertNotIn("Export c", html)
+        self.assertNotIn("id=export", html)
+
+    def test_debug_editable_zero_export_retains_controls(self):
+        """Rate editing remains available explicitly through the debug view."""
+        self.assertIn("Export c", render_plan([0], editable=True, debug=True))
 
     def test_unavailable_rates_not_treated_as_zero(self):
         """An unavailable rate is not evidence of a genuine zero tariff."""
