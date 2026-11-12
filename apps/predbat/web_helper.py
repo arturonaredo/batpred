@@ -7212,8 +7212,8 @@ def get_plan_renderer_js():
                 import: `The import rate for this slot, in ${currencyMinor} per kWh. Bold if a charge is planned this slot.`,
                 export: `The export rate for this slot, in ${currencyMinor} per kWh. Bold if a discharge/export is planned this slot.`,
                 state: "What the battery is doing this slot - hover a state cell for the specific reason.",
-                limit: 'The battery SoC Predbat is planning to reach by the end of this slot.',
-                pv: 'Predicted solar generation for this slot, from the Solcast forecast.',
+                limit: (combined || applied) ? 'Battery charging target/ceiling for this interval, not the predicted SoC. See the SoC column for the prediction.' : 'The battery SoC Predbat is planning to reach by the end of this slot.',
+                pv: 'Modeled solar energy in this row interval (kWh, not kW), including configured cloud variability. It may differ from the smooth source forecast; it is not measured generation.',
                 load: 'Predicted house electricity consumption for this slot, from historical data.',
                 clip: "Solar energy predicted to be lost - the inverter can't handle all the PV generated, or an export limit is set.",
                 xload: 'Extra load added externally via load_forecast settings (e.g. PredAI, PredHeat).',
@@ -7237,12 +7237,17 @@ def get_plan_renderer_js():
 
             // Billing columns appear on a History view only once the supplier's half-hourly bill is attached
             const hasBilling = jsonData.rows.some(r => r.billed !== undefined);
+            // Hide an uninformative zero tariff, not unknown data or editable controls.
+            // Compute once for the header, every row and the totals spacer together.
+            const showExport = editable || jsonData.rows.length === 0 || jsonData.rows.some(
+                row => row.plan_rates_unavailable || !Number.isFinite(row.export_rate) || row.export_rate !== 0
+            );
 
             // Render header
             html += '<tr>';
             html += th('time', 'Time');
             html += showDebug ? th('import', `Import ${currencyMinor} (w/loss)`) : th('import', `Import ${currencyMinor}`);
-            html += showDebug ? th('export', `Export ${currencyMinor} (w/loss)`) : th('export', `Export ${currencyMinor}`);
+            if (showExport) html += showDebug ? th('export', `Export ${currencyMinor} (w/loss)`) : th('export', `Export ${currencyMinor}`);
             html += th('state', 'State', ' colspan="2"');
             html += th('limit', 'Limit %');
             html += showDebug ? th('pv', 'PV kWh (10%)') : th('pv', 'PV kWh');
@@ -7329,20 +7334,22 @@ def get_plan_renderer_js():
 
                 // Export rate - italic with symbol if estimated (see import rate comment above for
                 // why 'manual' is excluded in editable mode)
-                let exportText = row.export_rate.toFixed(2);
-                if (combined && row.plan_rates_unavailable) exportText = '—';
-                if (showDebug && row.export_rate_adjusted !== undefined) {
-                    exportText += ` (${row.export_rate_adjusted.toFixed(2)})`;
-                }
-                const exportAdjustType = (editable && row.export_rate_adjust_type === 'manual') ? null : row.export_rate_adjust_type;
-                const exportAdjust = exportAdjustType ? ` ${getAdjustSymbol(exportAdjustType)}` : '';
-                if (exportAdjustType) {
-                    exportText = `<i>${exportText}${exportAdjust}</i>`;
-                }
-                if (editable) {
-                    html += renderRateCell(row.export_rate, row.rate_color_export, 'export', row.time, timeDisplay, overrides, exportText, row.slot_minute);
-                } else {
-                    html += `<td id=export ${cellStyle} bgcolor=${row.rate_color_export || '#FFFFFF'}>${exportText}</td>`;
+                if (showExport) {
+                    let exportText = row.export_rate.toFixed(2);
+                    if (combined && row.plan_rates_unavailable) exportText = '—';
+                    if (showDebug && row.export_rate_adjusted !== undefined) {
+                        exportText += ` (${row.export_rate_adjusted.toFixed(2)})`;
+                    }
+                    const exportAdjustType = (editable && row.export_rate_adjust_type === 'manual') ? null : row.export_rate_adjust_type;
+                    const exportAdjust = exportAdjustType ? ` ${getAdjustSymbol(exportAdjustType)}` : '';
+                    if (exportAdjustType) {
+                        exportText = `<i>${exportText}${exportAdjust}</i>`;
+                    }
+                    if (editable) {
+                        html += renderRateCell(row.export_rate, row.rate_color_export, 'export', row.time, timeDisplay, overrides, exportText, row.slot_minute);
+                    } else {
+                        html += `<td id=export ${cellStyle} bgcolor=${row.rate_color_export || '#FFFFFF'}>${exportText}</td>`;
+                    }
                 }
 
                 // State cells (with rowspan and split handling)
@@ -7516,7 +7523,7 @@ def get_plan_renderer_js():
                 html += '<tr style="color:black">';
 
                 // Empty cells for Time, Import, Export, State (colspan 2), Limit %
-                html += '<td></td><td></td><td></td><td></td><td></td><td></td>';
+                html += '<td></td>'.repeat(showExport ? 6 : 5);
 
                 // PV forecast total
                 html += `<td bgcolor=#FFFFFF><b>${totals.pv_forecast || ''}</b></td>`;

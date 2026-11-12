@@ -35,6 +35,7 @@ def run_cloud_modulation_tests(my_predbat):
     failed |= test_cloud_modulation(my_predbat)
     failed |= test_cloud_modulation_non_flat(my_predbat)
     failed |= test_cloud_envelope_conserves_each_window(my_predbat)
+    failed |= test_cloud_envelope_conserves_absolute_rate_slots(my_predbat)
     failed |= test_cloud_envelope_antiphase(my_predbat)
     failed |= test_cloud_duty_follows_band_asymmetry(my_predbat)
     failed |= test_pv90_ceiling_capped_by_array_size(my_predbat)
@@ -107,6 +108,105 @@ def test_cloud_envelope_conserves_each_window(my_predbat):
     if negative:
         print("  ERROR: {} step(s) went negative, worst {:.6f}".format(len(negative), min(modulated[o] for o in negative)))
         failed = True
+
+    return failed
+
+
+def test_cloud_envelope_conserves_absolute_rate_slots(my_predbat):
+    """Cloud redistribution stays inside absolute half-hour windows on partial and unusual axes.
+
+    The first forecast window can begin part-way through a rate slot. That partial window must use
+    only forecast buckets before the next absolute boundary; a bucket straddling a boundary is left
+    untouched rather than borrowing energy from the neighbouring rate slot. Negative historical
+    axes and axes carried through midnight/DST remain absolute minute counts, not day-wrapped times.
+    """
+    failed = False
+    print("**** Testing absolute half-hour cloud-window alignment ****")
+
+    step = PREDICT_STEP
+    horizon = my_predbat.forecast_minutes + my_predbat.plan_interval_minutes + 2 * step
+    for minutes_now in (820, -7, 1381, 1501):
+        print("Test: absolute rate-slot conservation at minute {}".format(minutes_now))
+        base_item = {
+            absolute_minute: 0.004 + (absolute_minute % 13) * 0.0004
+            for absolute_minute in range(minutes_now, minutes_now + horizon)
+        }
+        ceiling_item = {absolute_minute: value * 1.6 for absolute_minute, value in base_item.items()}
+
+        baseline = my_predbat.step_data_history(base_item, minutes_now, forward=True)
+        modulated = my_predbat.step_data_history(
+            base_item,
+            minutes_now,
+            forward=True,
+            cloud_ceiling=ceiling_item,
+            cloud_duty=(4, 2),
+        )
+        ceiling_step = my_predbat.step_data_history(ceiling_item, minutes_now, forward=True)
+        p10_item = {absolute_minute: value * 0.5 for absolute_minute, value in base_item.items()}
+        p10_baseline = my_predbat.step_data_history(p10_item, minutes_now, forward=True)
+        p10_modulated = my_predbat.step_data_history(
+            p10_item,
+            minutes_now,
+            forward=True,
+            cloud_ceiling=base_item,
+            cloud_duty=(2, 4),
+            flip=True,
+        )
+        scenarios = (
+            ("p50", baseline, modulated, ceiling_step),
+            ("p10", p10_baseline, p10_modulated, baseline),
+        )
+        for name, original, forecast, ceiling in scenarios:
+            if forecast == original:
+                print("  ERROR: the {} cloud envelope became inert at minute {}".format(name, minutes_now))
+                failed = True
+
+            crossing = []
+            for offset in original:
+                absolute_start = minutes_now + offset
+                absolute_end = absolute_start + step
+                if absolute_start // CLOUD_WINDOW != (absolute_end - 1) // CLOUD_WINDOW:
+                    crossing.append(offset)
+            changed_crossing = [offset for offset in crossing if abs(forecast[offset] - original[offset]) > 1e-9]
+            if changed_crossing:
+                print("  ERROR: {} boundary-straddling bucket(s) were modulated: {}".format(name, changed_crossing[:4]))
+                failed = True
+
+            first_window = (minutes_now // CLOUD_WINDOW) * CLOUD_WINDOW
+            horizon_end = minutes_now + my_predbat.forecast_minutes
+            worst = 0.0
+            worst_window = None
+            for window_start in range(first_window, horizon_end, CLOUD_WINDOW):
+                window_end = window_start + CLOUD_WINDOW
+                offsets = [
+                    offset
+                    for offset in original
+                    if window_start <= minutes_now + offset
+                    and minutes_now + offset + step <= window_end
+                ]
+                before = sum(original[offset] for offset in offsets)
+                after = sum(forecast[offset] for offset in offsets)
+                if abs(after - before) > worst:
+                    worst = abs(after - before)
+                    worst_window = (window_start, before, after, offsets)
+            if worst > 1e-6:
+                print("  ERROR: {} absolute half-hour energy drifted by {:.6f} kWh in {} (before {}, after {})".format(name, worst, *worst_window[:3]))
+                failed = True
+
+            over_ceiling = [offset for offset in forecast if forecast[offset] > ceiling.get(offset, 0.0) + 1e-6]
+            negative = [offset for offset, value in forecast.items() if value < -1e-9]
+            if over_ceiling:
+                print("  ERROR: {} bucket(s) exceeded the {} cloud ceiling".format(len(over_ceiling), name))
+                failed = True
+            if negative:
+                print("  ERROR: {} {} bucket(s) became negative".format(len(negative), name))
+                failed = True
+
+        raised_p50 = {offset for offset in baseline if modulated[offset] > baseline[offset] + 1e-9}
+        lowered_p10 = {offset for offset in p10_baseline if p10_modulated[offset] < p10_baseline[offset] - 1e-9}
+        if not raised_p50 or not raised_p50.issubset(lowered_p10):
+            print("  ERROR: p10 did not stay antiphase with p50 at minute {}".format(minutes_now))
+            failed = True
 
     return failed
 

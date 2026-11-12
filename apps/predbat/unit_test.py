@@ -85,6 +85,7 @@ from tests.test_car_planning_combined import run_car_planning_combined_tests
 from tests.test_car_planning_preview import run_car_planning_preview_tests
 from tests.test_car_planning_preview_integration import run_car_planning_preview_integration_tests
 from tests.test_car_planning_single_table import run_car_planning_single_table_tests
+from tests.test_plan_export_column import run_plan_export_column_tests
 from tests.test_car_planning_targets import run_car_planning_targets_tests
 from tests.test_car_planning_economic import run_car_planning_economic_tests
 from tests.test_car_planning_partial import run_car_planning_partial_tests
@@ -703,6 +704,7 @@ def main():
         ("car_planning_preview", run_car_planning_preview_tests, "Read-only combined replay presentation", False),
         ("car_planning_preview_integration", run_car_planning_preview_integration_tests, "EV preview actual replay and web routes", False),
         ("car_planning_single_table", run_car_planning_single_table_tests, "EV candidate in the existing read-only web table", False),
+        ("plan_export_column", run_plan_export_column_tests, "Hide zero export tariffs without changing table alignment", False),
         ("car_planning_targets", run_car_planning_targets_tests, "Real replay-derived charge ceilings and rejection reasons", False),
         ("car_planning_economic", run_car_planning_economic_tests, "Bounded economic search diversity and exact short-horizon comparison", False),
         ("car_planning_partial", run_car_planning_partial_tests, "Truthful paired-safe partial EV shadow plan with unchanged requested target", False),
