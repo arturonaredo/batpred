@@ -112,7 +112,7 @@ def _slots(base):
     return [_slot(i, i * 5, 5) for i in range(0, base.forecast_minutes // 5)]
 
 
-def _actions(base, ev_step_indices=(), modes=("demand", "charge")):
+def _actions(base, ev_step_indices=(), modes=("demand",)):
     """Build actions matching the synthetic step indices."""
     actions = []
     for i in range(0, base.forecast_minutes // 5):
@@ -149,7 +149,7 @@ def test_partial_bins_and_absolute_clock_alignment():
     assert rows[-1]["end"] == (base.midnight_utc + timedelta(minutes=last_abs_end)).strftime(TIME_FORMAT)
     assert rows[-1]["minutes"] == 5
     assert "demand" in rows[0]["battery_modes"]
-    assert "charge" in rows[0]["battery_modes"]
+    assert rows[0]["battery_modes"] == "demand"
 
 
 def test_partial_first_bin_when_now_unaligned():
@@ -208,7 +208,7 @@ def test_pv10_uses_scenario_specific_maps():
 
 
 def test_mixed_modes_preserved_in_row():
-    """A bin mixing demand, charge and hold keeps all three modes in the row string."""
+    """A mode transition splits rows instead of merging totals into a false timeline."""
     base = _base_fixture(minutes=30)
     pred = _pred(base, soc_kw=5.0, grid_kw=2.0)
     actions = [
@@ -222,9 +222,116 @@ def test_mixed_modes_preserved_in_row():
     result = _result(actions)
     rows = build_replay_preview(base, pred, result, _slots(base), scenario=0)
     assert rows
-    modes = rows[0]["battery_modes"].split(",")
-    assert "demand" in modes and "charge" in modes and "hold" in modes
-    assert modes.index("demand") < modes.index("charge") < modes.index("hold")
+    assert [row["battery_modes"] for row in rows] == ["demand", "charge", "hold", "demand", "charge", "demand"]
+    assert [row["minutes"] for row in rows] == [5] * 6
+
+
+def test_rows_follow_the_configured_battery_window():
+    """Ignoring the selected window would collapse five-minute rows into half-hours."""
+    for window, count in ((5, 12), (15, 4), (30, 2), (60, 1)):
+        base = _base_fixture(minutes=60)
+        base.plan_preview_row_minutes = window
+        pred = _pred(base)
+        rows = build_replay_preview(base, pred, _result(_actions(base)), _slots(base), scenario=0)
+        assert len(rows) == count, (window, rows)
+        assert all(row["minutes"] == window and row["battery_modes"] == "demand" for row in rows)
+        assert abs(sum(row["house_kwh"] for row in rows) - 4.8) < 1e-9
+        assert abs(sum(row["pv_kwh"] for row in rows) - 2.4) < 1e-9
+
+
+def test_configured_rows_preserve_partial_edges_and_step_costs():
+    """Subdividing a partial interval preserves its own SOC, peak, energy and cumulative cost."""
+    base = _base_fixture(minutes=65, now_minute=725)
+    base.plan_preview_row_minutes = 15
+    pred = _pred(base, slope_per_step=0.1, last_value=6.3)
+    pred.metric_time = {_grid_stamp(base, minute): 100 + minute for minute in range(0, 65, 5)}
+    pred.final_metric = 165
+    pred.predict_grid_power[_grid_stamp(base, 15)] = 5.5
+    rows = build_replay_preview(base, pred, _result(_actions(base)), _slots(base), scenario=0)
+    assert [row["minutes"] for row in rows] == [10, 15, 15, 15, 10]
+    assert rows[0]["start"] == "2026-01-01T12:05:00+0000"
+    assert rows[-1]["end"] == "2026-01-01T13:10:00+0000"
+    assert rows[1]["battery_start_percent"] == 52
+    assert rows[-1]["battery_end_percent"] == 63
+    assert rows[1]["grid_peak_w"] == 5500.5
+    assert abs(sum(row["cost_change"] for row in rows) - 0.65) < 1e-9
+    assert abs(rows[-1]["total_cost"] + rows[-1]["cost_change"] - 1.65) < 1e-9
+
+
+def test_rows_split_at_charge_target_and_ev_boundaries():
+    """A row must not hide different charge targets or EV relay intents."""
+    base = _base_fixture(minutes=30)
+    base.plan_preview_row_minutes = 30
+    base.plan_preview_charge_limits = {base.minutes_now + minute: 50 if minute < 10 else 60 for minute in range(0, 30, 5)}
+    actions = [_action(index, "charge", ev_on=index >= 4) for index in range(6)]
+    rows = build_replay_preview(base, _pred(base), _result(actions), _slots(base), scenario=0)
+    assert [row["minutes"] for row in rows] == [10, 10, 10]
+    assert [row["charge_target_percent"] for row in rows] == [50, 60, 60]
+    assert [row["ev_on_minutes"] for row in rows] == [0, 0, 10]
+
+
+def test_five_minute_full_horizon_is_not_truncated_by_the_preview_limit():
+    """The complete 48-hour five-minute schedule must survive preview and view validation."""
+    from car_charging_view import build_car_charging_plan_view
+
+    base = _base_fixture(minutes=2880, now_minute=5)
+    base.plan_preview_row_minutes = 5
+    actions = _actions(base, modes=("charge", "demand"))
+    rows = build_replay_preview(base, _pred(base), _result(actions), _slots(base), scenario=0)
+    assert len(rows) == 576 and sum(row["minutes"] for row in rows) == 2880
+    now = base.now_utc
+    report = {"status": "candidate", "generated_at": now.isoformat(), "native_checks": {key: {"passed": True, "checked_minutes": 2880} for key in ("nominal", "pv10")}, "preview": {"nominal": rows, "pv10": deepcopy(rows)}}
+    view = build_car_charging_plan_view({}, report, now=now)
+    assert len(view["rows"]) == 576
+    assert [row["state"] for row in view["rows"][:4]] == ["Chrg", "Demand", "Chrg", "Demand"]
+    assert all(" + " not in row["state_text"] for row in view["rows"])
+
+
+def test_invalid_preview_window_is_not_silently_replaced():
+    """Invalid configuration must not fabricate a valid-looking display cadence."""
+    for value in (0, -5, 10, True, "5", float("nan")):
+        base = _base_fixture(minutes=30)
+        base.plan_preview_row_minutes = value
+        assert build_replay_preview(base, _pred(base), _result(_actions(base)), _slots(base), scenario=0) == []
+
+
+def test_single_mode_mismatch_between_scenarios_is_rejected():
+    """A nominal Charge and PV10 Demand cannot describe one applied interval."""
+    from car_charging_view import build_car_charging_plan_view
+    from tests.test_car_planning_single_table import _good_report, _native_plan
+
+    report = _good_report()
+    report["preview"]["pv10"][0]["battery_modes"] = "charge"
+    view = build_car_charging_plan_view(_native_plan(), report)
+    assert view.get("plan_unavailable") is True and view["rows"] == []
+
+
+def test_plan_page_and_polling_api_show_single_action_intervals():
+    """Both user-facing routes retain the new interval boundaries, not a mixed-mode label."""
+    import asyncio
+    import json
+    import re
+    from tests.test_car_planning_single_table import _build_page, _good_report
+
+    for width, expected in ((5, 6), (60, 1)):
+        base = _base_fixture(minutes=30 if width == 5 else 60)
+        base.plan_preview_row_minutes = width
+        result = _result(_actions(base, modes=("demand", "charge") if width == 5 else ("demand",)))
+        report = _good_report()
+        report["preview"] = {name: build_replay_preview(base, _pred(base), result, _slots(base), scenario=index) for index, name in enumerate(("nominal", "pv10"))}
+        original = deepcopy(report)
+        page = _build_page(report)
+        request = SimpleNamespace(rel_url=SimpleNamespace(query={}))
+        html = asyncio.run(page.html_plan(request))
+        match = re.search(r"window\.planData\s*=\s*({.*?});", html.text)
+        assert match
+        page_plan = json.loads(match.group(1))
+        api_plan = json.loads(asyncio.run(page.html_api_plan_data(request)).text)["plan"]
+        for plan in (page_plan, api_plan):
+            assert len(plan["rows"]) == expected
+            assert all(row["state"] in ("Demand", "Chrg") and " + " not in row["state_text"] for row in plan["rows"])
+            assert plan["rows"][0]["plan_interval_end"] == ("2026-01-01T12:05:00+0000" if width == 5 else "2026-01-01T13:00:00+0000")
+        assert report == original
 
 
 def test_rejects_nonfinite_grid_power():
@@ -295,7 +402,7 @@ def test_total_horizon_2880_yields_97_rows():
     result = _result(_actions(base))
     rows = build_replay_preview(base, pred, result, _slots(base), scenario=0)
     assert len(rows) == 97
-    assert PREVIEW_ROW_LIMIT == 97
+    assert len(rows) <= PREVIEW_ROW_LIMIT
 
 
 def test_row_minutes_cover_full_horizon_exactly():
@@ -579,6 +686,13 @@ def run_car_planning_preview_tests(unused_base):
         test_rejects_nonfeasible_status,
         test_does_not_mutate_inputs,
         test_total_horizon_2880_yields_97_rows,
+        test_rows_follow_the_configured_battery_window,
+        test_configured_rows_preserve_partial_edges_and_step_costs,
+        test_rows_split_at_charge_target_and_ev_boundaries,
+        test_five_minute_full_horizon_is_not_truncated_by_the_preview_limit,
+        test_invalid_preview_window_is_not_silently_replaced,
+        test_single_mode_mismatch_between_scenarios_is_rejected,
+        test_plan_page_and_polling_api_show_single_action_intervals,
         test_row_minutes_cover_full_horizon_exactly,
         test_house_kwh_sums_5min_kwh_directly,
         test_ev_reserved_uses_full_rate_over_on_minutes,

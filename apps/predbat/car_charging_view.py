@@ -3,7 +3,7 @@
 This module projects a validated combined candidate into the existing web Plan
 table without changing the native executable schedule:
 
-* building an independent, half-hour aligned replay preview from the native
+* building an independent, battery-window aligned replay preview from the native
   traces (``base.predict_soc``, ``base.predict_grid_power``) and the solver
   ``actions`` so the candidate is shown row-by-row, not as a single
   averaging table cell;
@@ -27,7 +27,8 @@ import math
 
 from const import TIME_FORMAT
 
-PREVIEW_ROW_LIMIT = 97
+# A complete 48-hour horizon at the smallest supported five-minute window.
+PREVIEW_ROW_LIMIT = 576
 _NO_CANDIDATE_STATUSES = frozenset(
     {
         "disabled",
@@ -168,10 +169,11 @@ def _bin_modes(actions_by_start, slice_starts):
 
 
 def build_replay_preview(base, pred, result, slots, scenario):
-    """Build half-hour aligned replay rows for the native EV/battery plan.
+    """Build configured-window replay rows with a single battery intent per row.
 
     Returns a list of at most ``PREVIEW_ROW_LIMIT`` dictionaries, one per
-    half-hour bin that overlaps the planning horizon. Each row uses the
+    configured window that overlaps the planning horizon, additionally split
+    at mode, target, EV and tariff changes. Each row uses the
     absolute ``base.minutes_now + slot.start_min`` clock, never a relative
     index, and reports truthful first/last partial-bin start/end ISO
     timestamps derived from ``base.midnight_utc``. Rejects incomplete or
@@ -204,7 +206,11 @@ def build_replay_preview(base, pred, result, slots, scenario):
         return []
     load_map = getattr(base, "load_minutes_step10" if scenario == 1 else "load_minutes_step", {})
     pv_map = getattr(base, "pv_forecast_minute10_step" if scenario == 1 else "pv_forecast_minute_step", {})
-    bins = {}
+    row_minutes = getattr(base, "plan_preview_row_minutes", 30)
+    if type(row_minutes) is not int or row_minutes not in (5, 15, 30, 60):
+        return []
+    rows = []
+    previous_key = None
     for position, (action, slot) in enumerate(zip(actions, slots)):
         minute = position * 5
         if slot.start_min != minute or slot.duration_min != 5 or action.slot_index != slot.index:
@@ -216,26 +222,34 @@ def build_replay_preview(base, pred, result, slots, scenario):
         if not _is_finite(load) or not _is_finite(pv) or load < 0 or pv < 0:
             return []
         absolute = minutes_now + minute
+        target = None
+        if action.battery_mode == "charge":
+            target = getattr(base, "plan_preview_charge_limits", {}).get(absolute, 100)
+            if not _is_finite(target) or not 0 < target <= 100.1:
+                return []
         start_soc = pred.predict_soc[minute] * 100 / soc_max
         end_soc = (final_soc if minute + 5 == horizon else pred.predict_soc[minute + 5]) * 100 / soc_max
         peak = max(0.0, pred.predict_grid_power[_format_iso(base, absolute)] * 1000 + 0.5)
-        row = bins.setdefault(
-            absolute // 30,
-            {
-                "start": _format_iso(base, absolute),
-                "end": "",
-                "minutes": 0,
-                "battery_modes": [],
-                "ev_on_minutes": 0,
-                "ev_reserved_kwh": 0.0,
-                "house_kwh": 0.0,
-                "pv_kwh": 0.0,
-                "battery_start_percent": start_soc,
-                "battery_end_percent": end_soc,
-                "battery_min_percent": min(start_soc, end_soc),
-                "grid_peak_w": 0.0,
-            },
-        )
+        key = (absolute // row_minutes, action.battery_mode, target, action.ev_action, getattr(slot, "import_price", None), getattr(slot, "export_price", None))
+        if key != previous_key:
+            rows.append(
+                {
+                    "start": _format_iso(base, absolute),
+                    "end": "",
+                    "minutes": 0,
+                    "battery_modes": [],
+                    "ev_on_minutes": 0,
+                    "ev_reserved_kwh": 0.0,
+                    "house_kwh": 0.0,
+                    "pv_kwh": 0.0,
+                    "battery_start_percent": start_soc,
+                    "battery_end_percent": end_soc,
+                    "battery_min_percent": min(start_soc, end_soc),
+                    "grid_peak_w": 0.0,
+                }
+            )
+            previous_key = key
+        row = rows[-1]
         row["end"] = _format_iso(base, absolute + 5)
         row["minutes"] += 5
         if action.battery_mode not in row["battery_modes"]:
@@ -244,9 +258,6 @@ def build_replay_preview(base, pred, result, slots, scenario):
             row["ev_on_minutes"] += 5
             row["ev_reserved_kwh"] += rate_kw * 5 / 60
         if action.battery_mode == "charge":
-            target = getattr(base, "plan_preview_charge_limits", {}).get(absolute, 100)
-            if not _is_finite(target) or not 0 < target <= 100.1:
-                return []
             row["charge_target_percent"] = max(row.get("charge_target_percent", 0), target)
         # Native forecast maps contain kWh per step, not average kW.
         row["house_kwh"] += load
@@ -268,9 +279,8 @@ def build_replay_preview(base, pred, result, slots, scenario):
             row["cost_change"] = cost_end / 100 - row["total_cost"]
         durations = row.setdefault("mode_minutes", {})
         durations[action.battery_mode] = durations.get(action.battery_mode, 0) + 5
-    if len(bins) > PREVIEW_ROW_LIMIT:
+    if len(rows) > PREVIEW_ROW_LIMIT:
         return []
-    rows = list(bins.values())
     for row in rows:
         row["battery_modes"] = ",".join(row["battery_modes"])
         for key in ("import_rate", "export_rate"):
@@ -412,7 +422,7 @@ def _paired_preview(report, now):
             if not _is_finite(target) or not 0 < target <= 100.1:
                 return None
             start, end = _parse_iso(row.get("start")), _parse_iso(row.get("end"))
-            if start is None or end is None or not 0 < row["minutes"] <= 30 or (end - start).total_seconds() != row["minutes"] * 60:
+            if start is None or end is None or not 0 < row["minutes"] <= 60 or (end - start).total_seconds() != row["minutes"] * 60:
                 return None
             # Native SOC is rounded to 0.001 kWh, capacity is not. Retain its
             # genuine value (e.g. 100.001%) rather than rejecting a full battery.
@@ -452,6 +462,8 @@ def _paired_preview(report, now):
             return None
         left_modes = left["battery_modes"].split(",")
         right_modes = right["battery_modes"].split(",")
+        if left_modes != right_modes:
+            return None
         if len(left_modes) > 1 or len(right_modes) > 1:
             if left["battery_modes"] != right["battery_modes"] or left["mode_minutes"] != right["mode_minutes"]:
                 return None
