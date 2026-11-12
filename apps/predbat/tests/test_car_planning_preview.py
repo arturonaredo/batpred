@@ -672,6 +672,63 @@ def test_car_planning_preview_js_returns_empty_no_independent_poll():
 # ----------------------------------------------------------------------
 
 
+def test_plan_forecast_hours_limits_only_visible_rows_and_totals():
+    """A 24-hour plan setting must not display the complete 48-hour replay."""
+    from car_charging_view import build_car_charging_plan_view
+    from tests.test_car_planning_single_table import _good_report, _native_plan
+
+    for window in (5, 15, 30, 60):
+        base = _base_fixture(minutes=2880, now_minute=725)
+        base.plan_preview_row_minutes = window
+        base.forecast_plan_hours = 24
+        pred = _pred(base, soc_kw=4, slope_per_step=0.001)
+        pred.metric_time = {_grid_stamp(base, minute): 100 + minute for minute in range(0, 2880, 5)}
+        pred.final_metric = 2980
+        result = _result(_actions(base))
+        report = _good_report()
+        report["forecast_plan_hours"] = 24
+        report["native_checks"] = {name: {"passed": True, "checked_minutes": 2880} for name in ("nominal", "pv10")}
+        report["preview"] = {name: build_replay_preview(base, pred, result, _slots(base), scenario=index) for index, name in enumerate(("nominal", "pv10"))}
+        original = deepcopy(report)
+        assert sum(r["minutes"] for r in report["preview"]["nominal"]) == 2880
+        view = build_car_charging_plan_view(_native_plan(), report)
+        assert view["rows"][0]["time"] == "2026-01-01T12:05:00+0000"
+        assert view["rows"][-1]["plan_interval_end"] == "2026-01-02T12:05:00+0000"
+        assert view["totals"]["load_forecast"] == 115.2
+        assert view["totals"]["pv_forecast"] == 57.6
+        assert view["totals"]["total_cost"] == 15.4
+        assert report == original
+
+
+def test_display_horizon_cannot_hide_a_rejected_replay_tail():
+    """Rows outside the visible day still belong to the independently validated replay."""
+    from car_charging_view import build_car_charging_plan_view
+    from tests.test_car_planning_single_table import _good_report, _native_plan
+
+    base = _base_fixture(minutes=2880)
+    base.plan_preview_row_minutes = 5
+    base.forecast_plan_hours = 24
+    report = _good_report()
+    report["forecast_plan_hours"] = 24
+    rows = build_replay_preview(base, _pred(base), _result(_actions(base)), _slots(base), scenario=0)
+    report["preview"] = {"nominal": rows, "pv10": deepcopy(rows)}
+    report["preview"]["pv10"][-1]["battery_modes"] = "invalid"
+    view = build_car_charging_plan_view(_native_plan(), report)
+    assert view["rows"] == [] and view.get("plan_unavailable") is True
+
+
+def test_invalid_plan_forecast_hours_never_fabricates_a_visible_day():
+    """A malformed plan horizon must not silently become a plausible 24-hour view."""
+    from car_charging_view import build_car_charging_plan_view
+    from tests.test_car_planning_single_table import _good_report, _native_plan
+
+    for value in (True, 0, -24, 7, 97, "24", float("nan")):
+        report = _good_report()
+        report["forecast_plan_hours"] = value
+        view = build_car_charging_plan_view(_native_plan(), report)
+        assert view["rows"] == [] and view.get("plan_unavailable") is True
+
+
 def run_car_planning_preview_tests(unused_base):
     """Run all bounded preview regressions with isolated synthetic fixtures."""
     tests = [
@@ -693,6 +750,9 @@ def run_car_planning_preview_tests(unused_base):
         test_invalid_preview_window_is_not_silently_replaced,
         test_single_mode_mismatch_between_scenarios_is_rejected,
         test_plan_page_and_polling_api_show_single_action_intervals,
+        test_plan_forecast_hours_limits_only_visible_rows_and_totals,
+        test_display_horizon_cannot_hide_a_rejected_replay_tail,
+        test_invalid_plan_forecast_hours_never_fabricates_a_visible_day,
         test_row_minutes_cover_full_horizon_exactly,
         test_house_kwh_sums_5min_kwh_directly,
         test_ev_reserved_uses_full_rate_over_on_minutes,
