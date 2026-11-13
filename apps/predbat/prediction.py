@@ -928,6 +928,9 @@ class Prediction(PredictionBatch):
             charge_window_n = charge_window_optimised.get(minute_absolute, -1)
             export_window_n = export_window_optimised.get(minute_absolute, -1)
             charge_window_active = charge_window_n >= 0
+            # The opt-in load-first model is active for the whole native charge
+            # window; EV slots and the SOC charge ceiling do not gate support.
+            grid_charge_support_active = bool(self.plan_grid_charge_support_w and charge_window_active)
             export_window_active = export_window_n >= 0
             export_limit_now = export_limits[export_window_n] if export_window_active else IDLE_EXPORT_LIMIT
             export_mode_now = export_mode_of(export_limit_now)
@@ -952,7 +955,9 @@ class Prediction(PredictionBatch):
 
                 # When set reserve enable is on pretend the reserve is the charge limit minus the
                 # minimum battery rate modelled as it can leak a little
-                if set_reserve_enable and (soc >= charge_limit_n):
+                # Shared support may continue below the charge target, but the
+                # configured reserve remains the hard floor.
+                if set_reserve_enable and (soc >= charge_limit_n) and not grid_charge_support_active:
                     reserve_expected = max(charge_limit_n, reserve)
 
             # Outside the recording window?
@@ -1050,9 +1055,9 @@ class Prediction(PredictionBatch):
                         else:
                             car_load_energy_bypass += car_load_scale / self.car_charging_loss
 
-                        # Model not allowing the car to charge from the battery - applies regardless of
-                        # car_energy_reported_load, which only controls CT-clamp house-load inclusion
-                        if (car_load_scale > 0) and (not self.car_charging_from_battery) and set_charge_window:
+                        # Preserve the native EV battery hold except when the opt-in site support model
+                        # is active; it represents whole-site load sharing, not EV-slot eligibility.
+                        if (car_load_scale > 0) and (not self.car_charging_from_battery) and set_charge_window and not grid_charge_support_active:
                             discharge_rate_now = battery_rate_min  # 0
                             if enable_save_stats:
                                 self.predict_car_hold_best[minute] = True
@@ -1115,11 +1120,12 @@ class Prediction(PredictionBatch):
             # Count load
             load_kwh += load_yesterday + car_gone_kwh
 
-            # Set discharge during charge?
+            # Native charge/deadband settings cannot suppress explicit shared
+            # support; its rate, inverter and reserve bounds remain below.
             if charge_window_active:
-                if not set_discharge_during_charge:
+                if not set_discharge_during_charge and not grid_charge_support_active:
                     discharge_rate_now = battery_rate_min
-                elif set_charge_window and soc >= charge_limit_n and (abs(calc_percent_limit(soc, soc_max) - calc_percent_limit(charge_limit_n, soc_max)) <= 1.0):
+                elif set_charge_window and soc >= charge_limit_n and (abs(calc_percent_limit(soc, soc_max) - calc_percent_limit(charge_limit_n, soc_max)) <= 1.0) and not grid_charge_support_active:
                     discharge_rate_now = battery_rate_min
 
             # Current real charge rate
@@ -1234,7 +1240,7 @@ class Prediction(PredictionBatch):
 
                 # Once force discharge starts the four hour rule is disabled
                 four_hour_rule = False
-            elif charge_window_active and soc < charge_limit_n:
+            elif charge_window_active and (soc < charge_limit_n or grid_charge_support_active):
                 # Charge enable
                 # Only tune charge rate on final plan not every simulation
                 if inverter_hybrid and (battery_rate_max_charge_dc > battery_rate_max_charge):
@@ -1250,24 +1256,29 @@ class Prediction(PredictionBatch):
                     window_end_step = min(max(((charge_window[charge_window_n]["end"] - self.minutes_now) // step) * step, minute), self.forecast_minutes)
                     pv_window_kwh = pv_remaining_kwh.get(minute, 0.0) - pv_remaining_kwh.get(window_end_step, 0.0)
 
-                charge_rate_now, charge_rate_now_curve = find_charge_rate(
-                    minute_absolute,
-                    soc,
-                    charge_window[charge_window_n],
-                    charge_limit_n,
-                    battery_rate_max_charge_combined,
-                    soc_max,
-                    charge_rate_curve,
-                    set_charge_low_power,
-                    self.charge_low_power_margin,
-                    battery_rate_min,
-                    battery_rate_max_scaling,
-                    battery_loss,
-                    None,
-                    pv_window_kwh=pv_window_kwh,
-                    low_power_pv_threshold_w=self.low_power_pv_threshold_w,
-                    solar_full_rate=self.set_charge_low_power_solar_full_rate,
-                )
+                if soc < charge_limit_n:
+                    charge_rate_now, charge_rate_now_curve = find_charge_rate(
+                        minute_absolute,
+                        soc,
+                        charge_window[charge_window_n],
+                        charge_limit_n,
+                        battery_rate_max_charge_combined,
+                        soc_max,
+                        charge_rate_curve,
+                        set_charge_low_power,
+                        self.charge_low_power_margin,
+                        battery_rate_min,
+                        battery_rate_max_scaling,
+                        battery_loss,
+                        None,
+                        pv_window_kwh=pv_window_kwh,
+                        low_power_pv_threshold_w=self.low_power_pv_threshold_w,
+                        solar_full_rate=self.set_charge_low_power_solar_full_rate,
+                    )
+                else:
+                    # The target ends charging but does not disable opt-in support
+                    # for the home's load during the remainder of this charge window.
+                    charge_rate_now, charge_rate_now_curve = 0, 0
                 charge_rate_now_curve_step = charge_rate_now_curve * step
 
                 battery_draw = -max(min(charge_rate_now_curve_step, max(charge_limit_n - soc, pv_now)), 0, -battery_to_max)
@@ -1281,7 +1292,7 @@ class Prediction(PredictionBatch):
                     pv_dc = 0
                 pv_ac = (pv_now - pv_dc) * inverter_loss_ac
 
-                if (charge_limit_n - soc) < (charge_rate_now_curve_step):
+                if soc < charge_limit_n and (charge_limit_n - soc) < (charge_rate_now_curve_step):
                     # The battery will hit the charge limit in this period, so if the charge was spread over the period
                     # it could be done from solar, but in reality it will be full rate and then stop meaning the solar
                     # won't cover it and it will likely create an import.
@@ -1293,7 +1304,7 @@ class Prediction(PredictionBatch):
                         metric_keep += max(potential_import * import_rate, 0)
 
                 # Explicit shadow-only physics; no flag is placed on the live base.
-                if self.plan_grid_charge_support_w:
+                if grid_charge_support_active:
                     battery_draw, pv_dc, pv_ac, support_peak_w = compute_car_planning_grid_charge_support(
                         self.plan_grid_charge_support_w,
                         load_yesterday,
