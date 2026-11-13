@@ -680,7 +680,7 @@ def _native_windows(base, result, slots):
 
 
 def _solver_charge_run_limits(base, result, slots):
-    """Map each native rate/control segment to its local conservative solver-SOC ceiling."""
+    """Map each native charge segment to a guarded integer ceiling from its solver SOC trace."""
     actions = getattr(result, "actions", None)
     trace = getattr(result, "battery_soc_trace", None)
     if not isinstance(actions, (tuple, list)) or not actions:
@@ -720,7 +720,10 @@ def _solver_charge_run_limits(base, result, slots):
             if previous.start_min + previous.duration_min != current.start_min:
                 raise ValueError("Non-contiguous solver charge SOC segment")
         peak = max(soc_trace[covered[0] : covered[-1] + 2])
-        percent = 100 if peak == capacity else math.floor(peak * 100 / capacity + 1e-9)
+        # Keep one percentage point for native rounding/model drift, then
+        # round the requested ceiling up. The final target stays tied to this
+        # solver trajectory (at most <2 points above it) and remains capped.
+        percent = min(100, math.ceil(peak * 100 / capacity + 1.0 - 1e-9))
         limits.append(capacity * percent / 100)
     if len(limits) != len(native_windows):
         raise ValueError("Solver charge ceilings do not match native control segments")

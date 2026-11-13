@@ -374,14 +374,16 @@ def _segment(duration, house_kw, ev_kw, pv_kw, soc, mode, battery, ev, site):
         charge = discharge = 0.0
         if soc < battery.capacity_kwh - EPSILON:
             charge = battery.max_charge_kw if mode == BATTERY_CHARGE else min(max(pv_kw - demand, 0), battery.max_charge_kw)
-            if mode == BATTERY_CHARGE and site.charge_import_cap_kw is not None:
-                # A grid-charge REQUEST need not mean physical battery charging:
-                # house/EV loads take priority. Use headroom to charge, or supply
-                # the grid deficit from the battery. The site cap below still
-                # rejects insufficient support, including reserve exhaustion.
-                charge = min(charge, max(site.charge_import_cap_kw - demand + pv_kw, 0))
-                if soc > battery.reserve_kwh + EPSILON:
-                    discharge = min(max(demand - pv_kw - site.charge_import_cap_kw, 0), battery.max_discharge_kw)
+        if mode == BATTERY_CHARGE and site.charge_import_cap_kw is not None:
+            # A grid-charge REQUEST need not mean physical battery charging:
+            # house/EV loads take priority. Use headroom to charge, or supply
+            # the grid deficit from the battery. This also applies at full SOC,
+            # where the charge target has ended charging but support remains
+            # available. The site cap below rejects insufficient support,
+            # including reserve exhaustion.
+            charge = min(charge, max(site.charge_import_cap_kw - demand + pv_kw, 0))
+            if soc > battery.reserve_kwh + EPSILON:
+                discharge = min(max(demand - pv_kw - site.charge_import_cap_kw, 0), battery.max_discharge_kw)
         if mode == BATTERY_DEMAND and soc > battery.reserve_kwh + EPSILON:
             discharge = min(max(demand - pv_kw, 0), battery.max_discharge_kw)
         net = demand + charge - pv_kw - discharge
