@@ -929,7 +929,13 @@ def publish_car_charging_slot(base, renew=False):
             return True
         report = getattr(base, "car_charging_report", None)
         settings = read_car_charging_config(base)
-        if isinstance(report, dict) and report.get("domestic_only") is True and isinstance(settings, dict) and settings.get("household_fallback") is True and settings.get("household_economic_fallback") is True:
+        if (
+            isinstance(report, dict)
+            and report.get("domestic_only") is True
+            and isinstance(settings, dict)
+            and settings.get("household_fallback") is True
+            and (settings.get("household_economic_fallback") is True or report.get("power_readiness_service") is True)
+        ):
             if isinstance(receipt, dict) and receipt.get("domestic_only") is not True:
                 _withdraw_for_household(base, "domestic_authority_mismatch")
                 return True

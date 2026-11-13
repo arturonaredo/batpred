@@ -3463,13 +3463,17 @@ class Inverter(BatteryCurve):
             elif target_soc == self.soc_percent:
                 if not self.call_service_template("charge_freeze_service", service_data, domain="charge", extra_data=extra_data):
                     self.call_service_template("charge_start_service", service_data, domain="charge", extra_data=extra_data)
-            elif not self.inv_has_target_soc and target_soc < self.soc_percent:
+            elif not self.inv_has_target_soc and self.inverter_type != "DeyeSolarman" and target_soc < self.soc_percent:
                 # Software-controlled charging can overshoot between updates. Hold with the
                 # configured freeze service, as at equality, instead of resuming house discharge.
                 # Without a freeze service, preserve the existing stop fallback.
                 if not self.call_service_template("charge_freeze_service", service_data, domain="charge", extra_data=extra_data):
                     self.call_service_template("charge_stop_service", service_data_stop, domain="charge")
             else:
+                # The shared Deye service profile writes an actual six-row SoC
+                # target even though native direct target-register control is
+                # disabled. Retain that bounded Grid intent above target so
+                # peak support/readiness does not turn into a charge stop.
                 self.call_service_template("charge_start_service", service_data, domain="charge", extra_data=extra_data)
         else:
             self.call_service_template("charge_stop_service", service_data_stop, domain="charge")
