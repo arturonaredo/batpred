@@ -130,6 +130,47 @@ def _home_history_continuous(base, entity, since, transition, now):
         base.car_charging_home_history_check = {"key": key, "at": now, "continuous": continuous}
 
 
+def _connection_history_status(base, entity, since, transition, current_state, current_updated, allowed, now):
+    """Classify a cold-cache connection gap only from complete, ordered Recorder evidence."""
+    from car_charging_plan import _parse_entity_timestamp
+    from car_charging_observation import valid_connection_state
+
+    try:
+        history = base.ha_interface.get_history_window(entity, since, now)
+        if not isinstance(history, list) or len(history) != 1 or not isinstance(history[0], list) or not history[0]:
+            return "invalid"
+        previous_changed = None
+        previous_updated = None
+        anchor_state = None
+        disconnected = False
+        latest = None
+        for item in history[0]:
+            if not isinstance(item, dict) or item.get("entity_id") != entity or not isinstance(item.get("state"), str):
+                return "invalid"
+            changed = _parse_entity_timestamp(item["last_changed"], "connection_history_changed")
+            updated = _parse_entity_timestamp(item["last_updated"], "connection_history_updated")
+            if changed > updated or updated > now or (previous_changed and changed < previous_changed) or (previous_updated and updated < previous_updated):
+                return "invalid"
+            state = item["state"]
+            if changed <= since:
+                anchor_state = state
+            elif not valid_connection_state(state):
+                return "invalid"
+            elif state not in allowed:
+                disconnected = True
+            previous_changed, previous_updated = changed, updated
+            latest = (state, changed, updated)
+        if anchor_state is None or not valid_connection_state(anchor_state):
+            return "invalid"
+        if anchor_state not in allowed:
+            disconnected = True
+        if latest[:2] != (current_state, transition) or latest[2] < current_updated:
+            return "invalid"
+        return "disconnected" if disconnected else "continuous"
+    except Exception:
+        return "invalid"
+
+
 def _acknowledged_recurring_stop(base, settings, record, home, connection, now):
     """Recognise an operator-reconciled interruption of one existing physical session.
 
@@ -174,7 +215,7 @@ def _resolve(base, settings, now):
     """Resolve cached observations, reconciling cold home continuity against Recorder if needed."""
     from ha import run_async
     from car_charging_plan import _number, _parse_entity_timestamp, _parse_soc_raw, _read_entity_state
-    from car_charging_observation import vehicle_policy, vehicle_state_valid, log_connection_warning
+    from car_charging_observation import valid_connection_state, vehicle_policy, vehicle_state_valid, log_connection_warning
 
     config = settings["recurring_session"]
     measurements = measurement_policy(base)
@@ -293,10 +334,45 @@ def _resolve(base, settings, now):
             # physical unplug evidence. A fresh eligible connection is still
             # required above; no permission exists during the telemetry gap.
             # A real ineligible state, or an unobserved cache gap, remains distinct.
-            if not history or _parse_entity_timestamp(history[0]["at"], "connection_history") > checked:
-                new_connection = True
+            if history is None or history == [] or history == ():
+                cache_gap = True
+            elif not isinstance(history, (list, tuple)):
+                return unavailable("connection_not_confirmed", end_session=False)
             else:
-                new_connection = any(_parse_entity_timestamp(item["at"], "connection_history") > checked and item["state"] not in allowed and item["state"] not in ("unknown", "unavailable") for item in history)
+                try:
+                    cache_gap = _parse_entity_timestamp(history[0]["at"], "connection_history") > checked
+                except Exception:
+                    return unavailable("connection_not_confirmed", end_session=False)
+            if cache_gap:
+                cache_disconnected = False
+                if history:
+                    try:
+                        previous = None
+                        for item in history:
+                            if not isinstance(item, dict) or not valid_connection_state(item.get("state")):
+                                return unavailable("connection_not_confirmed", end_session=False)
+                            stamp = _parse_entity_timestamp(item["at"], "connection_history")
+                            if stamp > now or (previous and stamp < previous):
+                                return unavailable("connection_not_confirmed", end_session=False)
+                            if item["state"] not in allowed:
+                                cache_disconnected = True
+                            previous = stamp
+                        if (history[-1]["state"], previous) != (connection["state"], connection["value_last_changed"]):
+                            return unavailable("connection_not_confirmed", end_session=False)
+                    except Exception:
+                        return unavailable("connection_not_confirmed", end_session=False)
+                evidence = _connection_history_status(base, settings["connection_entity"], checked, connection["value_last_changed"], connection["state"], connection["last_updated"], allowed, now)
+                if evidence == "continuous" and not cache_disconnected:
+                    new_connection = False
+                elif evidence == "disconnected":
+                    new_connection = True
+                else:
+                    return unavailable("connection_not_confirmed", end_session=False)
+            else:
+                try:
+                    new_connection = any(_parse_entity_timestamp(item["at"], "connection_history") > checked and item["state"] not in allowed and item["state"] not in ("unknown", "unavailable") for item in history)
+                except Exception:
+                    return unavailable("connection_not_confirmed", end_session=False)
     new_session = (not record["active"] and not acknowledged) or session is None or new_home or new_connection
     _close_deadline(record, now, unavailable=new_session)
 
