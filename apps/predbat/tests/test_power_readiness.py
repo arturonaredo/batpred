@@ -300,6 +300,24 @@ def test_inactive_domestic_readiness_leaves_ordinary_native_control_unchanged(ba
     assert base.car_charging_pending is None and not writes
 
 
+def test_readiness_setting_is_admitted_by_full_ev_configuration(base):
+    """The real configuration entry point must accept readiness before any candidate overlay runs."""
+    from tests.test_car_planning_grid_support import _support_fixture
+    from tests.test_infra import reset_rates
+    from car_charging_plan import _options, evaluate_car_charging
+
+    _support_fixture(base)
+    base.args["battery_power_readiness"] = {"enabled": True, "minimum_cheap_minutes": 30}
+    base.export_limit = 0
+    reset_rates(base, 8.1, 0)
+    with patch("car_charging_plan._observation_clock", return_value=base.now_utc), patch("inverter_service_control.validate_template"):
+        assert _options(base)["grid_charge_support_w"] == 6000
+        report = evaluate_car_charging(base, publish=False)
+    assert report["status"] not in ("invalid_input", "error"), report
+    assert report["control_model"] == "deye_solarman"
+    assert report["power_readiness"]["active"] is True
+
+
 def run_power_readiness_tests(base):
     """Run service-policy and complete native numerical regressions."""
     test_readiness_defaults_off_and_rejects_invalid_settings(base)
@@ -316,4 +334,5 @@ def run_power_readiness_tests(base):
     test_domestic_service_revokes_changed_tariff_or_disabled_policy_before_dispatch(base)
     test_ev_waits_when_house_peak_uses_the_available_battery_power(base)
     test_inactive_domestic_readiness_leaves_ordinary_native_control_unchanged(base)
+    test_readiness_setting_is_admitted_by_full_ev_configuration(base)
     return False

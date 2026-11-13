@@ -179,6 +179,7 @@ def _options(base):
         "self_consumption_first",
         "household_fallback",
         "household_economic_fallback",
+        "power_readiness",
         "home_entity",
         "ev_partial_target_authorised",
         "recurring_session",
