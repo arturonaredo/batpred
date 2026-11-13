@@ -2928,6 +2928,7 @@ APPS_SCHEMA = {
     "car_charging_plugged_observed_at": {"type": "sensor|sensor_list", "sensor_type": "string", "entries": "num_cars"},
     "car_charging_soc_observed_at": {"type": "sensor|sensor_list", "sensor_type": "string", "entries": "num_cars"},
     "inverter_grid_support": {"type": "dict"},
+    "battery_power_readiness": {"type": "dict"},
     "car_charging_confirmed_session": {"type": "dict"},
     "car_charging_control_authorised": {"type": "boolean"},
     "car_charging_error_acknowledgement": {"type": "dict"},

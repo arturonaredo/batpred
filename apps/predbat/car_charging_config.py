@@ -41,6 +41,7 @@ CAR_SETTING_KEYS = {
     "self_consumption_first": "car_charging_self_consumption_first",
     "household_fallback": "car_charging_household_fallback",
     "household_economic_fallback": "car_charging_household_economic_fallback",
+    "power_readiness": "battery_power_readiness",
     "home_entity": "car_charging_home",
     "ev_partial_target_authorised": "car_charging_partial_target",
     "recurring_session": "car_charging_recurring_session",

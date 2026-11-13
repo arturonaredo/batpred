@@ -48,7 +48,10 @@ class ExecutorContractTests(unittest.TestCase):
     def test_running_is_not_the_same_as_starting(self):
         """Continuation avoids start hysteresis/cooldown but retains the physical stop floor."""
         case = self.runner.ExecutorCase("continuation", powered=True, load_w=13000, battery_percent=20, off_seconds=0)
-        self.assertTrue(self.runner.expected_power_decision(case, self.limits))
+        self.assertFalse(self.runner.expected_power_decision(case, self.limits))
+        self.assertTrue(self.runner.expected_power_decision(replace(case, load_w=12000), self.limits))
+        self.assertFalse(self.runner.expected_power_decision(replace(case, load_w=12001), self.limits))
+        self.assertTrue(self.runner.expected_power_decision(replace(case, load_w=12001, pv_w=1), self.limits))
         self.assertFalse(self.runner.expected_power_decision(replace(case, powered=False), self.limits))
         self.assertFalse(self.runner.expected_power_decision(replace(case, battery_percent=12), self.limits))
         self.assertFalse(self.runner.expected_power_decision(replace(case, load_w=14001), self.limits))
