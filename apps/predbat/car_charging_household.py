@@ -156,8 +156,9 @@ def _paired_complete(checks, horizon):
 
 
 def _snapshot_native_plan(base):
-    """Copy a valid, charge-only ordinary plan before fallback search can mutate shared state."""
+    """Copy the valid native plan clipped to the replay horizon before fallback search mutates state."""
     from car_charging_plan import _number
+    from const import PREDICT_STEP
 
     if getattr(base, "plan_valid", None) is not True:
         return None
@@ -165,26 +166,28 @@ def _snapshot_native_plan(base):
     limits = getattr(base, "charge_limit_best", None)
     export_windows = getattr(base, "export_window_best", None)
     export_limits = getattr(base, "export_limits_best", None)
-    if not isinstance(windows, list) or not windows or not isinstance(limits, list) or len(windows) != len(limits):
+    if not isinstance(windows, list) or not isinstance(limits, list) or len(windows) != len(limits):
         return None
     if export_windows not in (None, []) or export_limits not in (None, []):
         return None
-    if type(base.forecast_minutes) is not int or base.forecast_minutes <= 0:
+    now = getattr(base, "minutes_now", None)
+    if type(now) is not int or type(base.forecast_minutes) is not int or base.forecast_minutes <= 0 or base.forecast_minutes % PREDICT_STEP:
         return None
 
     copied_windows = deepcopy(windows)
     copied_limits = deepcopy(limits)
-    now = base.minutes_now
     horizon_end = now + base.forecast_minutes
-    previous_end = now
-    for index, (window, limit) in enumerate(zip(copied_windows, copied_limits)):
+    previous_end = None
+    replay_windows = []
+    replay_limits = []
+    for window, limit in zip(copied_windows, copied_limits):
         if not isinstance(window, dict) or type(window.get("start")) is not int or type(window.get("end")) is not int:
             return None
         start = window["start"]
         end = window["end"]
-        if start < now or end > horizon_end or start < previous_end or end <= start:
+        if end <= start or (previous_end is not None and start < previous_end):
             return None
-        if (start - now) % 5 or (end - now) % 5:
+        if (start - now) % PREDICT_STEP or (end - now) % PREDICT_STEP:
             return None
         try:
             target = _number(limit, "native_charge_limit", 0, base.soc_max)
@@ -192,9 +195,24 @@ def _snapshot_native_plan(base):
                 return None
         except (ValueError, TypeError, AttributeError):
             return None
-        copied_limits[index] = target
         previous_end = end
-    return {"plan_valid": True, "charge_windows": copied_windows, "charge_limits": copied_limits}
+        clipped_start = max(start, now)
+        clipped_end = min(end, horizon_end)
+        if clipped_start < clipped_end:
+            window["start"] = clipped_start
+            window["end"] = clipped_end
+            replay_windows.append(window)
+            replay_limits.append(target)
+    return {
+        "plan_valid": True,
+        "plan_provenance": {
+            "plan_made_by_version": deepcopy(getattr(base, "plan_made_by_version", None)),
+            "plan_last_updated": deepcopy(getattr(base, "plan_last_updated", None)),
+            "plan_last_updated_minutes": deepcopy(getattr(base, "plan_last_updated_minutes", None)),
+        },
+        "charge_windows": replay_windows,
+        "charge_limits": replay_limits,
+    }
 
 
 def _componentwise_improvement(candidate, reference):
