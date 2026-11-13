@@ -584,6 +584,316 @@ def test_native_plan_snapshot_accepts_empty_plan_and_rejects_unsafe_shapes(base)
         assert _snapshot_native_plan(base) is None
 
 
+def _generated_reference_inputs(base, minutes=15, low_rates=None):
+    """Build a short real native replay with one fixed EV reservation."""
+    from car_charging_plan import _replay_candidate, build_native_slots
+
+    _setup(base, minutes=minutes)
+    for name in ("manual_charge_times", "manual_demand_times", "manual_freeze_charge_times", "manual_export_times", "manual_freeze_export_times"):
+        setattr(base, name, [])
+    base.all_active_keep = {}
+    base.car_charging_limit[0] = 0.5
+    base.metric_battery_cycle = 0
+    base.metric_battery_value_scaling = 0
+    base.battery_value_rate = lambda _minute: 0
+    base.low_rates = deepcopy(low_rates) if low_rates is not None else [{"start": base.minutes_now, "end": base.minutes_now + minutes, "average": 8.0}]
+    options = {
+        "arrival": 0,
+        "beam": 512,
+        "battery_min_window_minutes": 5,
+        "control_model": "deye_solarman",
+        "deadline": minutes,
+        "ev_charging_priority": "cost",
+        "ev_soc": 0.0,
+        "grid_charge_support_w": 0,
+        "import_limit_w": 10000,
+        "initial_off_minutes": 10,
+        "initially_on": False,
+        "load_cap": None,
+        "mode": "apply",
+        "off_minutes": 5,
+        "pause": 10,
+        "restart": 10,
+        "terminal_min": base.reserve,
+    }
+    slots = build_native_slots(base, options)
+    result = SimpleNamespace(
+        status="feasible",
+        total_cost=0,
+        actions=tuple(SimpleNamespace(slot_index=slot.index, battery_mode="demand", ev_action="on" if slot.index == 0 else "off", discharge_limit_kw=None) for slot in slots),
+    )
+    _, checks = _replay_candidate(base, options, result, slots)
+    assert all(check["passed"] for check in checks.values()), checks
+    return options, slots, result, checks
+
+
+def test_generated_low_rates_reference_replays_fixed_ev_and_normalises_reserve(base):
+    """Generated references use independent low-rate geometry, reserve-safe levels, and real paired replay."""
+    import car_charging_household
+
+    options, slots, candidate, candidate_checks = _generated_reference_inputs(base)
+    options["grid_charge_support_w"] = 6000
+    fixed_schedule_builder = getattr(car_charging_household, "_fixed_ev_action_schedule", None)
+    generator = getattr(car_charging_household, "_generate_low_rates_native_reference", None)
+    assert callable(fixed_schedule_builder), "fixed EV action extraction must be explicit and battery-independent"
+    assert callable(generator), "unsafe ordinary references need a bounded low_rates reference generator"
+
+    class BatteryOpaqueAction:
+        """Expose only EV identity; accidental candidate-battery reads fail the test."""
+
+        def __init__(self, action):
+            self.slot_index = action.slot_index
+            self.ev_action = action.ev_action
+
+        @property
+        def battery_mode(self):
+            raise AssertionError("Generated reference read a candidate battery action")
+
+        @property
+        def discharge_limit_kw(self):
+            raise AssertionError("Generated reference read a candidate discharge limit")
+
+    opaque_candidate = SimpleNamespace(actions=tuple(BatteryOpaqueAction(action) for action in candidate.actions))
+    original_low_rates = deepcopy(base.low_rates)
+    original_schedule = tuple((slot.index, "on" if slot.index == 0 else "off") for slot in slots)
+    assert fixed_schedule_builder(opaque_candidate, slots) == original_schedule
+
+    reference = generator(base, options, original_schedule, candidate_checks)
+
+    assert reference["status"] == "paired_safe", reference
+    assert reference["provenance"]["source_kind"] == "copied_low_rates_geometry_fixed_ev_schedule"
+    assert reference["provenance"]["eligible_target_levels_percent"] == [0, 11, 25, 50, 75, 100]
+    assert reference["provenance"]["paired_evaluations"] <= 768
+    assert reference["windows"][0] == _native_windows(base, candidate, slots)[0]
+    assert [(action.slot_index, action.ev_action) for action in reference["result"].actions] == list(original_schedule)
+    assert all(action.battery_mode in ("demand", "charge") for action in reference["result"].actions)
+    assert all(check["checked_minutes"] == base.forecast_minutes and check["passed"] for check in reference["checks"].values())
+    assert all(abs(reference["checks"][name]["final_ev_kwh"] - candidate_checks[name]["final_ev_kwh"]) <= 0.002 for name in ("nominal", "pv10"))
+    assert all(limit >= base.reserve for limit in reference["windows"][2])
+    assert all(limit > 0 for limit in reference["windows"][2])
+    assert base.low_rates == original_low_rates
+
+    charge_only_slots = [SimpleNamespace(**slot.__dict__, allowed_battery_modes=("charge",)) for slot in slots]
+    positive_reference = generator(base, options, original_schedule, candidate_checks, charge_only_slots)
+    assert positive_reference["status"] == "paired_safe", positive_reference
+    assert positive_reference["provenance"]["selected_target_levels_percent"] == [11]
+    assert positive_reference["windows"][1] == [{"start": base.minutes_now, "end": base.minutes_now + 15, "average": 8.0}]
+
+
+def test_generated_reference_targets_are_executable_with_and_without_shared_support(base):
+    """Every generated target obeys the executor's strict reserve and shared-support command contract."""
+    from car_charging_household import _generate_low_rates_native_reference
+    from car_charging_execute import _intent
+
+    for support, fractional_reserve in ((0, False), (6000, False), (6000, True)):
+        options, slots, candidate, checks = _generated_reference_inputs(base)
+        options["grid_charge_support_w"] = support
+        if fractional_reserve:
+            base.reserve = base.soc_max * 0.101
+        inverter = SimpleNamespace(inverter_type="DeyeSolarman", reserve_percent=base.reserve * 100 / base.soc_max)
+        schedule = tuple((action.slot_index, action.ev_action) for action in candidate.actions)
+        reference = _generate_low_rates_native_reference(base, options, schedule, checks, slots)
+        assert reference["status"] == "paired_safe", reference
+        eligible = reference["provenance"]["eligible_target_levels_percent"]
+        assert eligible == ([0, 100] if not support else [0, 12 if fractional_reserve else 11, 25, 50, 75, 100])
+        for target in eligible + reference["provenance"]["selected_target_levels_percent"]:
+            command = {"target_soc": target, "freeze": False, "ev_on": False, "power_w": None}
+            assert _intent(command, inverter, bool(support)) == (target, False, None)
+
+
+def test_generated_low_rates_reference_fails_closed_for_manual_overrides_and_ev_mismatch(base):
+    """Manual mode requests and changed EV delivery cannot be hidden by a generated reference."""
+    import car_charging_household
+
+    options, _slots, candidate, candidate_checks = _generated_reference_inputs(base)
+    generator = getattr(car_charging_household, "_generate_low_rates_native_reference", None)
+    assert callable(generator), "unsafe ordinary references need a bounded low_rates reference generator"
+    fixed_schedule = tuple((action.slot_index, action.ev_action) for action in candidate.actions)
+
+    base.manual_demand_times = [base.minutes_now]
+    manual_reference = generator(base, options, fixed_schedule, candidate_checks)
+    assert manual_reference["status"] != "paired_safe"
+    assert manual_reference["reason"] == "manual_override_active"
+    base.manual_demand_times = []
+
+    constrained_slots = [SimpleNamespace(**slot.__dict__, allowed_battery_modes=("demand",) if slot.index == 0 else ("demand", "charge")) for slot in _slots]
+    base.manual_demand_times = [base.minutes_now]
+    constrained_reference = generator(base, options, fixed_schedule, candidate_checks, constrained_slots)
+    assert constrained_reference["status"] == "paired_safe", constrained_reference
+    assert constrained_reference["result"].actions[0].battery_mode == "demand"
+    assert "generated_action_violates_native_allowed_modes" in constrained_reference["provenance"]["rejected_proposal_reasons"]
+    base.manual_demand_times = []
+
+    charge_override_slots = [SimpleNamespace(**slot.__dict__, allowed_battery_modes=("demand", "charge")) for slot in _slots]
+    base.manual_charge_times = [base.minutes_now]
+    manual_charge_reference = generator(base, options, fixed_schedule, candidate_checks, charge_override_slots)
+    assert manual_charge_reference["status"] != "paired_safe"
+    assert manual_charge_reference["reason"] == "manual_target_override_unsupported"
+    base.manual_charge_times = []
+
+    mismatched_checks = deepcopy(candidate_checks)
+    for check in mismatched_checks.values():
+        check["final_ev_kwh"] += 0.1
+    mismatched_reference = generator(base, options, fixed_schedule, mismatched_checks)
+    assert mismatched_reference["status"] != "paired_safe"
+    assert mismatched_reference["reason"] == "ev_delivery_mismatch"
+
+    original_low_rates = deepcopy(base.low_rates)
+    base.low_rates = [{"start": base.minutes_now, "end": base.minutes_now, "average": 8.0}]
+    invalid_reference = generator(base, options, fixed_schedule, candidate_checks)
+    assert invalid_reference["status"] != "paired_safe"
+    assert invalid_reference["reason"] == "low_rates_geometry_invalid"
+    assert base.low_rates == [{"start": base.minutes_now, "end": base.minutes_now, "average": 8.0}]
+    base.low_rates = original_low_rates
+
+    base.all_active_keep = {base.minutes_now: 90}
+    floor_reference = generator(base, options, fixed_schedule, candidate_checks)
+    assert floor_reference["status"] != "paired_safe"
+    assert "domestic_manual_floor" in floor_reference["provenance"]["failure_reasons"]
+    base.all_active_keep = {}
+
+    original_low_rates = deepcopy(base.low_rates)
+    base.low_rates = []
+    missing_reference = generator(base, options, fixed_schedule, candidate_checks)
+    assert missing_reference["status"] != "paired_safe"
+    assert missing_reference["reason"] == "low_rates_unavailable"
+    base.low_rates = original_low_rates
+
+    with patch("car_charging_household.GENERATED_REFERENCE_MAX_PAIRED_EVALUATIONS", 1):
+        exhausted_reference = generator(base, options, fixed_schedule, candidate_checks)
+    assert exhausted_reference["status"] == "blocked"
+    assert exhausted_reference["reason"] == "search_budget_exhausted"
+
+
+def test_generated_reference_retains_safe_result_when_refinement_budget_ends(base):
+    """A finite search must retain a fully replayed safe reference found before its budget ends."""
+    from car_charging_household import _generate_low_rates_native_reference
+
+    options, slots, candidate, checks = _generated_reference_inputs(base)
+    schedule = tuple((action.slot_index, action.ev_action) for action in candidate.actions)
+    with patch("car_charging_household.GENERATED_REFERENCE_MAX_PAIRED_EVALUATIONS", 2):
+        reference = _generate_low_rates_native_reference(base, options, schedule, checks, slots)
+    assert reference["status"] == "paired_safe", reference
+    assert reference["provenance"]["search_budget_exhausted"] is True
+    assert reference["provenance"]["paired_evaluations"] == 2
+    assert all(check["passed"] and check["checked_minutes"] == base.forecast_minutes for check in reference["checks"].values())
+
+
+def test_generated_reference_refines_native_targets_between_coarse_levels(base):
+    """Real replay finds the least-cost 26% start target rather than stopping near the coarse 50% seed."""
+    from car_charging_household import _generate_low_rates_native_reference
+    from car_charging_plan import _replay_candidate, build_native_slots
+
+    options, _slots, _candidate, _checks = _generated_reference_inputs(base)
+    base.soc_max, base.reserve, base.soc_kw = 10.0, 1.0, 2.4
+    base.low_rates = [{"start": base.minutes_now, "end": base.minutes_now + 10, "average": 10.0}]
+    options.update(grid_charge_support_w=6000, import_limit_w=6000, restart=25, terminal_min=base.reserve)
+    slots = build_native_slots(base, options)
+    candidate = SimpleNamespace(
+        status="feasible",
+        total_cost=None,
+        actions=tuple(SimpleNamespace(slot_index=slot.index, battery_mode="charge" if slot.index < 2 else "demand", ev_action="on" if slot.index == 2 else "off", discharge_limit_kw=None) for slot in slots),
+        battery_soc_trace=(2.4, 2.6, 2.6, 1.9),
+    )
+    _windows, checks = _replay_candidate(base, options, candidate, slots)
+    assert all(check["passed"] for check in checks.values()), checks
+    schedule = tuple((action.slot_index, action.ev_action) for action in candidate.actions)
+    reference = _generate_low_rates_native_reference(base, options, schedule, checks, slots)
+    assert reference["status"] == "paired_safe", reference
+    assert reference["provenance"]["selected_target_levels_percent"] == [26], reference["provenance"]
+    assert all(check["passed"] for check in reference["checks"].values())
+
+
+def test_generated_reference_retains_only_bounded_complete_trial_payloads(base):
+    """Memoisation must not retain every full native preview while refining a safe reference."""
+    import weakref
+    import car_charging_plan
+    from car_charging_household import _generate_low_rates_native_reference
+
+    options, slots, candidate, checks = _generated_reference_inputs(base)
+    options["grid_charge_support_w"] = 6000
+    schedule = tuple((action.slot_index, action.ev_action) for action in candidate.actions)
+    original = car_charging_plan._replay
+    live_payloads = weakref.WeakSet()
+    peaks = []
+
+    class TrialPayload:
+        """Observe ownership of trial check dictionaries without altering their physical values."""
+
+    def observed_replay(*args, **kwargs):
+        """Attach a lifetime marker to a real native replay's complete check payload."""
+        check = original(*args, **kwargs)
+        marker = TrialPayload()
+        live_payloads.add(marker)
+        check["_trial_payload_lifetime_marker"] = marker
+        peaks.append(len(live_payloads))
+        return check
+
+    with patch("car_charging_plan._replay", side_effect=observed_replay):
+        reference = _generate_low_rates_native_reference(base, options, schedule, checks, slots)
+    assert reference["status"] == "paired_safe", reference
+    assert reference["provenance"]["evaluated_proposals"] > 20
+    assert max(peaks) <= 12, "complete preview/check payloads accumulated beyond the four retained safe references"
+
+
+def test_generated_reference_bounds_more_than_three_low_rate_windows(base):
+    """Longer low-rate lists are reduced to three evenly spaced windows before paired replay."""
+    import car_charging_household
+
+    now = base.minutes_now
+    low_rates = [{"start": now + index * 5, "end": now + (index + 1) * 5, "average": 8.0 - index} for index in range(6)]
+    options, slots, candidate, candidate_checks = _generated_reference_inputs(base, minutes=30, low_rates=low_rates)
+    generator = getattr(car_charging_household, "_generate_low_rates_native_reference", None)
+    assert callable(generator), "unsafe ordinary references need a bounded low_rates reference generator"
+    fixed_schedule = tuple((action.slot_index, action.ev_action) for action in candidate.actions)
+    constrained_slots = [SimpleNamespace(**slot.__dict__, allowed_battery_modes=("demand",)) for slot in slots]
+
+    reference = generator(base, options, fixed_schedule, candidate_checks, constrained_slots)
+
+    assert reference["status"] == "paired_safe", reference
+    assert reference["provenance"]["selected_source_window_indexes"] == [0, 2, 5]
+    assert len(reference["provenance"]["source_windows"]) == 6
+    assert len(reference["provenance"]["selected_target_levels_percent"]) == 3
+    assert reference["provenance"]["paired_evaluations"] <= 768
+    assert all(action.battery_mode == "demand" for action in reference["result"].actions)
+
+
+def test_unsafe_ordinary_native_reference_uses_generated_alternative_without_savings(base):
+    """A real paired low_rates reference may replace an unsafe ordinary replay but claims no savings."""
+    from car_charging_plan import _search_joint_cost_candidates
+
+    options, slots, candidate, _checks = _generated_reference_inputs(base)
+    options["import_limit_w"] = 10000
+    now = base.minutes_now
+    native_snapshot = {
+        "plan_valid": True,
+        "charge_windows": [{"start": now, "end": now + 15, "average": 8.0}],
+        "charge_limits": [base.soc_max * 0.9],
+    }
+    original_snapshot = deepcopy(native_snapshot)
+    from car_charging_household import _replay_native_joint_plan
+
+    _, _, original_checks = _replay_native_joint_plan(base, options, native_snapshot, candidate, slots, _native_windows(base, candidate, slots)[0])
+    assert original_checks["nominal"]["passed"] is False, original_checks
+    assert "site_import_exceeded" in original_checks["nominal"]["reasons"], original_checks
+
+    selected, attempts = _search_joint_cost_candidates(base, options, native_snapshot, (candidate, slots), [])
+
+    assert selected is not None and selected["source"] == "native_reference_alternative"
+    comparison = selected["economic_comparison"]
+    assert attempts[0]["reference_passed"] is False
+    assert "site_import_exceeded" in attempts[0]["reference_reasons"]["nominal"], attempts
+    assert attempts[0]["generated_reference_passed"] is True
+    assert comparison["ordinary_native_reference"]["passed"] is False
+    assert comparison["reference_kind"] == "generated_fixed_ev_low_rates_native_window_reference"
+    assert comparison["generated_reference_provenance"]["source_kind"] == "copied_low_rates_geometry_fixed_ev_schedule"
+    assert comparison["battery_plan_improvement"] is False
+    assert comparison["candidate_costs"] == comparison["reference_costs"]
+    assert selected["commands"] == [{"start": now + 5 * index, "end": now + 5 * (index + 1), "target_soc": 0, "freeze": False, "power_w": None, "ev_on": index == 0} for index in range(3)]
+    assert selected["native_reference_snapshot"] == original_snapshot
+    assert native_snapshot == original_snapshot
+
+
 def test_joint_cost_improvement_uses_raw_paired_vectors_and_switch_floor():
     """Numerical noise, one-scenario savings, and extra switching cannot qualify COST."""
     from car_charging_household import _joint_cost_improvement
@@ -1853,6 +2163,14 @@ def run_car_planning_grid_support_tests(base):
     test_joint_native_reference_reuses_identical_ev_pattern_and_native_battery_windows(base)
     test_native_plan_snapshot_clips_only_to_replay_horizon_and_preserves_provenance(base)
     test_native_plan_snapshot_accepts_empty_plan_and_rejects_unsafe_shapes(base)
+    test_generated_low_rates_reference_replays_fixed_ev_and_normalises_reserve(base)
+    test_generated_low_rates_reference_fails_closed_for_manual_overrides_and_ev_mismatch(base)
+    test_generated_reference_bounds_more_than_three_low_rate_windows(base)
+    test_generated_reference_retains_safe_result_when_refinement_budget_ends(base)
+    test_generated_reference_refines_native_targets_between_coarse_levels(base)
+    test_generated_reference_retains_only_bounded_complete_trial_payloads(base)
+    test_generated_reference_targets_are_executable_with_and_without_shared_support(base)
+    test_unsafe_ordinary_native_reference_uses_generated_alternative_without_savings(base)
     test_joint_cost_improvement_uses_raw_paired_vectors_and_switch_floor()
     test_joint_cost_search_keeps_configured_and_continuous_candidates_when_512_fails(base)
     test_joint_cost_search_retains_equal_native_battery_plan_for_ev_delivery(base)

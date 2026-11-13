@@ -18,9 +18,11 @@ avoids mid-horizon peak-band imports. This module guards the new behaviour:
   optimal schedule for tiny (≤ 6 slot) cases.
 """
 
+from copy import deepcopy
 from dataclasses import replace
 from itertools import product
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from car_charging_solver import (
@@ -401,11 +403,213 @@ class EconomicSearchTests(unittest.TestCase):
         return best_cost
 
 
+def test_generated_reference_search_budget_includes_unrestricted_and_best_continuous(base):
+    """Limit expensive low-rate replays to configured, 512, and the two cheapest continuous plans."""
+    from car_charging_plan import _search_joint_cost_candidates
+
+    horizon = base.forecast_minutes
+    slots = [Slot(index, index * 5, 5, 0.1, 0, 10, 0) for index in range(7)]
+    options = {"beam": 128, "mode": "apply", "ev_charging_priority": "cost", "control_model": "deye_solarman"}
+    schedules = {}
+    checks_by_label = {}
+    windows = ([], [], [])
+
+    def make_candidate(label, on_index):
+        """Create a unique EV reservation without depending on solver physics."""
+        actions = tuple(
+            SimpleNamespace(
+                slot_index=slot.index,
+                battery_mode="demand",
+                ev_action="on" if slot.index == on_index else "off",
+                discharge_limit_kw=None,
+            )
+            for slot in slots
+        )
+        result = SimpleNamespace(status="feasible", total_cost=label, actions=actions, label=label)
+        schedules[label] = tuple((action.slot_index, action.ev_action) for action in actions)
+        return result
+
+    def safe_checks(cost):
+        """Return complete paired evidence with a known native cost for ordering."""
+        return {
+            name: {
+                "passed": True,
+                "checked_minutes": horizon,
+                "horizon_energy_cost": cost,
+                "battery_cycle_kwh": 0,
+                "final_battery_kwh": 5,
+                "final_ev_kwh": 1,
+                "validated_ev_target_kwh": 1,
+            }
+            for name in ("nominal", "pv10")
+        }
+
+    configured = make_candidate("configured", 0)
+    duplicate_configured = make_candidate("continuous_duplicate", 0)
+    continuous = [make_candidate("continuous_{}".format(index), index + 1) for index in range(5)]
+    unrestricted = make_candidate("unrestricted_512", 6)
+    checks_by_label["configured"] = safe_checks(60)
+    checks_by_label[duplicate_configured.label] = safe_checks(60)
+    checks_by_label["unrestricted_512"] = safe_checks(55)
+    continuous_costs = (50, 40, 30, 20, 10)
+    continuous_attempts = []
+    for result, cost in zip(continuous, continuous_costs):
+        checks = safe_checks(cost)
+        checks_by_label[result.label] = checks
+        continuous_attempts.append(
+            {
+                "_candidate": (result, slots, windows, checks, options, "continuous_block"),
+                "solver_status": "feasible",
+            }
+        )
+
+    refined_checks = safe_checks(55)
+    checks_by_label[unrestricted.label] = refined_checks
+    duplicate_checks = checks_by_label[duplicate_configured.label]
+    failed_reference_checks = {name: {"passed": False, "checked_minutes": horizon, "reasons": ["site_import_exceeded"]} for name in ("nominal", "pv10")}
+    reference_calls = []
+    generated_calls = []
+    ordinary_reference = SimpleNamespace(status="ordinary_reference", actions=())
+    continuous_attempts.insert(
+        0,
+        {
+            "_candidate": (duplicate_configured, slots, windows, duplicate_checks, options, "continuous_block"),
+            "solver_status": "feasible",
+            "test_label": "duplicate_configured",
+        },
+    )
+
+    def replay_candidate(_base, _trial, result, _slots):
+        """Return the per-candidate paired evidence used to rank continuous schedules."""
+        return windows, checks_by_label[result.label]
+
+    def replay_ordinary(_base, _trial, _snapshot, _candidate, _slots, ev_windows):
+        """Prove that every candidate still receives its ordinary native reference replay."""
+        reference_calls.append(deepcopy(ev_windows))
+        return ordinary_reference, (deepcopy(ev_windows), [], []), deepcopy(failed_reference_checks)
+
+    def replay_generated(_base, _trial, schedule, _checks, _slots):
+        """Accept the first configured reference, then prove the selected 512/continuous sources still run."""
+        fixed_schedule = tuple(schedule)
+        generated_calls.append(fixed_schedule)
+        if fixed_schedule == schedules["configured"]:
+            result = SimpleNamespace(
+                status="test_generated_safe_reference",
+                actions=tuple(SimpleNamespace(slot_index=index, battery_mode="demand", ev_action=ev_action, discharge_limit_kw=None) for index, ev_action in fixed_schedule),
+            )
+            return {
+                "status": "paired_safe",
+                "result": result,
+                "slots": _slots,
+                "windows": windows,
+                "checks": safe_checks(100),
+                "costs": {"nominal": 100, "pv10": 100},
+                "provenance": {"test": "configured-safe"},
+            }
+        return {"status": "unsafe", "reason": "test_generated_reference_unsafe", "provenance": {}}
+
+    with (
+        patch("car_charging_plan.build_candidate", return_value=(unrestricted, slots)),
+        patch("car_charging_plan._replay_candidate", side_effect=replay_candidate),
+        patch("car_charging_household._replay_native_joint_plan", side_effect=replay_ordinary),
+        patch("car_charging_household._generate_low_rates_native_reference", side_effect=replay_generated),
+        patch("car_charging_execute.economic_input_fingerprint", return_value={"test": "same-input"}),
+    ):
+        selected, attempts = _search_joint_cost_candidates(
+            base,
+            options,
+            {"plan_valid": True, "charge_windows": [], "charge_limits": []},
+            (configured, slots),
+            continuous_attempts,
+        )
+
+    expected_schedules = {
+        schedules["configured"],
+        schedules["unrestricted_512"],
+        schedules["continuous_3"],
+        schedules["continuous_4"],
+    }
+    assert selected["source"] == "configured_beam", selected
+    assert selected["economic_comparison"]["positive_improvement"] is True
+    assert len(reference_calls) == 8, "ordinary native reference replay must remain unbudgeted"
+    assert len(generated_calls) <= 4, generated_calls
+    assert len(generated_calls) == 4, generated_calls
+    assert set(generated_calls) == expected_schedules, generated_calls
+    duplicate_attempt = next(attempt for attempt in attempts if attempt.get("test_label") == "duplicate_configured")
+    assert duplicate_attempt["generated_reference_passed"] is True, duplicate_attempt
+    budgeted = [attempt for attempt in attempts if attempt.get("generated_reference_status") == "bounded_generated_reference_schedule_budget"]
+    assert len(budgeted) == 3, attempts
+    assert all(attempt["economic_rejection"] == "bounded_generated_reference_schedule_budget" for attempt in budgeted)
+
+
+def test_native_reference_alternative_reports_selected_plan_switches(base):
+    """The selected native alternative, not its rejected proposal, owns candidate switch metadata."""
+    from car_charging_plan import _search_joint_cost_candidates
+
+    slots = [Slot(index, index * 5, 5, 0.1, 0, 10, 0) for index in range(3)]
+    candidate = SimpleNamespace(
+        status="feasible",
+        total_cost=0,
+        actions=tuple(
+            SimpleNamespace(
+                slot_index=index,
+                battery_mode="charge" if index in (0, 2) else "demand",
+                ev_action="off",
+                discharge_limit_kw=None,
+            )
+            for index in range(3)
+        ),
+    )
+    reference = SimpleNamespace(
+        status="ordinary_native_joint_reference",
+        actions=tuple(SimpleNamespace(slot_index=index, battery_mode="demand", ev_action="off", discharge_limit_kw=None) for index in range(3)),
+    )
+    checks = {
+        name: {
+            "passed": True,
+            "checked_minutes": base.forecast_minutes,
+            "reasons": [],
+            "horizon_energy_cost": 10,
+            "battery_cycle_kwh": 0,
+            "final_battery_kwh": base.soc_kw,
+            "final_ev_kwh": 0,
+            "validated_ev_target_kwh": 0,
+        }
+        for name in ("nominal", "pv10")
+    }
+    windows = ([], [], [])
+    options = {"beam": 512, "mode": "apply", "ev_charging_priority": "cost", "control_model": "deye_solarman"}
+
+    with (
+        patch("car_charging_plan._replay_candidate", return_value=(windows, checks)),
+        patch("car_charging_household._replay_native_joint_plan", return_value=(reference, windows, checks)),
+    ):
+        selected, _attempts = _search_joint_cost_candidates(
+            base,
+            options,
+            {"plan_valid": True, "charge_windows": [], "charge_limits": []},
+            (candidate, slots),
+            [],
+        )
+
+    comparison = selected["economic_comparison"]
+    assert selected["source"] == "native_reference_alternative"
+    assert comparison["proposed_candidate_battery_mode_switches"] == 2
+    assert comparison["candidate_battery_mode_switches"] == 0
+    assert comparison["reference_battery_mode_switches"] == 0
+    assert comparison["positive_improvement"] is False
+    assert "generated_reference_schedule_cap_4" in comparison["search_scope"]
+
+
 def run_car_planning_economic_tests(base):
     """Run the economic regressions through Predbat's registered harness."""
     suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromTestCase(test) for test in (PruneBucketHeadTests, EconomicSearchTests))
     result = unittest.TextTestRunner(verbosity=2).run(suite)
-    return not result.wasSuccessful()
+    if not result.wasSuccessful():
+        return True
+    test_generated_reference_search_budget_includes_unrestricted_and_best_continuous(base)
+    test_native_reference_alternative_reports_selected_plan_switches(base)
+    return False
 
 
 if __name__ == "__main__":

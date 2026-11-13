@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 from datetime import timedelta
+from itertools import product
 import math
 import re
 from types import SimpleNamespace
@@ -9,6 +10,10 @@ from types import SimpleNamespace
 HOUSEHOLD_COST_TOLERANCE = 0.002
 JOINT_COST_IMPROVEMENT_FLOOR = 1.0
 JOINT_COST_EXTRA_SWITCH_FLOOR = 1.0
+GENERATED_REFERENCE_MAX_WINDOWS = 3
+GENERATED_REFERENCE_MAX_SEEDS = 4
+GENERATED_REFERENCE_MAX_PAIRED_EVALUATIONS = 768
+GENERATED_REFERENCE_REFINEMENT_PASSES = 2
 
 
 class HouseholdFallbackBlocked(ValueError):
@@ -415,6 +420,331 @@ def _replay_native_joint_plan(base, options, snapshot, candidate, slots, ev_wind
     for check in checks.values():
         check.pop("_charge_peak_kwh", None)
     return result, windows, checks
+
+
+def _fixed_ev_action_schedule(result, slots):
+    """Copy only EV slot decisions from a candidate, never its battery actions."""
+    actions = getattr(result, "actions", None)
+    if not isinstance(actions, (tuple, list)) or not actions or len(actions) != len(slots):
+        raise ValueError("Fixed EV reference requires a complete action horizon")
+    schedule = []
+    for action, slot in zip(actions, slots):
+        slot_index = getattr(action, "slot_index", None)
+        ev_action = getattr(action, "ev_action", None)
+        if slot_index != slot.index or ev_action not in ("on", "off"):
+            raise ValueError("Fixed EV reference schedule is invalid")
+        schedule.append((slot.index, ev_action))
+    return tuple(schedule)
+
+
+def _reference_failure(status, reason, **extra):
+    """Return a uniform non-executable result for a failed bounded search."""
+    return {"status": status, "reason": reason, "result": None, "slots": None, "windows": None, "checks": {}, "costs": None, "provenance": {}, **extra}
+
+
+def _generate_low_rates_native_reference(base, options, fixed_ev_schedule, candidate_checks, slots=None):
+    """Find a bounded paired-safe reference from copied low-rate geometry and fixed EV decisions only."""
+    from car_charging_plan import _number, _replay, build_native_slots
+    from battery_window import commands_respect_windows
+    from const import PREDICT_STEP
+
+    source = getattr(base, "low_rates", None)
+    if not isinstance(options, dict) or options.get("mode") != "apply" or options.get("ev_charging_priority") != "cost":
+        return _reference_failure("unavailable", "generated_reference_inputs_invalid")
+    if not isinstance(source, (list, tuple)) or not source:
+        return _reference_failure("unavailable", "low_rates_unavailable")
+    copied_source = deepcopy(source)
+    raw_horizon = getattr(base, "forecast_minutes", None)
+    if type(raw_horizon) is not int or raw_horizon <= 0 or raw_horizon % PREDICT_STEP:
+        return _reference_failure("unavailable", "generated_reference_horizon_invalid")
+    if len(copied_source) > raw_horizon // PREDICT_STEP:
+        return _reference_failure("unavailable", "low_rates_geometry_too_large")
+
+    try:
+        now = base.minutes_now
+        horizon = base.forecast_minutes
+        capacity = _number(base.soc_max, "generated_reference_capacity", 0.001)
+        reserve = _number(base.reserve, "generated_reference_reserve", 0, capacity)
+        if type(now) is not int or type(horizon) is not int or horizon <= 0 or horizon % PREDICT_STEP:
+            raise ValueError("Invalid native reference horizon")
+        horizon_end = now + horizon
+        geometry = []
+        previous_end = None
+        for source_index, window in enumerate(copied_source):
+            if not isinstance(window, dict) or type(window.get("start")) is not int or type(window.get("end")) is not int:
+                raise ValueError("Invalid low-rate window geometry")
+            start, end = window["start"], window["end"]
+            if end <= start or (start - now) % PREDICT_STEP or (end - now) % PREDICT_STEP:
+                raise ValueError("Misaligned low-rate window geometry")
+            average = _number(window.get("average"), "low_rates_window_average", -math.inf)
+            clipped_start, clipped_end = max(start, now), min(end, horizon_end)
+            if clipped_start >= clipped_end:
+                continue
+            if previous_end is not None and clipped_start < previous_end:
+                raise ValueError("Overlapping low-rate window geometry")
+            previous_end = clipped_end
+            geometry.append({"source_index": source_index, "start": clipped_start, "end": clipped_end, "average": average})
+    except (ValueError, TypeError, AttributeError):
+        return _reference_failure("unavailable", "low_rates_geometry_invalid")
+    if not geometry:
+        return _reference_failure("unavailable", "low_rates_geometry_outside_horizon")
+
+    try:
+        native_slots = list(build_native_slots(base, options) if slots is None else slots)
+        expected_steps = horizon // PREDICT_STEP
+        if len(native_slots) != expected_steps:
+            raise ValueError("Native reference slot count is incomplete")
+        for index, slot in enumerate(native_slots):
+            if type(slot.index) is not int or slot.index != index or slot.start_min != index * PREDICT_STEP or slot.duration_min != PREDICT_STEP:
+                raise ValueError("Native reference slot timeline is invalid")
+            for name in ("ac_load_kwh", "pv_kwh", "import_price", "export_price", "battery_min_kwh"):
+                _number(getattr(slot, name), "generated_reference_" + name, 0 if name in ("ac_load_kwh", "pv_kwh", "battery_min_kwh") else -math.inf)
+    except (ValueError, TypeError, KeyError, AttributeError, IndexError):
+        return _reference_failure("unavailable", "native_reference_slots_invalid")
+
+    manual_names = ("manual_charge_times", "manual_demand_times", "manual_freeze_charge_times", "manual_export_times", "manual_freeze_export_times")
+    manual_active = any(getattr(base, name, None) for name in manual_names)
+    # A per-slot mode list cannot encode the target of a manual charge, freeze,
+    # or export. Do not substitute a cheaper target for that explicit intent.
+    if any(getattr(base, name, None) for name in manual_names if name != "manual_demand_times"):
+        return _reference_failure("blocked", "manual_target_override_unsupported")
+    has_allowed_modes = [hasattr(slot, "allowed_battery_modes") for slot in native_slots]
+    if any(has_allowed_modes) and not all(has_allowed_modes):
+        return _reference_failure("blocked", "native_allowed_modes_incomplete")
+    if manual_active and not all(has_allowed_modes):
+        return _reference_failure("blocked", "manual_override_active")
+    allowed_modes = []
+    if all(has_allowed_modes):
+        for slot in native_slots:
+            modes = getattr(slot, "allowed_battery_modes")
+            if not isinstance(modes, (tuple, list)) or not modes or any(mode not in ("demand", "charge") for mode in modes):
+                return _reference_failure("blocked", "native_allowed_modes_invalid")
+            allowed_modes.append(tuple(modes))
+    else:
+        allowed_modes = [("demand", "charge")] * len(native_slots)
+
+    if not isinstance(fixed_ev_schedule, (tuple, list)) or len(fixed_ev_schedule) != len(native_slots):
+        return _reference_failure("unavailable", "fixed_ev_schedule_invalid")
+    schedule = []
+    for index, item in enumerate(fixed_ev_schedule):
+        if not isinstance(item, (tuple, list)) or len(item) != 2 or type(item[0]) is not int or item[0] != native_slots[index].index or item[1] not in ("on", "off"):
+            return _reference_failure("unavailable", "fixed_ev_schedule_invalid")
+        schedule.append((item[0], item[1]))
+    schedule = tuple(schedule)
+    if not _paired_complete(candidate_checks, horizon):
+        return _reference_failure("unavailable", "candidate_ev_evidence_incomplete")
+    try:
+        for name in ("nominal", "pv10"):
+            _number(candidate_checks[name].get("final_ev_kwh"), "candidate_final_ev_kwh", 0)
+            _number(candidate_checks[name].get("validated_ev_target_kwh"), "candidate_ev_target_kwh", 0)
+    except (ValueError, TypeError, AttributeError):
+        return _reference_failure("unavailable", "candidate_ev_evidence_invalid")
+
+    try:
+        # Match _intent: intermediate Deye targets require shared support and
+        # must be strictly above the rounded reserve. Keep executor guards intact.
+        shared_support = _number(options.get("grid_charge_support_w", 0), "generated_reference_grid_support", 0) > 0
+        reserve_floor = max(1, math.ceil(reserve * 100 / capacity) + 1)
+        positive_levels = tuple(range(reserve_floor, 101)) if shared_support else (100,)
+        positive_levels = tuple(sorted({100, *positive_levels}))
+        minimum_window = _number(options.get("battery_min_window_minutes", PREDICT_STEP), "generated_reference_minimum_window", PREDICT_STEP)
+        if minimum_window % PREDICT_STEP:
+            raise ValueError("Invalid battery window minimum")
+        rate = _number(base.car_charging_rate[0], "generated_reference_ev_rate", 0.001)
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return _reference_failure("unavailable", "generated_reference_inputs_invalid")
+
+    if len(geometry) <= GENERATED_REFERENCE_MAX_WINDOWS:
+        selected_geometry = geometry
+    else:
+        sample_indexes = sorted({0, round((len(geometry) - 1) / 2), len(geometry) - 1})
+        selected_geometry = [geometry[index] for index in sample_indexes]
+    coarse_levels = sorted({0, min(positive_levels), *[level for level in (25, 50, 75, 100) if level in positive_levels]})
+
+    ev_windows = []
+    for slot, (_slot_index, ev_action) in zip(native_slots, schedule):
+        if ev_action == "on":
+            start = now + slot.start_min
+            end = start + slot.duration_min
+            energy = rate * slot.duration_min / 60
+            ev_windows.append({"start": start, "end": end, "kwh": energy, "average": slot.import_price, "cost": energy * slot.import_price, "octopus": False})
+
+    evaluated = {}
+    safe_references = []
+    failure_reasons = set()
+    paired_evaluations = 0
+    refinement_passes = 0
+    budget_exhausted = False
+
+    def evaluate(levels):
+        """Replay one unique native action proposal in both full-horizon scenarios."""
+        nonlocal paired_evaluations
+        levels = tuple(levels)
+        if levels in evaluated:
+            return evaluated[levels]
+        if paired_evaluations + 2 > GENERATED_REFERENCE_MAX_PAIRED_EVALUATIONS:
+            raise RuntimeError("generated_reference_search_budget_exhausted")
+        targets_by_source = {window["source_index"]: level for window, level in zip(selected_geometry, levels)}
+        charge_windows = []
+        charge_limits = []
+        for window, level in zip(selected_geometry, levels):
+            if level == 0:
+                continue
+            target = capacity * level / 100
+            if target + 1e-9 < reserve:
+                failure_reasons.add("reserve_level_below_configured_floor")
+                evaluated[levels] = None
+                return None
+            target = max(target, reserve)
+            if not any(window["start"] <= now + slot.start_min and now + slot.start_min + slot.duration_min <= window["end"] for slot in native_slots):
+                failure_reasons.add("low_rates_geometry_without_native_slots")
+                evaluated[levels] = None
+                return None
+            charge_windows.append({"start": window["start"], "end": window["end"], "average": window["average"]})
+            charge_limits.append(target)
+
+        actions = []
+        for slot, (_slot_index, ev_action) in zip(native_slots, schedule):
+            start = now + slot.start_min
+            end = start + slot.duration_min
+            active = []
+            for window in selected_geometry:
+                overlaps = window["start"] < end and window["end"] > start
+                if overlaps and not (window["start"] <= start and end <= window["end"]):
+                    failure_reasons.add("low_rates_geometry_not_slot_aligned")
+                    evaluated[levels] = None
+                    return None
+                if overlaps and targets_by_source[window["source_index"]] > 0:
+                    active.append(window)
+            if len(active) > 1:
+                failure_reasons.add("low_rates_geometry_overlaps_native_slots")
+                evaluated[levels] = None
+                return None
+            mode = "charge" if active else "demand"
+            if mode not in allowed_modes[slot.index]:
+                failure_reasons.add("generated_action_violates_native_allowed_modes")
+                evaluated[levels] = None
+                return None
+            actions.append(SimpleNamespace(slot_index=slot.index, battery_mode=mode, ev_action=ev_action, discharge_limit_kw=None))
+        commands = []
+        for slot, action in zip(native_slots, actions):
+            start = now + slot.start_min
+            end = start + slot.duration_min
+            target = next((level for window, level in zip(selected_geometry, levels) if window["start"] <= start < window["end"] and level > 0), 0)
+            commands.append({"start": start, "end": end, "target_soc": target if action.battery_mode == "charge" else 0, "freeze": False, "power_w": None, "ev_on": action.ev_action == "on"})
+        try:
+            respects_windows = commands_respect_windows(commands, minimum_window, options.get("initial_window_mode"), options.get("initial_window_remaining_minutes", 0))
+        except (ValueError, TypeError, KeyError, AttributeError):
+            failure_reasons.add("generated_action_window_validation_failed")
+            evaluated[levels] = None
+            return None
+        if not respects_windows:
+            failure_reasons.add("generated_action_violates_battery_window_minimum")
+            evaluated[levels] = None
+            return None
+        result = SimpleNamespace(status="generated_low_rates_native_reference", total_cost=None, actions=tuple(actions))
+        windows = (deepcopy(ev_windows), charge_windows, charge_limits)
+        checks = {}
+        try:
+            for name, scenario in (("nominal", 0), ("pv10", 1)):
+                checks[name] = _replay(base, options, result, native_slots, windows, scenario)
+                checks[name].pop("_charge_peak_kwh", None)
+                paired_evaluations += 1
+        except Exception:
+            failure_reasons.add("generated_reference_replay_failed")
+            evaluated[levels] = None
+            return None
+        if not _paired_passed(checks, horizon):
+            failure_reasons.add("generated_reference_unsafe_or_incomplete")
+            for check in checks.values():
+                reasons = check.get("reasons", []) if isinstance(check, dict) else []
+                if isinstance(reasons, list):
+                    failure_reasons.update(reason for reason in reasons if isinstance(reason, str) and len(reason) <= 80)
+            evaluated[levels] = None
+            return None
+        for name in ("nominal", "pv10"):
+            try:
+                final_ev = _number(checks[name].get("final_ev_kwh"), "generated_reference_final_ev_kwh", 0)
+                reference_target = _number(checks[name].get("validated_ev_target_kwh"), "generated_reference_ev_target_kwh", 0)
+                candidate_ev = _number(candidate_checks[name].get("final_ev_kwh"), "candidate_final_ev_kwh", 0)
+                candidate_target = _number(candidate_checks[name].get("validated_ev_target_kwh"), "candidate_ev_target_kwh", 0)
+            except (ValueError, TypeError, AttributeError):
+                failure_reasons.add("candidate_ev_evidence_invalid")
+                evaluated[levels] = None
+                return None
+            if abs(reference_target - candidate_target) > 0.002 or final_ev < reference_target - 0.002:
+                failure_reasons.add("generated_reference_ev_target_not_met")
+                evaluated[levels] = None
+                return None
+            if abs(final_ev - candidate_ev) > 0.002:
+                failure_reasons.add("ev_delivery_mismatch")
+                evaluated[levels] = None
+                return None
+        costs = _native_adjusted_cost(base, checks)
+        if costs is None:
+            failure_reasons.add("generated_reference_costs_incomplete")
+            evaluated[levels] = None
+            return None
+        record = {"result": result, "slots": native_slots, "windows": windows, "checks": checks, "costs": costs, "levels": levels}
+        # Memoise the proposal identity, not every full 48-hour preview/check
+        # payload. Only the bounded best-safe set needs to retain those objects.
+        evaluated[levels] = None
+        safe_references.append(record)
+        safe_references.sort(key=lambda item: (max(item["costs"].values()), sum(item["costs"].values()), item["levels"]))
+        del safe_references[GENERATED_REFERENCE_MAX_SEEDS:]
+        return record
+
+    try:
+        for levels in product(coarse_levels, repeat=len(selected_geometry)):
+            evaluate(levels)
+        for pass_index in range(GENERATED_REFERENCE_REFINEMENT_PASSES):
+            if not safe_references:
+                break
+            refinement_passes = pass_index + 1
+            before = safe_references[0]["levels"]
+            # Two adjacent perturbations cannot refine a coarse 50% seed down
+            # to a valid 26% target. Search representable whole-percent levels
+            # along each coordinate, retaining the best paired-safe outcome.
+            for index in range(len(selected_geometry)):
+                seed = safe_references[0]["levels"]
+                for level in (0, *positive_levels):
+                    proposal = list(seed)
+                    proposal[index] = level
+                    evaluate(tuple(proposal))
+            if safe_references[0]["levels"] == before:
+                break
+    except RuntimeError as exc:
+        if str(exc) == "generated_reference_search_budget_exhausted":
+            budget_exhausted = True
+        else:
+            raise
+
+    if not safe_references:
+        if budget_exhausted:
+            return _reference_failure("blocked", "search_budget_exhausted", provenance={"paired_evaluations": paired_evaluations})
+        reason = "ev_delivery_mismatch" if "ev_delivery_mismatch" in failure_reasons else "generated_reference_unsafe_or_incomplete"
+        return _reference_failure("unsafe", reason, provenance={"paired_evaluations": paired_evaluations, "failure_reasons": sorted(failure_reasons)})
+    selected = min(safe_references, key=lambda item: (max(item["costs"].values()), sum(item["costs"].values()), item["levels"]))
+    import hashlib
+    import json
+
+    schedule_fingerprint = hashlib.sha256(json.dumps(schedule, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+    provenance = {
+        "source_kind": "copied_low_rates_geometry_fixed_ev_schedule",
+        "source_windows": [{"start": window["start"], "end": window["end"]} for window in geometry],
+        "selected_source_window_indexes": [window["source_index"] for window in selected_geometry],
+        "selected_target_levels_percent": list(selected["levels"]),
+        "eligible_target_levels_percent": coarse_levels,
+        "fixed_ev_schedule_fingerprint": schedule_fingerprint,
+        "paired_evaluations": paired_evaluations,
+        "evaluated_proposals": len(evaluated),
+        "refinement_passes": refinement_passes,
+        "search_budget_exhausted": budget_exhausted,
+        "evaluation_unit": "individual_native_scenarios_in_complete_paired_proposals",
+        "rejected_proposal_reasons": sorted(failure_reasons),
+        "search_scope": "up_to_three_native_windows_coarse_levels_then_two_whole_percent_coordinate_passes_best_safe_within_budget",
+    }
+    return {"status": "paired_safe", "reason": None, **selected, "provenance": provenance}
 
 
 def _public_checks(checks):
