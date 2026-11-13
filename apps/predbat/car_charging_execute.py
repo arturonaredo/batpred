@@ -255,6 +255,7 @@ def economic_input_fingerprint(base, options, native_snapshot):
         "rates": {
             "import": [base.rate_import.get(minute) for minute in range(start, end)],
             "export": [base.rate_export.get(minute) for minute in range(start, end)],
+            "native_low_rate_windows": deepcopy(getattr(base, "low_rates", None)),
         },
         "step_forecasts": {
             "pv": [base.pv_forecast_minute_step[offset] for offset in steps],

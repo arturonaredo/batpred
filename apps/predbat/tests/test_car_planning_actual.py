@@ -137,6 +137,7 @@ def test_cost_execution_rejects_missing_changed_and_stale_economic_evidence(base
         ("missing", "economic_evidence_missing"),
         ("changed", "economic_evidence_changed"),
         ("stale", "economic_inputs_changed"),
+        ("low_rates", "economic_inputs_changed"),
     ):
         _, writes, _, _ = _actual_inputs(base)
         report = evaluate_car_charging(base, publish=False)
@@ -146,8 +147,10 @@ def test_cost_execution_rejects_missing_changed_and_stale_economic_evidence(base
             pending["report"].pop("economic_comparison")
         elif fault == "changed":
             pending["economic_evidence"]["evidence_fingerprint"] = "changed-proof"
-        else:
+        elif fault == "stale":
             base.rate_import[base.minutes_now] += 0.25
+        else:
+            base.low_rates = deepcopy(getattr(base, "low_rates", [])) + [{"start": base.minutes_now, "end": base.minutes_now + 5, "average": 1.0}]
 
         assert execute_car_charging_plan(base)[0] == "EV blocked", (fault, base.car_charging_report)
         assert base.car_charging_report["execution_reason"] == expected_reason, base.car_charging_report

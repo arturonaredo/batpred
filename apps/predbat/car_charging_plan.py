@@ -16,6 +16,10 @@ import math
 from const import PREDICT_STEP, PREDBAT_MAX_CARS
 from prediction import Prediction
 
+GENERATED_REFERENCE_MAX_SCHEDULES = 4
+GENERATED_REFERENCE_CONTINUOUS_SCHEDULES = 2
+JOINT_COST_SEARCH_SCOPE = "best_accepted_among_configured_beam_512_and_bounded_continuous_candidates_" "generated_reference_schedule_cap_{}_not_global_optimum".format(GENERATED_REFERENCE_MAX_SCHEDULES)
+
 
 class UnsupportedCarPlanning(ValueError):
     """A native configuration cannot be represented by this single-EV prototype."""
@@ -1123,6 +1127,8 @@ def _search_joint_cost_candidates(base, options, native_snapshot, configured_can
         _joint_cost_improvement,
         _native_adjusted_cost,
         _paired_passed,
+        _fixed_ev_action_schedule,
+        _generate_low_rates_native_reference,
         _replay_native_joint_plan,
     )
 
@@ -1132,6 +1138,7 @@ def _search_joint_cost_candidates(base, options, native_snapshot, configured_can
     attempts = []
     accepted = []
     sources = []
+    generated_reference_cache = {}
     if configured_candidate and len(configured_candidate) == 2 and configured_candidate[0] is not None:
         sources.append((configured_candidate[0], configured_candidate[1], options, "configured_beam", options["beam"], None, None, {}))
     for attempt in continuous_attempts:
@@ -1148,7 +1155,47 @@ def _search_joint_cost_candidates(base, options, native_snapshot, configured_can
         refined_result, refined_slots = build_candidate(base, refinement_options)
         sources.append((refined_result, refined_slots, refinement_options, "unrestricted_beam_512", 512, None, None, {}))
 
-    for result, slots, trial, source, beam, saved_windows, saved_checks, metadata in sources:
+    mandatory_reference_sources = {index for index, source_info in enumerate(sources) if source_info[3] in ("configured_beam", "unrestricted_beam_512")}
+    generated_reference_source_indexes = set(mandatory_reference_sources)
+    selected_ev_schedules = set()
+    for index in mandatory_reference_sources:
+        result, slots = sources[index][0], sources[index][1]
+        try:
+            selected_ev_schedules.add(_fixed_ev_action_schedule(result, slots))
+        except (ValueError, TypeError, AttributeError):
+            pass
+
+    continuous_reference_sources = []
+    for index, source_info in enumerate(sources):
+        result, slots, _trial, source, _beam, _saved_windows, saved_checks, _metadata = source_info
+        if source != "continuous_block":
+            continue
+        try:
+            fixed_ev_schedule = _fixed_ev_action_schedule(result, slots)
+        except (ValueError, TypeError, AttributeError):
+            continue
+        costs = _native_adjusted_cost(base, saved_checks) if _paired_passed(saved_checks, base.forecast_minutes) else None
+        if costs is None:
+            rank = (1, 0.0, 0.0, index)
+        else:
+            rank = (0, max(costs.values()), sum(costs.values()), index)
+        continuous_reference_sources.append((rank, index, fixed_ev_schedule))
+
+    selected_continuous_sources = 0
+    continuous_schedule_limit = min(
+        GENERATED_REFERENCE_CONTINUOUS_SCHEDULES,
+        max(0, GENERATED_REFERENCE_MAX_SCHEDULES - len(mandatory_reference_sources)),
+    )
+    for _rank, index, fixed_ev_schedule in sorted(continuous_reference_sources):
+        if fixed_ev_schedule in selected_ev_schedules:
+            continue
+        generated_reference_source_indexes.add(index)
+        selected_ev_schedules.add(fixed_ev_schedule)
+        selected_continuous_sources += 1
+        if selected_continuous_sources >= continuous_schedule_limit:
+            break
+
+    for source_index, (result, slots, trial, source, beam, saved_windows, saved_checks, metadata) in enumerate(sources):
         attempt_record = {**metadata, "source": source, "beam_width": beam, "solver_status": getattr(result, "status", "unknown")}
         if not getattr(result, "actions", None):
             attempt_record.update(native_passed=False, native_reasons={"nominal": ["solver_no_plan"], "pv10": ["solver_no_plan"]})
@@ -1173,50 +1220,170 @@ def _search_joint_cost_candidates(base, options, native_snapshot, configured_can
             attempts.append(attempt_record)
             continue
 
+        ordinary_reference_reasons = {"nominal": ["native_reference_replay_failed"], "pv10": ["native_reference_replay_failed"]}
+        ordinary_reference_checks = {}
+        ordinary_reference_passed = False
+        ordinary_reference_costs = None
+        ordinary_reference_target_met = False
+        ordinary_same_ev_delivery = None
         try:
-            reference_result, reference_windows, reference_checks = _replay_native_joint_plan(base, trial, native_snapshot, result, slots, candidate_windows[0])
+            ordinary_result, ordinary_windows, ordinary_checks = _replay_native_joint_plan(base, trial, native_snapshot, result, slots, candidate_windows[0])
+            ordinary_reference_checks = ordinary_checks if isinstance(ordinary_checks, dict) else {}
+            ordinary_reference_passed = _paired_passed(ordinary_checks, base.forecast_minutes)
+            ordinary_reference_reasons = _check_reasons(ordinary_reference_checks)
+            ordinary_reference_costs = _native_adjusted_cost(base, ordinary_checks) if ordinary_reference_passed else None
+            if ordinary_reference_costs is not None:
+                try:
+                    ordinary_reference_target_met = all(_number(check.get("final_ev_kwh"), "native_reference_final_ev") >= _number(check.get("validated_ev_target_kwh"), "native_reference_ev_target") - 0.002 for check in ordinary_reference_checks.values())
+                except (ValueError, TypeError, AttributeError):
+                    ordinary_reference_target_met = False
+                if candidate_costs is not None:
+                    ordinary_same_ev_delivery = all(
+                        isinstance(candidate_checks[name].get("final_ev_kwh"), (int, float))
+                        and isinstance(ordinary_reference_checks[name].get("final_ev_kwh"), (int, float))
+                        and abs(candidate_checks[name]["final_ev_kwh"] - ordinary_reference_checks[name]["final_ev_kwh"]) <= 0.002
+                        for name in ("nominal", "pv10")
+                    )
         except (ValueError, TypeError, KeyError, AttributeError):
-            attempt_record["economic_rejection"] = "native_reference_replay_failed"
-            attempt_record["reference_reasons"] = {"nominal": ["native_reference_replay_failed"], "pv10": ["native_reference_replay_failed"]}
-            attempts.append(attempt_record)
-            continue
-        reference_passed = _paired_passed(reference_checks, base.forecast_minutes)
-        attempt_record.update(reference_passed=reference_passed, reference_reasons=_check_reasons(reference_checks))
-        reference_costs = _native_adjusted_cost(base, reference_checks) if reference_passed else None
+            ordinary_reference_reasons = {"nominal": ["native_reference_replay_failed"], "pv10": ["native_reference_replay_failed"]}
+        if ordinary_reference_costs is None:
+            ordinary_reference_status = "unsafe_or_incomplete"
+        elif not ordinary_reference_target_met:
+            ordinary_reference_status = "ev_target_not_met"
+        elif candidate_costs is not None and ordinary_same_ev_delivery is not True:
+            ordinary_reference_status = "ev_delivery_mismatch"
+        else:
+            ordinary_reference_status = "paired_safe"
+        attempt_record.update(
+            reference_passed=ordinary_reference_passed,
+            reference_reasons=ordinary_reference_reasons,
+            reference_ev_target_met=ordinary_reference_target_met,
+            ordinary_native_reference_status=ordinary_reference_status,
+        )
+
+        ordinary_reference_eligible = ordinary_reference_status == "paired_safe" and (candidate_costs is None or ordinary_same_ev_delivery is True)
+        reference_kind = "current_cycle_native_battery_plan_paired_with_identical_ev_windows"
+        reference_result = ordinary_result if ordinary_reference_eligible else None
+        reference_windows = ordinary_windows if ordinary_reference_eligible else None
+        reference_checks = ordinary_reference_checks if ordinary_reference_eligible else None
+        reference_costs = ordinary_reference_costs if ordinary_reference_eligible else None
+        same_ev_delivery = ordinary_same_ev_delivery if ordinary_reference_eligible else None
+        generated_reference_provenance = None
+
+        if not ordinary_reference_eligible:
+            try:
+                fixed_ev_schedule = _fixed_ev_action_schedule(result, slots)
+            except (ValueError, TypeError, AttributeError):
+                attempt_record.update(generated_reference_passed=False, generated_reference_status="unavailable", generated_reference_reason="fixed_ev_schedule_invalid")
+                attempts.append(attempt_record)
+                continue
+            from car_charging_execute import economic_input_fingerprint
+
+            cache_key = _digest(
+                {
+                    "input_fingerprint": economic_input_fingerprint(base, trial, native_snapshot),
+                    "fixed_ev_schedule": fixed_ev_schedule,
+                    "candidate_ev_evidence": {
+                        name: {key: candidate_checks[name].get(key) for key in ("checked_minutes", "final_ev_kwh", "validated_ev_target_kwh")}
+                        for name in ("nominal", "pv10")
+                        if isinstance(candidate_checks, dict) and isinstance(candidate_checks.get(name), dict)
+                    },
+                    "native_slots": [(slot.index, slot.start_min, slot.duration_min, slot.ac_load_kwh, slot.pv_kwh, slot.import_price, slot.export_price, slot.battery_min_kwh) for slot in slots],
+                    "reference_options": {
+                        name: trial.get(name)
+                        for name in (
+                            "mode",
+                            "control_model",
+                            "ev_charging_priority",
+                            "ev_soc",
+                            "arrival",
+                            "deadline",
+                            "pause",
+                            "restart",
+                            "off_minutes",
+                            "initially_on",
+                            "initial_off_minutes",
+                            "import_limit_w",
+                            "grid_charge_support_w",
+                            "terminal_min",
+                            "load_cap",
+                            "forecast_basis",
+                            "battery_min_window_minutes",
+                            "initial_window_mode",
+                            "initial_window_remaining_minutes",
+                        )
+                    },
+                }
+            )
+            generated_reference = generated_reference_cache.get(cache_key)
+            if generated_reference is None and source_index not in generated_reference_source_indexes:
+                reason = "bounded_generated_reference_schedule_budget"
+                attempt_record.update(
+                    generated_reference_passed=False,
+                    generated_reference_status=reason,
+                    generated_reference_reason=reason,
+                )
+                attempt_record["economic_rejection"] = reason
+                attempts.append(attempt_record)
+                continue
+            if generated_reference is None:
+                generated_reference = _generate_low_rates_native_reference(base, trial, fixed_ev_schedule, candidate_checks, slots)
+                generated_reference_cache[cache_key] = deepcopy(generated_reference)
+            generated_passed = generated_reference.get("status") == "paired_safe"
+            attempt_record.update(
+                generated_reference_passed=generated_passed,
+                generated_reference_status=generated_reference.get("status"),
+                generated_reference_reason=generated_reference.get("reason"),
+                generated_reference_provenance=deepcopy(generated_reference.get("provenance", {})),
+            )
+            generated_windows = generated_reference.get("windows")
+            if not generated_passed or not isinstance(generated_windows, (tuple, list)) or len(generated_windows) != 3 or generated_windows[0] != candidate_windows[0]:
+                attempt_record["economic_rejection"] = "native_reference_unsafe_or_incomplete" if not generated_passed else "generated_reference_ev_schedule_mismatch"
+                attempts.append(attempt_record)
+                continue
+            reference_result = generated_reference["result"]
+            reference_windows = generated_reference["windows"]
+            reference_checks = generated_reference["checks"]
+            reference_costs = generated_reference["costs"]
+            same_ev_delivery = True
+            reference_kind = "generated_fixed_ev_low_rates_native_window_reference"
+            generated_reference_provenance = deepcopy(generated_reference["provenance"])
+            attempt_record["generated_reference_ev_target_met"] = True
+        else:
+            attempt_record["ordinary_native_reference_ev_delivery"] = ordinary_same_ev_delivery
+
         if reference_costs is None:
             attempt_record["economic_rejection"] = "native_reference_unsafe_or_incomplete"
             attempts.append(attempt_record)
             continue
-        try:
-            reference_target_met = all(_number(check.get("final_ev_kwh"), "native_reference_final_ev") >= _number(check.get("validated_ev_target_kwh"), "native_reference_ev_target") - 0.002 for check in reference_checks.values())
-        except (ValueError, TypeError, AttributeError):
-            reference_target_met = False
-        attempt_record["reference_ev_target_met"] = reference_target_met
-        if not reference_target_met:
-            attempt_record["economic_rejection"] = "native_reference_ev_target_not_met"
-            attempts.append(attempt_record)
-            continue
-
-        same_ev_delivery = None
-        if candidate_costs is not None:
-            same_ev_delivery = all(
-                isinstance(candidate_checks[name].get("final_ev_kwh"), (int, float)) and isinstance(reference_checks[name].get("final_ev_kwh"), (int, float)) and abs(candidate_checks[name]["final_ev_kwh"] - reference_checks[name]["final_ev_kwh"]) <= 0.002
-                for name in ("nominal", "pv10")
-            )
-            if not same_ev_delivery:
-                attempt_record["economic_rejection"] = "native_reference_ev_delivery_mismatch"
-                attempts.append(attempt_record)
-                continue
 
         candidate_switches = _battery_mode_switches(result) if candidate_costs is not None else None
         reference_switches = _battery_mode_switches(reference_result)
         improved = candidate_costs is not None and _joint_cost_improvement(candidate_costs, reference_costs, candidate_switches, reference_switches)
         compared_costs = candidate_costs if candidate_costs is not None else reference_costs
         deltas = {name: compared_costs[name] - reference_costs[name] for name in ("nominal", "pv10")}
+        ordinary_native_reference = {
+            "status": ordinary_reference_status,
+            "passed": ordinary_reference_passed,
+            "eligible": ordinary_reference_eligible,
+            "reasons": deepcopy(ordinary_reference_reasons),
+            "ev_target_met": ordinary_reference_target_met,
+            "same_ev_delivery": ordinary_same_ev_delivery,
+            "checks": {
+                name: {key: check.get(key) for key in ("passed", "checked_minutes", "reasons", "peak_import_w", "minimum_battery_kwh", "final_battery_kwh", "final_ev_kwh", "validated_ev_target_kwh")}
+                for name, check in ordinary_reference_checks.items()
+                if isinstance(check, dict)
+            },
+        }
         reference_fingerprint = _digest(
             {
                 "native_snapshot": native_snapshot,
-                "ev_windows": candidate_windows[0],
+                "reference_kind": reference_kind,
+                "generated_reference_provenance": generated_reference_provenance,
+                "ev_windows": reference_windows[0],
+                "reference_charge_windows": reference_windows[1],
+                "reference_charge_limits": reference_windows[2],
+                "ordinary_native_reference": ordinary_native_reference,
                 "reference_costs": reference_costs,
                 "reference_checks": {
                     name: {key: check.get(key) for key in ("passed", "checked_minutes", "reasons", "horizon_energy_cost", "battery_cycle_kwh", "final_battery_kwh", "final_ev_kwh", "validated_ev_target_kwh")} for name, check in reference_checks.items()
@@ -1225,10 +1392,12 @@ def _search_joint_cost_candidates(base, options, native_snapshot, configured_can
         )
         comparison = {
             "status": "componentwise_improvement" if improved else "native_reference_alternative",
-            "reference_kind": "current_cycle_native_battery_plan_paired_with_identical_ev_windows",
+            "reference_kind": reference_kind,
             "reference_fingerprint": reference_fingerprint,
-            "reference_charge_windows": deepcopy(native_snapshot["charge_windows"]),
-            "reference_charge_limits": deepcopy(native_snapshot["charge_limits"]),
+            "reference_charge_windows": deepcopy(reference_windows[1]),
+            "reference_charge_limits": deepcopy(reference_windows[2]),
+            "ordinary_native_reference": ordinary_native_reference,
+            "generated_reference_provenance": deepcopy(generated_reference_provenance),
             "reference_costs": deepcopy(reference_costs),
             "reference_checks": {
                 name: {key: check.get(key) for key in ("passed", "checked_minutes", "reasons", "horizon_energy_cost", "battery_cycle_kwh", "final_battery_kwh", "final_ev_kwh", "validated_ev_target_kwh")} for name, check in reference_checks.items()
@@ -1247,7 +1416,7 @@ def _search_joint_cost_candidates(base, options, native_snapshot, configured_can
             "native_reference_ev_target_met": True,
             "proposed_candidate_native_passed": candidate_passed,
             "comparison_basis": "raw_paired_native_horizon_cost_plus_cycle_cost_minus_terminal_soc_value",
-            "search_scope": "best_accepted_among_configured_beam_512_and_bounded_continuous_candidates_not_global_optimum",
+            "search_scope": JOINT_COST_SEARCH_SCOPE,
         }
         if improved:
             accepted.append(
@@ -1265,6 +1434,7 @@ def _search_joint_cost_candidates(base, options, native_snapshot, configured_can
                     "reference_windows": reference_windows,
                     "reference_checks": reference_checks,
                     "native_reference_snapshot": deepcopy(native_snapshot),
+                    "generated_reference_provenance": deepcopy(generated_reference_provenance),
                 }
             )
             attempt_record.update(economic_accepted=True, economic_comparison=deepcopy(comparison))
@@ -1279,10 +1449,12 @@ def _search_joint_cost_candidates(base, options, native_snapshot, configured_can
                 status="native_reference_alternative",
                 proposed_candidate_costs=deepcopy(candidate_costs),
                 proposed_candidate_same_ev_delivery=same_ev_delivery,
+                proposed_candidate_battery_mode_switches=candidate_switches,
+                candidate_battery_mode_switches=reference_switches,
                 candidate_costs=deepcopy(reference_costs),
                 candidate_minus_reference={"nominal": 0.0, "pv10": 0.0},
                 same_ev_delivery=True,
-                same_ev_delivery_basis="selected_native_plan_versus_its_identical_ev_reference",
+                same_ev_delivery_basis="selected_native_reference_versus_its_identical_ev_schedule",
                 componentwise_non_regression=True,
                 positive_improvement=False,
                 battery_plan_improvement=False,
@@ -1302,6 +1474,7 @@ def _search_joint_cost_candidates(base, options, native_snapshot, configured_can
                     "reference_windows": reference_windows,
                     "reference_checks": reference_checks,
                     "native_reference_snapshot": deepcopy(native_snapshot),
+                    "generated_reference_provenance": deepcopy(generated_reference_provenance),
                 }
             )
         attempts.append(attempt_record)
@@ -1538,7 +1711,7 @@ def evaluate_car_charging(base, publish=True):
                     reason="COST execution requires a complete safe paired native reference and material per-scenario improvement, or its safe native alternative",
                     joint_economic_search_attempts=economic_attempts,
                     native_reference_status="unavailable" if native_snapshot is None else "unsafe_or_incomplete_or_not_materially_better",
-                    search_scope="best_accepted_among_configured_beam_512_and_bounded_continuous_candidates_not_global_optimum",
+                    search_scope=JOINT_COST_SEARCH_SCOPE,
                     execution_enabled=False,
                     ready_to_activate=False,
                     bounded_search=True,
@@ -1686,7 +1859,11 @@ def evaluate_car_charging(base, publish=True):
                 cost_unit=base.currency_symbols[1],
                 cost_convention="solver_objective_includes_cycle_cost_and_terminal_credit; native_horizon_energy_cost_excludes_both_and_standing_charge",
                 ev_window_convention="full_step_power_reservation_not_partial_target_energy",
-                charge_limit_convention="solver_charge_run_peak_floor_whole_percent_then_paired_native_replay" if windows[1] else "no_charge_windows",
+                charge_limit_convention=(
+                    "generated_low_rates_window_targets_at_or_above_reserve_paired_native_replay"
+                    if economic_selected is not None and economic_selected["source"] == "native_reference_alternative" and economic_selected["economic_comparison"]["reference_kind"] == "generated_fixed_ev_low_rates_native_window_reference"
+                    else "solver_charge_run_peak_guarded_ceil_plus_one_percentage_point_then_paired_native_replay" if windows[1] else "no_charge_windows"
+                ),
                 initial_execution_state_assumption="relay_value_and_elapsed_off_time" if options["entity_config"]["relay_entity"] else "assumed_off_for_minimum_cooldown_no_relay",
                 ev_initial_state={
                     "initially_on": options["initially_on"],
@@ -1761,6 +1938,8 @@ def evaluate_car_charging(base, publish=True):
                     )
                     comparison.update(generation_id=generation_id, plan_fingerprint=plan_fingerprint, command_fingerprint=command_hash, input_fingerprint=input_fingerprint, accepted=True, evidence=deepcopy(evidence))
                     pending.update(economic_evidence=deepcopy(evidence), native_reference_snapshot=deepcopy(reference_snapshot))
+                    if economic_selected.get("generated_reference_provenance") is not None:
+                        pending["generated_reference_provenance"] = deepcopy(economic_selected["generated_reference_provenance"])
                     pending["report"] = deepcopy(report)
                 base.car_charging_pending = pending
         partial_authorised = options["mode"] == "apply" and settings.get("ev_partial_target_authorised") is True and bool(options["grid_charge_support_w"])

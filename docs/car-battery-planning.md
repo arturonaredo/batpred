@@ -147,7 +147,7 @@ Any model-only assumption without a relay observation cannot authorise energisin
 
 | Priority | Preference |
 | --- | --- |
-| `cost` | Compare whole-house economic outcomes through departure, including solar opportunity cost, cycling and terminal energy. A cheaper validated split schedule may beat continuity. |
+| `cost` | Compare whole-house economic outcomes over the complete forecast horizon while meeting the EV target by departure, including solar opportunity cost, cycling and terminal energy. A cheaper validated split schedule may beat continuity. |
 | `asap` | Prefer nearby useful solar, then the next lower import-rate band, with an earlier deadline-preserving fallback. |
 | `now` | Require a validated start in the current control interval, including any separately authorised partial alternative. Never silently substitute a later start. |
 | `solar` | Use forecast household PV surplus only, with an independent fresh local-meter gate. No grid/battery fallback for EV charging. |
@@ -160,6 +160,24 @@ five-minute resolution before the ordinary validated search. Full target and bot
 native replays still take precedence over waiting for a cheaper opportunity.
 The cost path ranks up to twelve continuous candidates against an unrestricted
 schedule. These are bounded searches, not proofs of global optimality.
+
+COST compares independently replayed battery plans with the **same fixed EV
+reservation and delivery**, forecasts, initial state, cycle cost and terminal
+energy valuation. An unsafe ordinary native battery plan does not approve a
+candidate. For a bounded set of schedules, an additional reference search may
+instead use the current cycle's native eligible low-rate windows, without reading
+the candidate's battery actions. Its whole-percent targets must respect reserve,
+manual controls and battery window commitments, and pass both complete native
+scenarios before their costs can be used. Reports distinguish this generated
+reference from the ordinary native plan and retain the ordinary rejection.
+
+The reference search is bounded and does not establish a global optimum. A safe
+reference found before refinement ends remains eligible; an exhausted search
+without a fully validated reference does not grant authority. Domestic-plan
+replacement still requires material improvement without regression in either
+scenario. A selected paired-safe reference may instead be retained as an
+explicit equal-cost alternative, with no claimed battery-plan saving. Changes
+to its eligible native windows invalidate the economic receipt.
 
 An already active relay first tries continuation without inventing another OFF
 interval. NOW still obeys availability, consent, reserve, hysteresis and cooldown;
@@ -234,6 +252,11 @@ cached settings block the candidate. A grid-charge request can leave available
 grid/PV headroom for domestic charging while household and EV demand take priority;
 the battery may supply a deficit within its energy, rate and reserve limits.
 Insufficient support remains a real import violation, never a clipped graph.
+Within this explicit sharing model, reaching the charge target ends domestic
+charging, not bounded battery support for the remaining charge window. The
+support model does not depend on the presence of an EV slot. Solver-derived
+charge targets include a small whole-percent guard and are independently
+replayed; they are not an unconditional request to charge the home battery fully.
 
 No hold, Program Power, current-limit or work-mode writes are implied. Opt-in
 nominal and PV10 Python replay models this sharing; ordinary native plans and
