@@ -719,6 +719,11 @@ def _withdraw_for_household(base, reason, attempted=False):
     base.battery_window = None
     base.car_charging_pending = None
     base.car_charging_slots = [[] for _ in range(PREDBAT_MAX_CARS)]
+    if isinstance(receipt, dict) and receipt:
+        try:
+            base.log("Info: EV/household authority withdrawn: {}".format(reason))
+        except Exception:
+            pass
     try:
         _publish_ev(base)
         if domestic_context:
