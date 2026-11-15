@@ -282,6 +282,11 @@ def _options(base):
     # later in that block is NOT future-dated. Read the observation clock after
     # the cached states so a concurrent HA update is compared with current time.
     observed_now = _aware(_observation_clock(), "observation_clock")
+    requested_priority = ev_priority
+    if control_model == "deye_solarman" and settings.get("grid_charge_support"):
+        from power_readiness import readiness_ev_priority
+
+        ev_priority = readiness_ev_priority(base, requested_priority, mode, observed_now)
     initial_window_mode, initial_window_remaining = planning_window(base, now, observed_now, battery_min_window)
     manual_target_active = bool(getattr(base, "car_charging_manual_soc", None) and base.car_charging_manual_soc and base.car_charging_manual_soc[0])
     manual_target_kwh = None
@@ -433,6 +438,8 @@ def _options(base):
         "control_model": control_model,
         "grid_charge_support_w": support_w,
         "ev_charging_priority": ev_priority,
+        "requested_ev_charging_priority": requested_priority,
+        "readiness_now_override": ev_priority != requested_priority,
         "battery_min_window_minutes": battery_min_window,
         "initial_window_mode": initial_window_mode,
         "initial_window_remaining_minutes": initial_window_remaining,
@@ -1607,7 +1614,9 @@ def evaluate_car_charging(base, publish=True):
             "ready_to_activate": False,
             "control_model": options["control_model"],
             "grid_charge_support_w": options["grid_charge_support_w"],
-            "ev_charging_priority": options["ev_charging_priority"],
+            "ev_charging_priority": options.get("requested_ev_charging_priority", options["ev_charging_priority"]),
+            "effective_ev_charging_priority": options["ev_charging_priority"],
+            "readiness_now_override": options.get("readiness_now_override", False),
             "battery_min_window_minutes": options["battery_min_window_minutes"],
             "forecast_plan_hours": getattr(base, "forecast_plan_hours", 48),
             "battery_window_initial_mode": options["initial_window_mode"],
@@ -2058,7 +2067,12 @@ def evaluate_car_charging(base, publish=True):
                 report["ev_run_strategy"] = "immediate_start_not_validated"
                 report["execution_blockers"] = [*report.get("execution_blockers", []), "immediate_start_not_validated"]
                 report["reason"] = "No paired-safe EV start was validated for the current control interval; NOW does not defer the start"
-        if options["mode"] == "apply" and settings.get("household_fallback") is True and settings.get("household_economic_fallback") is True and report["status"] in ("no_plan_found", "native_rejected"):
+        readiness_fallback = False
+        if options["mode"] == "apply" and settings.get("household_fallback") is True and options["ev_charging_priority"] == "now" and report["status"] in ("no_plan_found", "native_rejected"):
+            from power_readiness import readiness_enabled, current_readiness_period
+
+            readiness_fallback = readiness_enabled(base) and current_readiness_period(base, _observation_clock()) is not None
+        if options["mode"] == "apply" and settings.get("household_fallback") is True and (settings.get("household_economic_fallback") is True or readiness_fallback) and report["status"] in ("no_plan_found", "native_rejected"):
             from car_charging_household import evaluate_household_fallback
 
             joint_rejection = {"status": report["status"]}
@@ -2067,6 +2081,8 @@ def evaluate_car_charging(base, publish=True):
                     joint_rejection[name] = deepcopy(report[name])
             fallback_report = evaluate_household_fallback(base, settings, "joint_candidate_" + report["status"])
             if isinstance(fallback_report, dict):
+                if readiness_fallback:
+                    fallback_report["ev_priority_attempt"] = {"requested": options.get("requested_ev_charging_priority", options["ev_charging_priority"]), "effective": options["ev_charging_priority"]}
                 fallback_report["joint_candidate_rejection"] = joint_rejection
                 pending = getattr(base, "car_charging_pending", None)
                 if isinstance(pending, dict) and pending.get("domestic_only") is True:

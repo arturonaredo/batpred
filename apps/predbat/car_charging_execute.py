@@ -530,7 +530,9 @@ def _candidate(base, pending, inverter, now, minute, current_options=None):
     _require(all(check.get("passed") is True and check.get("checked_minutes") == base.forecast_minutes for check in checks.values()), "native_checks_failed")
     _require(0 <= (now - _stamp(report["generated_at"])).total_seconds() <= RECEIPT_TTL_SECONDS, "candidate_stale_or_future")
     _require(pending.get("fingerprint") == execution_fingerprint(base), "configuration_changed")
-    _require(pending["options"]["ev_charging_priority"] == _ev_charging_priority(base), "charging_priority_changed_during_planning")
+    _require(pending["options"].get("requested_ev_charging_priority", pending["options"]["ev_charging_priority"]) == _ev_charging_priority(base), "charging_priority_changed_during_planning")
+    if pending["options"].get("readiness_now_override"):
+        _require(current_options is not None and current_options.get("readiness_now_override") is True and current_options["ev_charging_priority"] == pending["options"]["ev_charging_priority"], "automatic_charging_priority_changed")
     from battery_window import selected_window_minutes, commands_respect_windows, observed_window, command_mode, planning_window
 
     minimum_window = selected_window_minutes(base)
@@ -865,6 +867,8 @@ def execute_car_charging_plan(base):
         # Permission, clocks and protection inputs can change while writes settle.
         options, inverter, relay, now, minute = _evidence(base, allow_read_only_transition=True)
         _require(pending["fingerprint"] == execution_fingerprint(base), "configuration_changed_during_dispatch")
+        if pending["options"].get("readiness_now_override"):
+            _require(options.get("readiness_now_override") is True and options["ev_charging_priority"] == pending["options"]["ev_charging_priority"], "automatic_charging_priority_changed")
         _require(pending["report"].get("session_closed", False) is options["departure_passed"], "session_phase_changed")
         _require(command["start"] <= minute < command["end"], "command_expired_during_dispatch")
         solar = _ev_permitted(base, options, relay, now, command["ev_on"])
