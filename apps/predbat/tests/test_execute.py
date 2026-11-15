@@ -15,6 +15,11 @@ from const import EXPORT_MODE_TARGET, EXPORT_MODE_FREEZE, MINUTE_WATT
 from utils import pack_export_limit
 from utils import calc_percent_limit
 from control_monitor import ControlMonitor, MODE_CHARGING, MODE_EXPORTING, GRACE_S
+from config import INVERTER_DEF
+
+# Template fixtures register additional profiles at runtime. This static flag
+# regression pins the built-in types, not whichever templates ran before it.
+BUILTIN_INVERTER_TYPES = frozenset(INVERTER_DEF)
 
 
 class ActiveTestInverter:
@@ -2091,7 +2096,7 @@ def test_discharge_to_target_inverter_types():
     from config import INVERTER_DEF
 
     failed = False
-    reached = sorted(name for name, idef in INVERTER_DEF.items() if not idef.get("has_timed_pause", False) and not idef.get("has_target_soc", False))
+    reached = sorted(name for name, idef in INVERTER_DEF.items() if name in BUILTIN_INVERTER_TYPES and not idef.get("has_timed_pause", False) and not idef.get("has_target_soc", False))
     expected = ["FoxESS", "GS", "HU", "SE", "SF", "SFMB", "SIG", "SX4"]
     if reached != expected:
         print("ERROR: inverter types that can discharge to a Hold charging target should be {}, got {}".format(expected, reached))
