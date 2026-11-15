@@ -674,7 +674,7 @@ def test_js_renderer_rounds_fractional_soc_in_plan_cell():
     js = get_plan_renderer_js()
     # Row cell: every Plan row is rendered with Math.round applied
     # unconditionally, including executed combined plans.
-    assert "${Math.round(row.soc_percent)}${socSym}" in js, js
+    assert "${Math.round(row.soc_percent)}${socSym}${endpoint}" in js, js
     # Totals cell: same integer rounding so totals are consistent.
     assert "Math.round(totals.soc_percent" in js, js
 
@@ -741,4 +741,6 @@ def run_car_planning_applied_view_tests(base):
             failed = True
         else:
             print("PASS: " + test.__name__)
-    return failed
+    from tests.test_plan_table_clarity import run_plan_table_clarity_tests
+
+    return run_plan_table_clarity_tests() or failed

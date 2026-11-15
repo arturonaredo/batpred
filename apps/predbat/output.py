@@ -1400,6 +1400,7 @@ class Output:
         car_total = 0
         raw_plan = {}
         raw_plan["rows"] = []
+        raw_plan["recorded_cost"] = self.cost_today_sofar / 100.0
         scenario_sources = self.plan_scenario_sources() if show_scenarios else {}
         if scenario_sources:
             raw_plan["scenario_fields"] = PLAN_SCENARIO_FIELDS
