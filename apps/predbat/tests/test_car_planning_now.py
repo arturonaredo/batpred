@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from car_charging_solver import BatteryConfig, EVConfig, PlannerConfig, PlannerInputError, SiteConfig, Slot, plan
 from car_charging_execute import command_fingerprint, execute_car_charging_plan, publish_car_charging_slot
-from car_charging_plan import _continuous_grid_support_shadow, _options, _replay_candidate, evaluate_car_charging
+from car_charging_plan import _continuous_grid_support_shadow, _options, _replay_candidate, build_candidate, evaluate_car_charging
 from tests.test_car_planning_actual import _set_entity
 
 
@@ -44,6 +44,83 @@ def now_inputs(base):
     from tests.test_car_planning_priority import _priority_inputs
 
     return _priority_inputs(base, priority="now")
+
+
+def test_now_prefix_constraint_keeps_cooldown_and_availability():
+    """An initial-run preference only removes transitions; it cannot create unsafe starts."""
+    slots = [Slot(index, index * 5, 5, 0.1, 0, 10, 0) for index in range(12)]
+    ev = EVConfig(25, 0, 1.5, rate_kw=6, efficiency=1, deadline_min=60)
+    battery = BatteryConfig(20, 10, 2, 0, 0, 1, 1, 2)
+    site = SiteConfig(10)
+    preferred = PlannerConfig(beam_width=None, allowed_battery_modes=("demand",), require_ev_start=True, ev_initial_run_minutes=10)
+    result = plan(slots, ev, battery, site, preferred)
+    assert result.actions and all(action.ev_action == "on" for action in result.actions[:2])
+    assert result.actions[-1].ev_soc_kwh_end >= ev.stop_soc_kwh
+    assert not plan(slots, replace(ev, initial_off_minutes=5), battery, site, preferred).actions
+    assert not plan(slots, replace(ev, availability=(0, *range(2, 12))), battery, site, preferred).actions
+    assert not plan(slots, ev, replace(battery, initial_kwh=4), site, preferred).actions
+    for invalid in (True, 1, 7, -5, 65, 10.0, None):
+        try:
+            plan(slots, ev, battery, site, replace(preferred, ev_initial_run_minutes=invalid))
+        except PlannerInputError:
+            pass
+        else:
+            raise AssertionError("Invalid initial EV run accepted: {!r}".format(invalid))
+
+
+def test_now_prefix_is_not_an_alternative_priority_or_household_mode(base):
+    """Only an explicit NOW EV candidate with shared support can request a forced prefix."""
+    writes = now_inputs(base)
+    options = {**_options(base), "ev_initial_run_minutes": 10}
+    for changed in ({"ev_charging_priority": "cost"}, {"ev_charging_priority": "asap"}, {"ev_charging_priority": "solar"}, {"house_only": True}, {"grid_charge_support_w": 0}):
+        try:
+            build_candidate(base, {**options, **changed})
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Initial EV run escaped NOW support policy: {!r}".format(changed))
+    assert not writes
+
+
+def test_now_prefix_retains_full_target_and_later_safe_restart(base):
+    """A longer initial run beats a cheap early pause without waiving the later restart guards."""
+    writes = now_inputs(base)
+    options = _options(base)
+    base.soc_max, base.soc_kw, base.reserve = 10.0, 2.6, 1.0
+    base.car_charging_rate, base.car_charging_limit, base.car_charging_loss = [6.0], [2.0], 1.0
+    base.battery_loss = base.battery_loss_discharge = base.inverter_loss = 1.0
+    base.battery_rate_max_charge, base.battery_rate_max_discharge = 3.0 / 60, 6.0 / 60
+    base.battery_rate_max_scaling = base.battery_rate_max_scaling_discharge = base.charge_scaling10 = 1.0
+    base.metric_battery_cycle = base.metric_battery_value_scaling = 0.0
+    base.all_active_keep = {}
+    for minute in range(0, base.forecast_minutes, 5):
+        base.load_minutes_step[minute] = base.load_minutes_step10[minute] = 1.0 / 12
+        base.pv_forecast_minute_step[minute] = base.pv_forecast_minute10_step[minute] = 0.0
+    base.rate_import.update({base.minutes_now + minute: 50 if minute < 10 else 1 for minute in range(base.forecast_minutes)})
+    options.update(import_limit_w=4000, grid_charge_support_w=4000, terminal_min=1.0, pause=20, restart=25, initially_on=True, initial_off_minutes=0, battery_min_window_minutes=5)
+    ordinary, _ = build_candidate(base, options)
+    assert ordinary.actions and ordinary.actions[0].ev_action == "on" and ordinary.actions[1].ev_action == "off", ordinary
+    preferred, _ = build_candidate(base, {**options, "ev_initial_run_minutes": 10})
+    assert preferred.actions and all(action.ev_action == "on" for action in preferred.actions[:2]), "NOW discarded a feasible ten-minute initial run for a cheap five-minute pulse"
+    assert preferred.actions[-1].ev_soc_kwh_end >= 2.0 - 1e-9 and not writes
+    # A whole-target continuous run would cross the unchanged twenty-percent
+    # pause floor. A valid prefix must instead leave a safe later restart.
+    assert not build_candidate(base, {**options, "ev_initial_run_minutes": 20})[0].actions
+    assert any(action.ev_action == "off" for action in preferred.actions[2:])
+    for left, right in zip(preferred.actions, preferred.actions[1:]):
+        if left.ev_action == "off" and right.ev_action == "on":
+            assert right.battery_soc_kwh_start >= 2.5 - 1e-9
+    # Exercise selection, not just the low-level constraint: a full-target
+    # single block fails, but the actual native engine validates the prefix
+    # and safe later delivery in both forecasts before it can be selected.
+    selected, attempts = _continuous_grid_support_shadow(base, options)
+    assert selected is not None, attempts
+    chosen = next(attempt for attempt in attempts if attempt.get("selected"))
+    assert chosen["initial_run_minutes"] == 10 and chosen["priority_reason"] == "immediate_prefix_full_target", chosen
+    assert all(action.ev_action == "on" for action in selected[0].actions[:2])
+    assert set(selected[3]) == {"nominal", "pv10"}
+    assert all(check["passed"] and check["final_ev_kwh"] >= 2.0 - 0.002 for check in selected[3].values()), selected[3]
+    assert not writes
 
 
 def test_now_current_command_and_selector_event(base):
@@ -192,10 +269,13 @@ def test_now_completed_target_and_unsupported_controls(base):
 def run_car_planning_now_tests(base, template_available):
     """Run pure constraints independently, and real-template cases only with their actual backend."""
     test_now_pure_start_constraint()
+    test_now_prefix_constraint_keeps_cooldown_and_availability()
     if template_available:
         from unit_test import create_predbat
 
         for test in (
+            test_now_prefix_retains_full_target_and_later_safe_restart,
+            test_now_prefix_is_not_an_alternative_priority_or_household_mode,
             test_now_current_command_and_selector_event,
             test_now_never_substitutes_asap_or_cost_fallback,
             test_now_cooldown_and_active_continuation,

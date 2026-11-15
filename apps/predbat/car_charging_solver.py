@@ -125,6 +125,10 @@ class PlannerConfig:
     slot 0 and, if a different mode is picked, it must persist for the full
     new window. A non-zero remaining time locks the initial mode until it
     elapses; then a fresh full window begins for the next chosen mode.
+
+    `ev_initial_run_minutes` optionally requires an initial EV-ON prefix. It
+    restricts decisions, never bypasses cooldown, availability or battery floors.
+    The remaining horizon stays available for safe pauses and later delivery.
     """
 
     time_step_minutes: int = 5
@@ -139,6 +143,7 @@ class PlannerConfig:
     battery_min_window_minutes: int = 5
     initial_window_mode: Optional[str] = None
     initial_window_remaining_minutes: int = 0
+    ev_initial_run_minutes: int = 0
 
 
 @dataclass(frozen=True)
@@ -313,6 +318,10 @@ def _validate(slots, ev, battery, site, planner):
         _require_finite(field, getattr(ev, field), 0)
     if type(ev.initially_on) is not bool or type(ev.deadline_min) is not int or ev.deadline_min < 0:
         raise PlannerInputError("Invalid EV initial state or deadline")
+    if type(planner.ev_initial_run_minutes) is not int or not 0 <= planner.ev_initial_run_minutes <= min(end, ev.deadline_min) or planner.ev_initial_run_minutes % planner.time_step_minutes:
+        raise PlannerInputError("ev_initial_run_minutes must be a non-negative whole-step prefix within the EV deadline")
+    if planner.ev_initial_run_minutes and (slots[0].start_min != 0 or planner.ev_initial_run_minutes not in {slot.start_min + slot.duration_min for slot in slots}):
+        raise PlannerInputError("EV initial run must start at zero and end at a slot boundary")
     if ev.availability is not None and (not isinstance(ev.availability, tuple) or any(type(i) is not int or not 0 <= i < len(slots) for i in ev.availability)):
         raise PlannerInputError("Availability must contain original slot indices")
     _require_finite("import_cap_kw", site.import_cap_kw, 0)
@@ -619,7 +628,7 @@ def plan(slots: Sequence[Slot], ev: EVConfig, battery: BatteryConfig, site: Site
             if i == 0 and planner.initial_battery_mode is not None:
                 allowed_modes = tuple(mode for mode in allowed_modes if mode == planner.initial_battery_mode)
             for mode in allowed_modes:
-                for on in (True,) if i == 0 and planner.require_ev_start else (False, True):
+                for on in (True,) if (i == 0 and planner.require_ev_start) or slot.start_min < planner.ev_initial_run_minutes else (False, True):
                     if on and planner.solar_ev_only and (mode != BATTERY_DEMAND or slot.pv_kwh - slot.ac_load_kwh < ev.rate_kw * slot.duration_min / 60 - EPSILON):
                         continue
                     transitions += 1
