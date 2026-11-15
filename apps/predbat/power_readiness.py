@@ -16,7 +16,7 @@ def readiness_settings(base):
     raw = getattr(base, "args", {}).get("battery_power_readiness")
     if raw is None:
         return {"enabled": False}
-    defaults = {"enabled": False, "auto_ev_now": False, "target_soc_percent": 35, "maximum_soc_percent": 60, "minimum_cheap_minutes": 360, "cheap_price_ceiling": 12.0}
+    defaults = {"enabled": False, "auto_ev_now": False, "target_soc_percent": 35, "maximum_soc_percent": 60, "minimum_cheap_minutes": 360, "cheap_price_ceiling": 10.0}
     if not isinstance(raw, dict) or set(raw) - set(defaults):
         raise ValueError("Invalid power readiness settings")
     settings = {**defaults, **raw}
@@ -39,7 +39,7 @@ def readiness_enabled(base):
 
 
 def cheap_readiness_periods(base, slots, minimum=None):
-    """Share tariff eligibility between domestic targets and temporary EV scheduling priority."""
+    """Share strict below-ceiling tariff eligibility between domestic targets and temporary EV priority."""
     settings = readiness_settings(base)
     if not settings["enabled"]:
         return []
@@ -58,11 +58,11 @@ def cheap_readiness_periods(base, slots, minimum=None):
     periods = []
     index = 0
     while index < len(slots):
-        if prices[index] > threshold:
+        if prices[index] >= threshold:
             index += 1
             continue
         first = index
-        while index < len(slots) and prices[index] <= threshold:
+        while index < len(slots) and prices[index] < threshold:
             index += 1
         start = base.minutes_now + slots[first].start_min
         end = base.minutes_now + slots[index - 1].start_min + slots[index - 1].duration_min
@@ -70,7 +70,7 @@ def cheap_readiness_periods(base, slots, minimum=None):
         if first == 0:
             for minute in range(start - 5, start - int(minimum) - 1, -5):
                 price = base.rate_import.get(minute)
-                if type(price) not in (int, float) or not math.isfinite(price) or price > threshold:
+                if type(price) not in (int, float) or not math.isfinite(price) or price >= threshold:
                     break
                 observed_prior_minutes += 5
         if end - start + observed_prior_minutes < minimum:
