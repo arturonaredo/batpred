@@ -261,13 +261,14 @@ battery_power_readiness:
   target_soc_percent: 35
   maximum_soc_percent: 60
   minimum_cheap_minutes: 360
-  cheap_price_ceiling: 12.0
+  cheap_price_ceiling: 10.0
 ```
 
-The example ceiling is 12 minor currency units/kWh, or EUR 0.12/kWh for euro
+The example ceiling is 10 minor currency units/kWh, or EUR 0.10/kWh for euro
 tariffs. These are the defaults when enabled. Missing configuration disables
 the feature. Targets are whole percentages below 100%; malformed settings fail
-closed. A continuous six-hour band below the ceiling qualifies even if a short
+closed. The ceiling is exclusive: 8.10 and 9.99 qualify with a ceiling of 10,
+but 10.00 and 11.20 do not. A continuous six-hour band below the ceiling qualifies even if a short
 cheaper interval exists later. Known earlier cheap tariffs keep the remaining
 hours eligible as a long band ends; missing prior tariffs are not invented.
 
