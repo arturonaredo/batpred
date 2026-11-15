@@ -654,7 +654,8 @@ def test_real_ha_timestamp_cache_and_elapsed_cooldown(base):
     from types import SimpleNamespace
 
     _setup(base)
-    ha = SimpleNamespace(state_data={}, db_enable=False)
+    ha = SimpleNamespace(state_data={}, db_enable=False, shared_attribute_lists={})
+    ha.share_long_lists = HAInterface.share_long_lists.__get__(ha)
     now = base.now_utc
     payload = {"state": "off", "attributes": {}, "last_changed": (now - timedelta(seconds=59)).isoformat(), "last_updated": now.isoformat()}
     HAInterface.update_state_item(ha, payload, "switch.test_relay")
