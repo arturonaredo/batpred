@@ -27,6 +27,40 @@ def _inputs(base, minutes=720):
     return options, slots, result
 
 
+def test_readiness_does_not_enable_economic_continuation_for_late_peak(base):
+    """A failed cheap buffer must not silently authorise a full household economic continuation."""
+    from car_charging_plan import _replay_candidate
+    from power_readiness import prepare_candidate, stage_household_readiness
+
+    options, slots, seed = _inputs(base)
+    for minute in range(0, base.forecast_minutes + 30, 5):
+        base.load_minutes_step[minute] = 2.0 / 12
+        base.load_minutes_step10[minute] = 2.4 / 12
+        base.pv_forecast_minute_step[minute] = 0
+        base.pv_forecast_minute10_step[minute] = 0
+    base.load_minutes_step10[650] = 8.0 / 12
+    from car_charging_plan import build_native_slots
+
+    slots = build_native_slots(base, options)
+    fixed = prepare_candidate(base, options, seed, slots, ([], [], []))
+    _, fixed_checks = _replay_candidate(base, options, fixed, slots)
+    assert not fixed_checks["pv10"]["passed"], fixed_checks
+    assert "site_import_exceeded" in fixed_checks["pv10"]["reasons"]
+    base.car_charging_pending = None
+    with patch("car_charging_plan.build_candidate") as economic_solver:
+        report = stage_household_readiness(base, options, slots, "test_future_peak")
+    economic_solver.assert_not_called()
+    assert report["status"] != "candidate", report
+    assert report["execution_reason"] == "power_readiness_native_replay_failed", report
+    assert base.car_charging_pending is None
+    base.load_minutes_step10[0] = 100.0 / 12
+    base.car_charging_pending = None
+    slots = build_native_slots(base, options)
+    rejected = stage_household_readiness(base, options, slots, "test_impossible_peak")
+    assert rejected["status"] != "candidate", rejected
+    assert base.car_charging_pending is None
+
+
 def test_readiness_defaults_off_and_rejects_invalid_settings(base):
     """Explicit opt-in is required and invalid settings cannot silently become an enabled policy."""
     import power_readiness
@@ -325,7 +359,7 @@ def test_household_readiness_survives_native_memory_cleanup(base):
     from car_charging_plan import evaluate_car_charging
     from car_charging_execute import execute_car_charging_plan, refresh_car_charging_lease
 
-    for invalidation in ("tariff", "expired"):
+    for invalidation in ("tariff", "expired", "logging_failure"):
         inverter, writes = _household_template_fixture(base, minutes=360, economic_fallback=False)
         reset_rates(base, 8.1, 0)
         base.args.update(battery_power_readiness={"enabled": True}, car_charging_recurring_session={"enabled": True})
@@ -345,11 +379,17 @@ def test_household_readiness_survives_native_memory_cleanup(base):
             assert base.car_charging_execution is not None, base.car_charging_report
             assert base.car_charging_report["status"] == "applied", base.car_charging_report
             assert len(writes) == before, "A cache-only refresh rewrote the inverter"
-        if invalidation == "tariff":
+        if invalidation in ("tariff", "logging_failure"):
             base.rate_import[base.minutes_now] += 0.25
         observed = started + timedelta(seconds=300 if invalidation == "expired" else 241)
-        with patch("car_charging_plan._observation_clock", return_value=observed), patch("car_charging_execute._clock", return_value=observed):
+        with (
+            patch("car_charging_plan._observation_clock", return_value=observed),
+            patch("car_charging_execute._clock", return_value=observed),
+            patch.object(base, "log", side_effect=OSError("synthetic logging failure") if invalidation == "logging_failure" else None) as log,
+        ):
             refresh_car_charging_lease(base)
+        reason = "receipt_expired" if invalidation == "expired" else "power_readiness_inputs_changed"
+        assert any(call.args == ("Info: EV/household authority withdrawn: " + reason,) for call in log.call_args_list), log.call_args_list
         assert base.car_charging_execution is None
         assert base.car_charging_report["status"] != "applied"
         base.release_plan_forecasts()
@@ -497,6 +537,7 @@ def test_empty_battery_readiness_keeps_live_safety_checks(base):
 
 def run_power_readiness_tests(base):
     """Run service-policy and complete native numerical regressions."""
+    test_readiness_does_not_enable_economic_continuation_for_late_peak(base)
     test_readiness_defaults_off_and_rejects_invalid_settings(base)
     test_flat_cheap_weekend_and_holiday_buffer_without_changing_reserve(base)
     test_expensive_flat_or_short_cheap_period_does_not_activate(base)
