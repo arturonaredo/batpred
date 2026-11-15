@@ -1009,21 +1009,21 @@ def test_js_renderer_treats_car_planning_simulation_as_non_editable():
 
 
 def test_js_renderer_emits_car_planning_injected_field_text():
-    """Additional trajectory fields stay in Dev, not in the original table layout."""
+    """Flow details are now explicitly available without adding authority or PV10 clutter."""
     from web_helper import get_plan_renderer_js
 
     renderer_js = get_plan_renderer_js()
-    # These fields remain available to Dev, but must not redesign the table.
+    # Conservative endpoints remain diagnostic; nominal flow details are now
+    # deliberately exposed by the presentation-only interval disclosure.
     plan_field_names = [
-        "soc_end_percent",
         "plan_soc_pv10_start_percent",
         "plan_soc_pv10_end_percent",
-        "plan_grid_peak_w",
         "plan_grid_peak_pv10_w",
-        "plan_ev_on_minutes",
     ]
     for name in plan_field_names:
         assert name not in renderer_js, f"extra developer field must not change the table: {name}"
+    assert "planFlowDetail" in renderer_js
+    assert "soc_end_percent" in renderer_js
     assert "Max grid kW" not in renderer_js
 
 

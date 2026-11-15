@@ -33,6 +33,8 @@ def replay_discharge_limits(model, result, slots, scenario):
     car_soc = list(model.car_charging_soc)
     trace = {}
     grid = {}
+    battery = {}
+    metric_time = {}
     cost = 0
     peak = 0
     minutes_over = 0
@@ -72,6 +74,10 @@ def replay_discharge_limits(model, result, slots, scenario):
         pred.run_prediction(limits, windows, [], [], scenario, end_record=PREDICT_STEP, save="test")
         soc = pred.final_soc
         car_soc = list(pred.final_car_soc)
+        # Retain native display traces only; never feed these maps back into
+        # the step inputs, acceptance checks, cost accumulation or controls.
+        battery.update(pred.predict_battery_power)
+        metric_time.update({stamp: value + cost + model.cost_today_sofar for stamp, value in pred.metric_time.items()})
         cost += pred.final_metric
         grid.update(pred.predict_grid_power)
         diagnostic = getattr(pred, "import_limit_diagnostics", None)
@@ -87,6 +93,8 @@ def replay_discharge_limits(model, result, slots, scenario):
     return SimpleNamespace(
         predict_soc=trace,
         predict_grid_power=grid,
+        predict_battery_power=battery,
+        metric_time=metric_time,
         final_soc=soc,
         final_car_soc=car_soc,
         final_metric=cost + model.cost_today_sofar,
