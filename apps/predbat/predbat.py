@@ -1906,12 +1906,7 @@ class PredBat(hass.Hass, Octopus, Energidataservice, Stromligning, Fetch, Plan, 
         else:
             self.expose_config("compare_active", False)
 
-        # Free memory
-        if not self.debug_enable:
-            self.load_minutes_step = {}
-            self.load_minutes_step10 = {}
-            self.pv_forecast_minute_step = {}
-            self.pv_forecast_minute10_step = {}
+        self.release_plan_forecasts()
 
         gc.collect()
         # Collecting frees the objects; on glibc the pages stay with the process until trimmed
@@ -1920,6 +1915,18 @@ class PredBat(hass.Hass, Octopus, Energidataservice, Stromligning, Fetch, Plan, 
         # Schedule inverter update for 30 seconds time to allow the inverter to process the changes we just made before we fetch the data again
         # This allows the power flow to update for the user more quickly.
         self.inverter_data_last_fetch = datetime.now() - timedelta(seconds=INVERTER_QUICK_UPDATE_SECONDS) + timedelta(seconds=30)
+
+    def release_plan_forecasts(self):
+        """Keep domestic receipt evidence until revocation; ordinary debug-off cleanup grants no authority."""
+        receipt = getattr(self, "car_charging_execution", None)
+        pending = getattr(self, "car_charging_pending", None)
+        domestic_evidence = isinstance(receipt, dict) and receipt.get("domestic_only") is True and isinstance(pending, dict) and pending.get("domestic_only") is True
+        if self.debug_enable or domestic_evidence:
+            return
+        self.load_minutes_step = {}
+        self.load_minutes_step10 = {}
+        self.pv_forecast_minute_step = {}
+        self.pv_forecast_minute10_step = {}
 
     async def async_download_predbat_version(self, version):
         """

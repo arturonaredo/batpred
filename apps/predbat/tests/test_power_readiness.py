@@ -318,6 +318,183 @@ def test_readiness_setting_is_admitted_by_full_ev_configuration(base):
     assert report["power_readiness"]["active"] is True
 
 
+def test_household_readiness_survives_native_memory_cleanup(base):
+    """Ordinary debug-off cleanup cannot erase evidence needed by the next real lease refresh."""
+    from tests.test_car_planning_grid_support import _household_template_fixture
+    from tests.test_infra import reset_rates
+    from car_charging_plan import evaluate_car_charging
+    from car_charging_execute import execute_car_charging_plan, refresh_car_charging_lease
+
+    for invalidation in ("tariff", "expired"):
+        inverter, writes = _household_template_fixture(base, minutes=360, economic_fallback=False)
+        reset_rates(base, 8.1, 0)
+        base.args.update(battery_power_readiness={"enabled": True}, car_charging_recurring_session={"enabled": True})
+        base.soc_kw = inverter.soc_kw = base.reserve
+        inverter.soc_percent = 10
+        base.debug_enable = False
+        started = base.now_utc
+        with patch("car_charging_plan._observation_clock", return_value=started), patch("car_charging_execute._clock", return_value=started):
+            assert evaluate_car_charging(base, publish=False)["status"] == "candidate"
+            assert execute_car_charging_plan(base)[0] == "Charging"
+        before = len(writes)
+        base.release_plan_forecasts()
+        for seconds in (3, 15, 60, 240):
+            observed = started + timedelta(seconds=seconds)
+            with patch("car_charging_plan._observation_clock", return_value=observed), patch("car_charging_execute._clock", return_value=observed):
+                refresh_car_charging_lease(base)
+            assert base.car_charging_execution is not None, base.car_charging_report
+            assert base.car_charging_report["status"] == "applied", base.car_charging_report
+            assert len(writes) == before, "A cache-only refresh rewrote the inverter"
+        if invalidation == "tariff":
+            base.rate_import[base.minutes_now] += 0.25
+        observed = started + timedelta(seconds=300 if invalidation == "expired" else 241)
+        with patch("car_charging_plan._observation_clock", return_value=observed), patch("car_charging_execute._clock", return_value=observed):
+            refresh_car_charging_lease(base)
+        assert base.car_charging_execution is None
+        assert base.car_charging_report["status"] != "applied"
+        base.release_plan_forecasts()
+        assert all(not getattr(base, name) for name in ("load_minutes_step", "load_minutes_step10", "pv_forecast_minute_step", "pv_forecast_minute10_step"))
+
+
+def test_automatic_now_is_current_band_only_and_restores_requested_priority(base):
+    """Automatic NOW uses real long cheap bands, never writes the selector or overrides solar."""
+    from power_readiness import readiness_ev_priority
+
+    _inputs(base)
+    base.args["battery_power_readiness"] = {"enabled": True, "auto_ev_now": True}
+    before = deepcopy(base.args)
+    for minutes in (359, 360):
+        for minute in base.rate_import:
+            base.rate_import[minute] = 8.1 if base.minutes_now <= minute < base.minutes_now + minutes else 30.0
+        assert readiness_ev_priority(base, "cost", "apply", base.now_utc) == ("now" if minutes == 360 else "cost")
+    assert readiness_ev_priority(base, "solar", "apply", base.now_utc) == "solar"
+    assert readiness_ev_priority(base, "cost", "shadow", base.now_utc) == "cost"
+    assert readiness_ev_priority(base, "cost", "apply", base.now_utc + timedelta(minutes=360)) == "cost"
+    for minute in base.rate_import:
+        base.rate_import[minute] = 8.1 if base.minutes_now + 60 <= minute < base.minutes_now + 420 else 30.0
+    assert readiness_ev_priority(base, "cost", "apply", base.now_utc) == "cost"
+    for minute in base.rate_import:
+        base.rate_import[minute] = 8.1 if base.minutes_now - 300 <= minute < base.minutes_now + 60 else 30.0
+    assert readiness_ev_priority(base, "asap", "apply", base.now_utc) == "now"
+    base.rate_import.pop(base.minutes_now)
+    assert readiness_ev_priority(base, "cost", "apply", base.now_utc) == "cost"
+    assert base.args == before
+
+
+def _readiness_ev_fixture(base):
+    """Keep real session/Storage checks and mirror only mocked live HA control-state reads."""
+    from tests.test_car_planning_session import session_inputs
+
+    result = session_inputs(base)
+    base.ha_interface.is_alive = lambda: True
+
+    def live_state(endpoint, **_kwargs):
+        """Return the synthetic current-state REST contract without consulting any real service."""
+        entity = endpoint.removeprefix("/api/states/")
+        payload = base.ha_interface.get_state(entity_id=entity, raw=True)
+        if not isinstance(payload, dict):
+            return None
+        return {**payload, "entity_id": entity, **{key: value.isoformat() if hasattr(value, "isoformat") else value for key, value in payload.items() if key in ("last_changed", "last_updated")}}
+
+    base.ha_interface.api_call = live_state
+    return result
+
+
+def test_full_ev_automatic_now_is_revalidated_before_dispatch(base):
+    """A new EV start cannot retain an automatic NOW proof after its current cheap band disappears."""
+    from tests.car_planning_fixtures import car_settings
+    from tests.test_infra import reset_rates
+    from car_charging_plan import evaluate_car_charging
+    from car_charging_execute import execute_car_charging_plan
+
+    for changed in (False, True):
+        _inverter, writes, _sources, _targets = _readiness_ev_fixture(base)
+        settings = car_settings(base)
+        settings.update(ev_charging_priority="cost", household_fallback=True, household_economic_fallback=False)
+        base.args["battery_power_readiness"] = {"enabled": True, "auto_ev_now": True}
+        reset_rates(base, 8.1, 0)
+        for minute in range(base.minutes_now - 360, base.minutes_now):
+            base.rate_import[minute] = 8.1
+        with patch("car_charging_plan._observation_clock", return_value=base.now_utc), patch("car_charging_execute._clock", return_value=base.now_utc):
+            report = evaluate_car_charging(base, publish=False)
+            assert report["status"] == "candidate", report
+            assert report["ev_charging_priority"] == "cost"
+            assert report["effective_ev_charging_priority"] == "now"
+            assert base.car_charging_pending["commands"][0]["ev_on"] is True
+            if changed:
+                base.rate_import[base.minutes_now] = 30.0
+            executed = execute_car_charging_plan(base)
+        if changed:
+            assert not writes and base.car_charging_execution is None, base.car_charging_report
+        else:
+            assert executed[0] == "Charging", base.car_charging_report
+            assert base.car_charging_report["status"] == "applied"
+        assert car_settings(base)["ev_charging_priority"] == "cost"
+
+
+def test_now_with_empty_home_battery_prepares_house_instead_of_deadlocking(base):
+    """A fully authorised EV session below restart SOC can prepare domestic energy without starting the EV."""
+    from tests.car_planning_fixtures import car_settings
+    from tests.test_infra import reset_rates
+    from car_charging_plan import evaluate_car_charging
+    from car_charging_execute import execute_car_charging_plan
+
+    for requested in ("now", "cost"):
+        inverter, writes, _sources, _targets = _readiness_ev_fixture(base)
+        settings = car_settings(base)
+        settings.update(ev_charging_priority=requested, household_fallback=True, household_economic_fallback=False)
+        base.args["battery_power_readiness"] = {"enabled": True, "auto_ev_now": True}
+        base.all_active_keep = {}
+        base.soc_kw = inverter.soc_kw = base.reserve
+        inverter.soc_percent = 10
+        reset_rates(base, 8.1, 0)
+        for minute in range(base.minutes_now - 360, base.minutes_now):
+            base.rate_import[minute] = 8.1
+        with patch("car_charging_plan._observation_clock", return_value=base.now_utc), patch("car_charging_execute._clock", return_value=base.now_utc):
+            report = evaluate_car_charging(base, publish=False)
+            assert report["status"] == "candidate" and report["power_readiness_service"] is True, report
+            assert report["domestic_only"] is True and report["proposed_ev_windows"] == []
+            assert all(not command["ev_on"] for command in base.car_charging_pending["commands"])
+            assert execute_car_charging_plan(base)[0] == "Charging", base.car_charging_report
+        assert writes and not any(service.startswith("switch") for service, _data in writes)
+        assert base.car_charging_execution["domestic_only"] is True
+        assert settings["household_economic_fallback"] is False
+
+
+def test_empty_battery_readiness_keeps_live_safety_checks(base):
+    """Preparation after a failed NOW start cannot bypass authority, relay OFF or grid-support checks."""
+    from tests.car_planning_fixtures import car_settings
+    from tests.test_car_planning_actual import _set_entity
+    from tests.test_infra import reset_rates
+    from car_charging_plan import evaluate_car_charging
+    from car_charging_execute import execute_car_charging_plan
+
+    for fault in ("authority", "relay_on", "support_off", "read_only"):
+        inverter, writes, _sources, _targets = _readiness_ev_fixture(base)
+        settings = car_settings(base)
+        settings.update(ev_charging_priority="now", household_economic_fallback=False)
+        base.args["battery_power_readiness"] = {"enabled": True, "auto_ev_now": True}
+        base.all_active_keep = {}
+        base.soc_kw = inverter.soc_kw = base.reserve
+        inverter.soc_percent = 10
+        reset_rates(base, 8.1, 0)
+        for minute in range(base.minutes_now - 360, base.minutes_now):
+            base.rate_import[minute] = 8.1
+        if fault == "authority":
+            settings.update(apply_verified=False, execution_authorised=False)
+        elif fault == "relay_on":
+            _set_entity(base, settings["relay_entity"], "on")
+        elif fault == "support_off":
+            _set_entity(base, settings["grid_charge_support"]["enabled_entity"], "off")
+        else:
+            base.set_read_only = True
+        with patch("car_charging_plan._observation_clock", return_value=base.now_utc), patch("car_charging_execute._clock", return_value=base.now_utc):
+            evaluate_car_charging(base, publish=False)
+            execute_car_charging_plan(base)
+        assert not writes, (fault, writes)
+        assert base.car_charging_execution is None, (fault, base.car_charging_report)
+
+
 def run_power_readiness_tests(base):
     """Run service-policy and complete native numerical regressions."""
     test_readiness_defaults_off_and_rejects_invalid_settings(base)
@@ -335,4 +512,9 @@ def run_power_readiness_tests(base):
     test_ev_waits_when_house_peak_uses_the_available_battery_power(base)
     test_inactive_domestic_readiness_leaves_ordinary_native_control_unchanged(base)
     test_readiness_setting_is_admitted_by_full_ev_configuration(base)
+    test_household_readiness_survives_native_memory_cleanup(base)
+    test_automatic_now_is_current_band_only_and_restores_requested_priority(base)
+    test_full_ev_automatic_now_is_revalidated_before_dispatch(base)
+    test_now_with_empty_home_battery_prepares_house_instead_of_deadlocking(base)
+    test_empty_battery_readiness_keeps_live_safety_checks(base)
     return False
