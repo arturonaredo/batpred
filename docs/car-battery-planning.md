@@ -309,6 +309,16 @@ too low, an eligible readiness service can prepare domestic energy with the EV
 OFF instead of blocking its own recovery. This does not enable the household
 economic optimiser, relax EV pause/restart or cooldown, or grant EV permission.
 
+Domestic readiness first replays the normal buffer target. If that would be
+exhausted before a later household peak, it can try higher targets in five-point
+steps up to `maximum_soc_percent`, including that exact cap. Every trial keeps
+the EV OFF, charges only in the same eligible cheap bands and uses Demand
+outside them. It does not invoke the household economic optimiser or add
+expensive charging. Both complete native scenarios must pass before dispatch;
+otherwise the service remains blocked. `power_readiness_target_attempts` records
+the trials. The maximum is an explicit preparation allowance, not a rigid
+reserve or an instruction to keep the battery permanently at that percentage.
+
 With the Deye/Solarman adapter, `inverter_grid_support` can name the existing local
 peak-shaving enable and limit observations. Missing, disabled, excessive or invalid
 cached settings block the candidate. A grid-charge request can leave available

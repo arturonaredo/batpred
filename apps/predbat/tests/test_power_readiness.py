@@ -34,8 +34,8 @@ def test_readiness_does_not_enable_economic_continuation_for_late_peak(base):
 
     options, slots, seed = _inputs(base)
     for minute in range(0, base.forecast_minutes + 30, 5):
-        base.load_minutes_step[minute] = 2.0 / 12
-        base.load_minutes_step10[minute] = 2.4 / 12
+        base.load_minutes_step[minute] = (2.0 if minute < 360 else 4.0) / 12
+        base.load_minutes_step10[minute] = (2.0 if minute < 360 else 4.0) / 12
         base.pv_forecast_minute_step[minute] = 0
         base.pv_forecast_minute10_step[minute] = 0
     base.load_minutes_step10[650] = 8.0 / 12
@@ -59,6 +59,60 @@ def test_readiness_does_not_enable_economic_continuation_for_late_peak(base):
     rejected = stage_household_readiness(base, options, slots, "test_impossible_peak")
     assert rejected["status"] != "candidate", rejected
     assert base.car_charging_pending is None
+
+
+def test_cheap_only_peak_cover_uses_authorised_cap_without_economic_solver(base):
+    """Raise only the cheap-band target to cover a later peak, never schedule non-cheap charging."""
+    from car_charging_plan import build_native_slots
+    from power_readiness import stage_household_readiness
+
+    options, _slots, _seed = _inputs(base)
+    base.args["battery_power_readiness"]["maximum_soc_percent"] = 70
+    for minute in range(0, base.forecast_minutes + 30, 5):
+        base.load_minutes_step[minute] = (2.0 if minute < 360 else 2.2) / 12
+        base.load_minutes_step10[minute] = base.load_minutes_step[minute]
+        base.pv_forecast_minute_step[minute] = 0
+        base.pv_forecast_minute10_step[minute] = 0
+    base.load_minutes_step[650] = base.load_minutes_step10[650] = 8.0 / 12
+    before = deepcopy(base.args)
+    slots = build_native_slots(base, options)
+    with patch("car_charging_plan.build_candidate") as economic_solver:
+        report = stage_household_readiness(base, options, slots, "test_later_peak")
+    economic_solver.assert_not_called()
+    assert report["status"] == "candidate", report
+    assert 35 < report["power_readiness"]["target_soc_percent"] <= 70
+    assert all(check["passed"] for check in report["native_checks"].values()), report
+    for command in base.car_charging_pending["commands"]:
+        assert command["ev_on"] is False
+        if command["start"] >= base.minutes_now + 360:
+            assert command["target_soc"] == 0, command
+        else:
+            assert 35 <= command["target_soc"] <= 70, command
+    assert base.args == before
+
+
+def test_cheap_peak_cover_rejects_unapproved_targets_and_ev_authority(base):
+    """A service replay target cannot exceed policy bounds or grant any EV-on schedule."""
+    from power_readiness import prepare_candidate
+
+    options, slots, seed = _inputs(base)
+    base.args["battery_power_readiness"]["maximum_soc_percent"] = 70
+    for target in (71, 34, True, 35.0):
+        try:
+            prepare_candidate(base, options, seed, slots, ([], [], []), service_target_percent=target)
+        except ValueError:
+            continue
+        raise AssertionError("Unapproved service replay target accepted")
+    for fault in ("not_household", "ev_on"):
+        changed_options = {**options, "house_only": fault != "not_household"}
+        changed_seed = deepcopy(seed)
+        if fault == "ev_on":
+            changed_seed.actions[0].ev_action = "on"
+        try:
+            prepare_candidate(base, changed_options, changed_seed, slots, ([], [], []), service_target_percent=70)
+        except ValueError:
+            continue
+        raise AssertionError("Non-domestic replay target accepted")
 
 
 def test_readiness_defaults_off_and_rejects_invalid_settings(base):
@@ -537,6 +591,8 @@ def test_empty_battery_readiness_keeps_live_safety_checks(base):
 
 def run_power_readiness_tests(base):
     """Run service-policy and complete native numerical regressions."""
+    test_cheap_peak_cover_rejects_unapproved_targets_and_ev_authority(base)
+    test_cheap_only_peak_cover_uses_authorised_cap_without_economic_solver(base)
     test_readiness_does_not_enable_economic_continuation_for_late_peak(base)
     test_readiness_defaults_off_and_rejects_invalid_settings(base)
     test_flat_cheap_weekend_and_holiday_buffer_without_changing_reserve(base)
