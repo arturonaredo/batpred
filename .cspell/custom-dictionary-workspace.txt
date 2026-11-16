@@ -93,6 +93,7 @@ calcsize
 calib
 callees
 Cantarell
+carga
 cbat
 CDLL
 cdn
@@ -119,6 +120,7 @@ cmax
 cmin
 cmpl
 cobat
+Coche
 codepoint
 codepoints
 Codespaces
@@ -146,6 +148,7 @@ creds
 crosscharge
 ctrdis
 ctypes
+curva
 customauthorizer
 customisation
 Customise
@@ -183,6 +186,8 @@ derate
 derated
 derating
 derecha
+descarga
+desconectado
 describedby
 dess
 desync
@@ -275,6 +280,7 @@ estimaciones
 estimado
 estimados
 está
+esté
 etime
 ETIMEDOUT
 etiquetada
@@ -291,6 +297,7 @@ evse
 exog
 explicación
 expmsg
+exportación
 exportlimit
 exportvalue
 facecolor
@@ -325,6 +332,7 @@ fromisoformat
 fronius
 funcs
 futurerate
+física
 físico
 gaierror
 gcoan
@@ -408,8 +416,10 @@ iess
 iflux
 importación
 importlimit
+incompleta
 inday
 Indevolt
+indica
 indra
 inicio
 inteless
@@ -667,6 +677,7 @@ preseeded
 previsión
 prevista
 previsto
+previstos
 prevs
 protobuf
 pseudonymisation
@@ -831,6 +842,7 @@ surrogatepass
 suspendedev
 suspendedevse
 sustituido
+sustituyen
 synkctl
 syscmd
 sysdn
