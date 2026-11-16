@@ -208,7 +208,14 @@ def continuous_charge_windows(base, options, result, slots, windows):
     unchanged = {"changed": False, "reason": "not_eligible"}
     settings = readiness_settings(base)
     profile = getattr(result, "power_readiness", {})
-    if not settings.get("enabled") or not isinstance(profile, dict) or not profile.get("active") or options.get("ev_charging_priority") != "cost" or options.get("control_model") != "deye_solarman" or not options.get("grid_charge_support_w"):
+    if (
+        not settings.get("enabled")
+        or not isinstance(profile, dict)
+        or not profile.get("active")
+        or options.get("ev_charging_priority") not in ("cost", "now", "asap", "solar")
+        or options.get("control_model") != "deye_solarman"
+        or not options.get("grid_charge_support_w")
+    ):
         return windows, unchanged
     if len(getattr(result, "actions", ())) != len(slots) or not slots or len(windows) != 3 or len(windows[1]) != len(windows[2]):
         return windows, {**unchanged, "reason": "incomplete_timeline"}
