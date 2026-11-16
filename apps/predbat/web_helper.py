@@ -7213,6 +7213,71 @@ def get_plan_renderer_js():
         return result;
     }
 
+    // Stable control strategy, not five-minute flow direction. Keep all samples.
+    function groupCompactPlanRows(rows) {
+        const result = [];
+        const keys = ['state','show_limit','import_rate','export_rate','plan_phase','plan_rates_unavailable'];
+        const strategy = row => row.state === 'Demand' ? 'Self-use' :
+            row.state === 'Chrg' ? 'Charge ceiling' : row.plan_action;
+        const bucket = row => Math.floor(new Date(row.time).getTime() / 1800000);
+        for (const row of rows) {
+            const last = result[result.length - 1];
+            const same = last && row.time.slice(0,10) === last.time.slice(0,10) &&
+                Number.isFinite(bucket(row)) && bucket(last) === bucket(row) &&
+                last.plan_interval_end === row.time && keys.every(key => last[key] === row[key]) &&
+                (last.plan_ev_on_minutes > 0) === (row.plan_ev_on_minutes > 0) &&
+                strategy(row) === last.plan_action;
+            if (!same) {
+                result.push({...row, plan_action:strategy(row), plan_members:[row]});
+                continue;
+            }
+            last.plan_members.push(row);
+            last.plan_interval_end = row.plan_interval_end;
+            last.soc_end_percent = row.soc_end_percent;
+            last.soc_change += row.soc_change;
+            for (const key of ['pv_forecast','pv_forecast10','load_forecast','load_forecast10','car_charging','cost_change']) {
+                last[key] = Number.isFinite(last[key]) && Number.isFinite(row[key]) ? last[key] + row[key] : null;
+            }
+            last.plan_grid_peak_w = Math.max(last.plan_grid_peak_w || 0, row.plan_grid_peak_w || 0);
+            last.total_cost = row.total_cost;
+        }
+        for (const row of result) {
+            for (const key of ['pv_forecast','pv_forecast10','load_forecast','load_forecast10','car_charging']) {
+                if (Number.isFinite(row[key])) row[key] = Number(row[key].toFixed(3));
+            }
+        }
+        return result;
+    }
+
+    function compactPlanFlow(row) {
+        const labels = (row.plan_members || [row]).map(member => {
+            const steps = member.plan_steps || [];
+            if (!steps.length) return member.plan_reason || 'Flow unavailable';
+            const gaining = steps.some(step => Number.isFinite(step.battery_kw) && step.battery_kw < -0.03);
+            const supplying = steps.some(step => Number.isFinite(step.battery_kw) && step.battery_kw > 0.03);
+            const importing = steps.some(step => Number.isFinite(step.grid_kw) && step.grid_kw > 0.03);
+            if (gaining && supplying) return 'Variable flow';
+            if (gaining) return importing ? 'Battery gains · grid imports' : 'Solar → battery';
+            if (supplying) return 'Battery → demand';
+            return importing ? 'Grid → demand' : 'No battery flow';
+        });
+        const unique = [...new Set(labels)];
+        return unique.length === 1 ? unique[0] : row.state === 'Demand' ? 'Variable self-use' : 'Variable flow';
+    }
+
+    function showPlanInterval(button) {
+        const panel = document.getElementById(button.getAttribute('aria-controls'));
+        if (!panel) return;
+        panel.innerHTML = button.dataset.planDetail;
+        const table = button.closest('table');
+        if (table) table.querySelectorAll('[data-plan-detail]').forEach(item => item.setAttribute('aria-pressed', String(item === button)));
+    }
+
+    function compactPlanDetail(row) {
+        const reasons = [...new Set((row.plan_members || [row]).map(member => `${member.plan_action}: ${member.plan_reason}`))];
+        return `<p><b>${escapePlanText(formatTimeDisplay(row.time))}–${escapePlanText(formatTimeDisplay(row.plan_interval_end))}</b> · ${reasons.map(escapePlanText).join(' · ')}</p>` + planFlowDetail(row);
+    }
+
     function planFlowDetail(row) {
         const power = (value, positive, negative) => Number.isFinite(value) ?
             `${Math.abs(value).toFixed(2)} kW ${value > 0.03 ? positive : value < -0.03 ? negative : '(idle)'}` : '—';
@@ -7247,8 +7312,9 @@ def get_plan_renderer_js():
             if (combined || applied) editable = false;
             if ((combined || applied) && (jsonData.plan_unavailable || jsonData.execution_blocked)) return '<p>No fresh validated combined candidate is available. Previous simulation hidden.</p>';
             const clarity = (combined || applied) && jsonData.rows.length > 0 && jsonData.rows.every(row => row.plan_action);
+            const detailId = clarity ? `plan-selected-flow-${dropdownCounter++}` : '';
             if (clarity) {
-                const rows = showDebug ? jsonData.rows : groupPlanRows(jsonData.rows);
+                const rows = showDebug ? jsonData.rows : groupCompactPlanRows(jsonData.rows);
                 jsonData = {...jsonData, rows: rows.map(row => ({...row, state_text: row.plan_action,
                     state_color: row.plan_action === 'Charge' ? '#3AEE85' : row.plan_action === 'Hold' ? '#34DBEB' : '#FFFFFF'}))};
             }
@@ -7266,9 +7332,11 @@ def get_plan_renderer_js():
                 const money = value => Number.isFinite(value) ? `${escapePlanText(jsonData.currency_symbols?.[0] || '')}${value.toFixed(2)}` : '—';
                 const estimated = future.every(Number.isFinite) ? future.reduce((a,b) => a+b,0) : null;
                 html += `<p class="plan-cost-summary" style="white-space:normal">Recorded so far: <b>${money(jsonData.recorded_cost)}</b> · Forecast cost (shown horizon): <b>${money(estimated)}</b></p>`;
-                html += `<p style="font-size:0.9em;white-space:normal">Future forecast · Predbat local time (${zone}; each timestamp keeps its own offset). Targets are ceilings, not discharge orders. Flows are predictions, not hardware confirmation. Scroll the table sideways for all columns.</p>`;
-                html += '<style>.plan-table-scroll{max-width:100%;overflow-x:auto}.plan-table-scroll>table{min-width:960px;font-size:13px!important}.plan-table-scroll th{position:sticky;top:0;background:var(--bg-color,#fff);z-index:1}.plan-table-scroll td{vertical-align:top}.plan-table-scroll details table{font-size:0.85em;white-space:nowrap}.plan-table-scroll summary{cursor:pointer}.plan-table-scroll .plan-reason{min-width:10em;max-width:16em}</style>';
+                html += `<p style="font-size:0.9em;white-space:normal">Future forecast · ${zone}. Self-use includes solar storage and battery supply, not alternating control orders. Targets are ceilings. Select a time for five-minute detail; predictions are not hardware confirmation.</p>`;
+                html += '<style>.plan-table-scroll{max-width:100%;overflow-x:auto}.plan-table-scroll>table{min-width:960px;font-size:13px!important}.plan-table-scroll th{position:sticky;top:0;background:var(--bg-color,#fff);z-index:1}.plan-table-scroll>table>tbody>tr>td{height:36px;box-sizing:border-box;padding:4px 6px!important;vertical-align:middle;white-space:nowrap!important;line-height:20px}.plan-table-scroll .plan-reason{max-width:15em;overflow:hidden;text-overflow:ellipsis}.plan-interval-button{font:inherit;line-height:20px;padding:0 4px;min-height:24px;white-space:nowrap;cursor:pointer}.plan-interval-button[aria-pressed=true]{outline:2px solid currentColor}.plan-selected-detail{max-width:100%;overflow-x:auto;margin-top:8px;font-size:13px}.plan-selected-detail p{margin:4px 0}.plan-selected-detail summary{cursor:pointer}.plan-selected-detail td{white-space:nowrap}</style>';
             }
+            if (clarity) html += '<style>.plan-table-scroll th{color:var(--text-color,#111)}.plan-table-scroll>table{margin-top:8px!important;margin-bottom:8px!important}</style>';
+            if (clarity) html += `<section class="plan-selected-detail" aria-label="Selected interval details" aria-live="polite" id="${detailId}">${compactPlanDetail(jsonData.rows[0])}</section>`;
             html += '<div class="plan-table-scroll"><table>';
             const cellStyle = 'style="padding: 4px;"';
 
@@ -7317,9 +7385,9 @@ def get_plan_renderer_js():
             html += th('time', 'Time');
             html += showDebug ? th('import', `Import ${currencyMinor} (w/loss)`) : th('import', `Import ${currencyMinor}`);
             if (showExport) html += showDebug ? th('export', `Export ${currencyMinor} (w/loss)`) : th('export', `Export ${currencyMinor}`);
-            html += th('state', clarity ? 'Action' : 'State', ' colspan="2"');
+            html += th('state', clarity ? 'Strategy' : 'State', ' colspan="2"');
             html += th('limit', clarity ? 'Target %' : 'Limit %');
-            if (clarity) html += '<th>Reason</th>';
+            if (clarity) html += '<th title="Reason from predicted battery and grid power, not a control command">Expected flow</th>';
             html += showDebug ? th('pv', 'PV kWh (10%)') : th('pv', 'PV kWh');
             html += showDebug ? th('load', 'Load kWh (10%)') : th('load', 'Load kWh');
             if (showDebug) {
@@ -7360,9 +7428,10 @@ def get_plan_renderer_js():
                 if (editable) {
                     html += renderTimeCell(row.time, timeDisplay, overrides, row.slot_minute);
                 } else {
-                    const end = clarity ? `–${formatTimeDisplay(row.plan_interval_end)}` : '';
-                    const phase = clarity ? `<small style="display:block">${row.plan_phase === 'current' ? 'Current interval · forecast' : 'Future forecast'}</small>` : '';
-                    html += `<td id=time bgcolor=#FFFFFF>${timeDisplay}${end}${phase}${clarity ? planFlowDetail(row) : ''}</td>`;
+                    const sameDay = clarity && row.time.slice(0,10) === row.plan_interval_end?.slice(0,10);
+                    const end = clarity ? `–${sameDay ? row.plan_interval_end.slice(11,16) : formatTimeDisplay(row.plan_interval_end)}` : '';
+                    const interval = clarity ? `<button type="button" class="plan-interval-button" aria-controls="${detailId}" aria-pressed="${i === 0}" data-plan-detail="${escapePlanText(compactPlanDetail(row))}" onclick="showPlanInterval(this)">${timeDisplay}${end}</button>` : timeDisplay;
+                    html += `<td id=time bgcolor=#FFFFFF>${interval}</td>`;
                 }
 
                 // Import rate - formatted bold if in charge window, italic with symbol if estimated.
@@ -7446,7 +7515,7 @@ def get_plan_renderer_js():
                     const rowspanAttr = row.rowspan_limit > 0 ? ` rowspan="${row.rowspan_limit}"` : '';
                     html += `<td${rowspanAttr} bgcolor=#FFFFFF> ${row.show_limit || ''}</td>`;
                 }
-                if (clarity) html += `<td class="plan-reason" bgcolor="#FFFFFF">${escapePlanText(row.plan_reason)}</td>`;
+                if (clarity) html += `<td class="plan-reason" title="${escapePlanText(row.plan_reason)}" bgcolor="#FFFFFF">${escapePlanText(compactPlanFlow(row))}</td>`;
 
                 // PV forecast (with 10% value in brackets if debug mode)
                 let pvText = row.pv_forecast == 0 ? '&#9866;' : row.pv_forecast;
@@ -7496,7 +7565,7 @@ def get_plan_renderer_js():
                 }
 
                 // SOC
-                const socSym = row.soc_sym || (row.soc_change > 0 ? '&nearr;' : (row.soc_change < 0 ? '&searr;' : '&rarr;'));
+                const socSym = clarity && Number.isFinite(row.soc_end_percent) ? '' : row.soc_sym || (row.soc_change > 0 ? '&nearr;' : (row.soc_change < 0 ? '&searr;' : '&rarr;'));
                 if (editable) {
                     html += renderSocCell(row.time, timeDisplay, row.soc_percent, row.soc_color, socSym, overrides, row.slot_minute, scenarioTitle(jsonData, row, 'soc_percent', row.soc_percent));
                 } else {
@@ -7504,7 +7573,7 @@ def get_plan_renderer_js():
                     // combined solver can emit fractional battery_start_percent values
                     // (e.g. 29.999377993406732) that must not appear in the rendered table.
                     // Raw planning SOC/math is unchanged upstream — only this cell rounds.
-                    const endpoint = clarity && Number.isFinite(row.soc_end_percent) ? `<small style="display:block">→ ${Math.round(row.soc_end_percent)}% end</small>` : '';
+                    const endpoint = clarity && Number.isFinite(row.soc_end_percent) ? ` → ${Math.round(row.soc_end_percent)}%` : '';
                     html += `<td id=soc bgcolor=${row.soc_color || '#FFFFFF'}${scenarioTitle(jsonData, row, 'soc_percent', row.soc_percent)}>${Math.round(row.soc_percent)}${socSym}${endpoint}</td>`;
                 }
 

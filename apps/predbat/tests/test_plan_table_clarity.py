@@ -166,8 +166,18 @@ console.log('PASS: real plan renderer grouping, boundaries, cost, timezone and p
 
 def run_plan_table_clarity_tests():
     """Run clarity regressions through the existing applied-view test group."""
+    from tests.test_plan_compact_strategy import CompactStrategyTests
+
     failed = False
-    for test in (test_partial_visible_text_is_bounded, test_limited_replay_detail, test_replay_display_steps, test_plan_flow_labels, test_compact_banner_keeps_warnings_visible, test_plan_table_javascript):
+    for test in (
+        test_partial_visible_text_is_bounded,
+        test_limited_replay_detail,
+        test_replay_display_steps,
+        test_plan_flow_labels,
+        test_compact_banner_keeps_warnings_visible,
+        test_plan_table_javascript,
+        CompactStrategyTests().test_compact_strategy_contract,
+    ):
         try:
             test()
             print("PASS: " + test.__name__)
