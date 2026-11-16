@@ -47,6 +47,7 @@ from web_helper import (
     get_header_html,
     get_plan_css,
     get_plan_renderer_js,
+    get_plan_graph_js,
     get_editor_js,
     get_editor_css,
     get_log_css,
@@ -2933,6 +2934,9 @@ chart.render();
 
         # Include renderer JavaScript (which declares newestDataTimestamp variable)
         text += get_plan_renderer_js()
+        # The combined-plan graph is intentionally installed only on /plan; the
+        # shared table renderer and the annual viewer keep their existing path.
+        text += get_plan_graph_js()
 
         # Initialise newestDataTimestamp from the initial data loaded, and start automatic updates
         text += "<script>"
