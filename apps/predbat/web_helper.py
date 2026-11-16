@@ -8605,6 +8605,8 @@ def get_plan_graph_js():
     """Return the read-only combined-plan graph, scoped to the live /plan page."""
     text = r"""
     <style>
+    html:has(#planGraphRoot), body:has(#planGraphRoot) { border:0; }
+    body:has(#planGraphRoot) { margin:0; }
     #planGraphRoot {
         --pg-surface: #fff;
         --pg-soft: #f7faf7;
@@ -8618,8 +8620,9 @@ def get_plan_graph_js():
         --pg-warning-bg: #fff5df;
         color: var(--pg-ink);
         font-family: inherit;
-        margin: 0 auto 18px;
-        max-width: 1160px;
+        margin: 0 0 18px;
+        width: 100%;
+        max-width: none;
     }
     body.dark-mode #planGraphRoot {
         --pg-surface: #2d2d2d;
@@ -8634,28 +8637,40 @@ def get_plan_graph_js():
         --pg-warning-bg: #3e3422;
     }
     #planGraphRoot * { box-sizing: border-box; }
-    #planGraphRoot .pg-heading { display:flex; align-items:center; justify-content:space-between; gap:16px; margin: 18px 0 12px; }
+    #planGraphRoot .pg-heading { display:flex; align-items:center; justify-content:space-between; gap:16px; margin: 18px 14px 12px; }
     #planGraphRoot h2 { margin:0; color:var(--pg-ink); font-size:clamp(21px, 3vw, 29px); font-weight:620; letter-spacing:-.035em; }
-    #planGraphRoot .pg-subtitle { margin:5px 0 0; color:var(--pg-muted); font-size:12px; }
+    #planGraphRoot .pg-heading > div:first-child { min-width:0; }
+    #planGraphRoot .pg-subtitle { margin:5px 0 0; color:var(--pg-muted); font-size:12px; line-height:1.5; overflow-wrap:anywhere; white-space:normal; }
     #planGraphRoot .pg-range { display:inline-flex; flex:0 0 auto; gap:2px; padding:3px; border:1px solid var(--pg-line); border-radius:11px; background:var(--pg-soft); }
     #planGraphRoot .pg-range[hidden] { display:none; }
     #planGraphRoot .pg-range button { min-width:54px; padding:7px 10px; border:0; border-radius:8px; background:transparent; color:var(--pg-muted); font:inherit; font-size:12px; cursor:pointer; }
     #planGraphRoot .pg-range button[aria-pressed="true"] { background:var(--pg-surface); color:var(--pg-ink); box-shadow:0 1px 4px #0002; }
     #planGraphRoot button:focus-visible, #planGraphRoot svg:focus-visible { outline:3px solid #137e6a; outline-offset:3px; }
-    #planGraphRoot .pg-card { overflow:hidden; border:1px solid var(--pg-line); border-radius:19px; background:var(--pg-surface); box-shadow:0 9px 30px #24382b10; }
+    #planGraphRoot .pg-card { overflow:hidden; border-block:1px solid var(--pg-line); border-radius:0; background:var(--pg-surface); }
     #planGraphRoot .pg-chart-wrap { width:100%; padding:10px 14px 0; }
-    #planGraphRoot .pg-chart { display:block; width:100%; height:420px; overflow:visible; touch-action:manipulation; cursor:crosshair; }
+    #planGraphRoot .pg-chart { display:block; width:100%; height:600px; overflow:visible; touch-action:manipulation; cursor:crosshair; }
     #planGraphRoot .pg-chart text { font-family:inherit; user-select:none; }
     #planGraphRoot .pg-axis { fill:var(--pg-muted); font-size:12px; }
     #planGraphRoot .pg-axis-strong { fill:var(--pg-ink); font-weight:700; }
     #planGraphRoot .pg-caption { fill:var(--pg-muted); font-size:10px; font-weight:750; letter-spacing:.1em; }
     #planGraphRoot .pg-grid { stroke:var(--pg-line); stroke-width:1; }
+    #planGraphRoot .pg-time-grid { stroke:var(--pg-muted); stroke-width:1; opacity:.25; stroke-dasharray:3 4; }
+    #planGraphRoot .plan-graph-axis-label { font-size:13px; font-weight:650; }
     #planGraphRoot .pg-battery-line { fill:none; stroke:var(--pg-battery); stroke-width:3; stroke-linecap:round; }
-    #planGraphRoot .pg-solar-segment { fill:none; stroke:var(--pg-solar); stroke-width:2.5; stroke-linecap:round; }
+    #planGraphRoot .pg-solar-segment { fill:none; stroke:var(--pg-solar); stroke-width:3; stroke-linecap:round; }
+    #planGraphRoot .pg-solar-area { fill:var(--pg-solar); opacity:.24; }
     #planGraphRoot .pg-load-segment { fill:none; stroke:var(--pg-load); stroke-width:2.3; stroke-dasharray:5 3; stroke-linecap:round; }
+    #planGraphRoot .pg-ev-power { fill:none; stroke:#9c63d5; stroke-width:3.5; }
+    #planGraphRoot .pg-grid-power { fill:none; stroke:#408fc5; stroke-width:2; }
+    #planGraphRoot .pg-battery-power { fill:none; stroke:#b66b8a; stroke-width:2; stroke-dasharray:4 3; }
+    #planGraphRoot .pg-power-zero { stroke:var(--pg-muted); stroke-width:1.3; opacity:.65; }
+    #planGraphRoot .pg-car-summary { margin:0; padding:0 18px 14px; font-size:12px; color:var(--pg-muted); white-space:normal; }
     #planGraphRoot .pg-cursor { stroke:var(--pg-battery); stroke-width:1.2; stroke-dasharray:4 4; opacity:.78; }
     #planGraphRoot .pg-cursor-dot { fill:var(--pg-surface); stroke:var(--pg-battery); stroke-width:3; }
-    #planGraphRoot .pg-rate { fill:#2a9478; stroke:var(--pg-surface); stroke-width:.5; }
+    #planGraphRoot .pg-rate { stroke:var(--pg-surface); stroke-width:.5; }
+    #planGraphRoot .pg-rate-green { fill:#269765; background:#269765; }
+    #planGraphRoot .pg-rate-yellow { fill:#e9b72e; background:#e9b72e; }
+    #planGraphRoot .pg-rate-red { fill:#d94d48; background:#d94d48; }
     #planGraphRoot .pg-rate-unknown { fill:url(#planGraphHatch); stroke:var(--pg-line); stroke-width:.5; }
     #planGraphRoot .pg-ev { fill:url(#planGraphEvHatch); stroke:#8bb7a4; stroke-width:.7; }
     #planGraphRoot .pg-gap { fill:url(#planGraphHatch); stroke:#b9c4bb; stroke-width:.7; }
@@ -8665,7 +8680,10 @@ def get_plan_graph_js():
     #planGraphRoot .pg-key { width:18px; height:0; border-top:3px solid var(--pg-battery); }
     #planGraphRoot .pg-key-solar { border-color:var(--pg-solar); }
     #planGraphRoot .pg-key-load { border-color:var(--pg-load); border-top-style:dashed; }
-    #planGraphRoot .pg-key-rate { width:10px; height:10px; border:1px solid #aab7ad; border-radius:3px; background:#9ac8b8; }
+    #planGraphRoot .pg-key-car { border-color:#9c63d5; }
+    #planGraphRoot .pg-key-grid { border-color:#408fc5; }
+    #planGraphRoot .pg-key-battery-power { border-color:#b66b8a; border-top-style:dashed; }
+    #planGraphRoot .pg-key-rate { width:10px; height:10px; border:0; border-radius:2px; }
     #planGraphRoot .pg-key-ev { width:18px; height:10px; border:1px solid #8bb7a4; border-radius:3px; background:repeating-linear-gradient(135deg,#dceddf 0 3px,#a7cbbb 3px 4px); }
     #planGraphRoot .pg-details-button { display:inline-flex; flex:0 0 auto; align-items:center; gap:8px; min-height:39px; padding:0 13px; border:1px solid #bac9bd; border-radius:10px; background:var(--pg-surface); color:var(--pg-ink); font:inherit; font-size:12px; font-weight:650; cursor:pointer; }
     #planGraphRoot .pg-details-button:hover { background:var(--pg-soft); }
@@ -8693,12 +8711,12 @@ def get_plan_graph_js():
     @media (max-width:700px) {
         #planGraphRoot .pg-heading { align-items:flex-start; gap:10px; }
         #planGraphRoot .pg-chart-wrap { padding:7px 5px 0; }
-        #planGraphRoot .pg-chart { height:375px; }
+        #planGraphRoot .pg-chart { height:600px; }
         #planGraphRoot .pg-bottom { align-items:stretch; flex-direction:column; padding:5px 13px 13px; }
         #planGraphRoot .pg-details-button { align-self:flex-end; }
     }
     @media (max-width:430px) {
-        #planGraphRoot .pg-chart { height:350px; }
+        #planGraphRoot .pg-chart { height:600px; }
         #planGraphRoot .pg-legend { gap:8px 11px; }
         #planGraphRoot .pg-legend-item { font-size:10px; }
         #planGraphRoot dialog.pg-dialog { inset:auto 0 0; width:100%; height:auto; max-height:88dvh; border:0; border-top:1px solid var(--pg-line); border-radius:20px 20px 0 0; }
@@ -8832,7 +8850,7 @@ def get_plan_graph_js():
             return [24, 48].filter(hours => boundaries.has(origin + hours * HOUR_MS));
         }
 
-        function createShell(container) {
+        function createShell(container, data) {
             container.replaceChildren();
             const root = graphElement('section', 'plan-graph-root');
             root.id = 'planGraphRoot';
@@ -8862,7 +8880,13 @@ def get_plan_graph_js():
             legend.setAttribute('aria-label', 'Leyenda del gráfico');
             const legendItems = [
                 ['pg-key', 'Batería · %'], ['pg-key pg-key-solar', 'Solar · kW medios'],
-                ['pg-key pg-key-load', 'Hogar · kW medios'], ['pg-key pg-key-rate', 'Tarifa importación'],
+                ['pg-key pg-key-load', 'Hogar · kW medios'],
+                ['pg-key pg-key-car', 'Coche · kW medios'],
+                ['pg-key pg-key-grid', 'Red · +importación / −exportación'],
+                ['pg-key pg-key-battery-power', 'Batería · +descarga / −carga'],
+                ['pg-key-rate pg-rate-green', 'Red <10 ' + String(data?.currency_symbols?.[1] || '') + '/kWh'],
+                ['pg-key-rate pg-rate-yellow', 'Red 10–<20 ' + String(data?.currency_symbols?.[1] || '') + '/kWh'],
+                ['pg-key-rate pg-rate-red', 'Red ≥20 ' + String(data?.currency_symbols?.[1] || '') + '/kWh'],
                 ['pg-key pg-key-ev', 'VE · kWh reservados']
             ];
             legendItems.forEach(([keyClass, label]) => {
@@ -8875,7 +8899,9 @@ def get_plan_graph_js():
             detailsButton.type = 'button';
             detailsButton.disabled = true;
             bottom.append(legend, detailsButton);
-            card.append(chartWrap, bottom);
+            const carSummary = graphElement('p', 'pg-car-summary');
+            carSummary.id = 'planGraphCarSummary';
+            card.append(chartWrap, bottom, carSummary);
             const instructions = graphElement('p', 'pg-sr-only', 'Enfoca el gráfico y usa las flechas izquierda y derecha para seleccionar un intervalo. Pulsa Intro para abrir sus detalles.');
             instructions.id = 'planGraphInstructions';
             const announcement = graphElement('p', 'pg-sr-only', '');
@@ -8948,13 +8974,17 @@ def get_plan_graph_js():
             const focusWasInGraph = Boolean(activeElement && container.contains(activeElement));
             const previousFocusId = focusWasInGraph ? activeElement.id : '';
             const previousRange = focusWasInGraph && activeElement.dataset ? activeElement.dataset.range : '';
-            const ui = createShell(container);
+            const ui = createShell(container, data);
             ui.executionContext.hidden = !data || data.plan_execution !== true || Boolean(data.execution_blocked) || !validAppliedReceiptForDisplay(data);
             const blocked = Boolean(data && data.execution_blocked);
             const unavailable = data && (data.plan_unavailable === true || blocked);
             const authority = data && (data.plan_simulation === true || data.plan_execution === true);
             const normalised = normaliseRows(data);
             const rows = normalised.rows;
+            if (rows.length) {
+                const clock = ui.root.querySelector('.pg-subtitle');
+                clock.textContent += ' · ' + formatTime(rows[0].startMs, true, rows[0].source.time);
+            }
             function sourceTimestampAt(value) {
                 const exactStart = rows.find(row => row.startMs === value);
                 if (exactStart) return exactStart.source.time;
@@ -9059,13 +9089,13 @@ def get_plan_graph_js():
                 svg.append(defs);
 
                 chartWidth = Math.max(320, Math.round(svg.clientWidth || 1000));
-                plotLeft = chartWidth <= 430 ? 48 : 62;
-                plotRight = chartWidth <= 430 ? 16 : 24;
+                plotLeft = chartWidth <= 430 ? 42 : 62;
+                plotRight = chartWidth <= 430 ? 46 : 62;
                 plotWidth = chartWidth - plotLeft - plotRight;
-                svg.setAttribute('viewBox', '0 0 ' + chartWidth + ' 445');
+                svg.setAttribute('viewBox', '0 0 ' + chartWidth + ' 600');
                 const left = plotLeft, right = plotRight, xWidth = plotWidth;
-                const socTop = 30, socBottom = 168, powerTop = 226, powerBottom = 319;
-                const rateY = 356, rateHeight = 15, evY = 394, evHeight = 14;
+                const socTop = 50, socBottom = 400, powerTop = socTop, powerBottom = socBottom;
+                const rateY = 482, rateHeight = 22, evY = 548, evHeight = 18;
                 const span = Math.max(1, displayEndMs - originMs);
                 const xAt = time => left + ((time - originMs) / span) * xWidth;
                 const ySoc = value => socBottom - (Math.max(0, Math.min(100, value)) / 100) * (socBottom - socTop);
@@ -9074,35 +9104,70 @@ def get_plan_graph_js():
                     const durationHours = (row.endMs - row.startMs) / HOUR_MS;
                     row.pvKw = row.pvKwh === null ? null : row.pvKwh / durationHours;
                     row.loadKw = row.loadKwh === null ? null : row.loadKwh / durationHours;
+                    row.evKw = row.evKwh === null ? null : row.evKwh / durationHours;
                     if (isFiniteNumber(row.pvKw)) validPower.push(row.pvKw);
                     if (isFiniteNumber(row.loadKw)) validPower.push(row.loadKw);
+                    if (isFiniteNumber(row.evKw)) validPower.push(row.evKw);
+                    // Plot published subinterval power only with complete, ordered
+                    // coverage. Do not infer grid/battery power from SoC or load.
+                    let previousEnd = row.startMs;
+                    let stepsValid = Array.isArray(row.source.plan_steps) && row.source.plan_steps.length > 0;
+                    row.powerSteps = [];
+                    if (stepsValid) row.source.plan_steps.forEach(step => {
+                        const start = Date.parse(step?.start), end = Date.parse(step?.end);
+                        if (start !== previousEnd || !Number.isFinite(end) || end <= start || end > row.endMs || !isFiniteNumber(step?.grid_kw) || (step?.battery_kw != null && !isFiniteNumber(step.battery_kw))) stepsValid = false;
+                        row.powerSteps.push({start, end, grid:step?.grid_kw, battery:step?.battery_kw});
+                        previousEnd = end;
+                    });
+                    if (!stepsValid || previousEnd !== row.endMs) row.powerSteps = [];
+                    row.powerSteps.forEach(step => {
+                        validPower.push(step.grid);
+                        if (isFiniteNumber(step.battery)) validPower.push(step.battery);
+                    });
                 });
                 const powerMax = Math.max(1, Math.ceil(Math.max(0, ...validPower)));
-                const yPower = value => powerBottom - (value / powerMax) * (powerBottom - powerTop);
+                const powerMin = Math.min(0, Math.floor(Math.min(0, ...validPower)));
+                const yPower = value => powerBottom - ((value - powerMin) / (powerMax - powerMin)) * (powerBottom - powerTop);
                 const xEnd = chartWidth - right;
 
                 [0, 20, 40, 60, 80, 100].forEach(value => {
                     const y = ySoc(value);
-                    svg.append(graphSvg('line', {class:'pg-grid', x1:left, y1:y, x2:xEnd, y2:y}));
-                    svg.append(graphSvg('text', {class:'pg-axis', x:left - 9, y:y + 4, 'text-anchor':'end'}, value + '%'));
+                    svg.append(graphSvg('text', {class:'pg-axis pg-soc-axis', x:xEnd + 9, y:y + 4, 'text-anchor':'start'}, value + '%'));
                 });
-                svg.append(graphSvg('text', {class:'pg-caption', x:left, y:19}, 'BATERÍA · %'));
-                svg.append(graphSvg('text', {class:'pg-caption', x:left, y:211}, 'POTENCIA MEDIA · kW'));
-                [0, powerMax / 2, powerMax].forEach(value => {
+                svg.append(graphSvg('text', {class:'pg-caption', x:left, y:23}, 'POTENCIA · kW'));
+                svg.append(graphSvg('text', {class:'pg-caption', x:xEnd, y:23, 'text-anchor':'end'}, 'BATERÍA · %'));
+                [powerMin, powerMin + (powerMax - powerMin) / 4, (powerMin + powerMax) / 2, powerMin + (powerMax - powerMin) * .75, powerMax].forEach(value => {
                     const y = yPower(value);
                     svg.append(graphSvg('line', {class:'pg-grid', x1:left, y1:y, x2:xEnd, y2:y}));
-                    svg.append(graphSvg('text', {class:'pg-axis', x:left - 9, y:y + 4, 'text-anchor':'end'}, formatNumber(value, value % 1 ? 1 : 0)));
+                    svg.append(graphSvg('text', {class:'pg-axis pg-power-axis', x:left - 9, y:y + 4, 'text-anchor':'end'}, formatNumber(value, value % 1 ? 1 : 0)));
                 });
+                svg.append(graphSvg('line', {class:'pg-power-zero', x1:left, y1:yPower(0), x2:xEnd, y2:yPower(0)}));
 
                 const rangeHours = span / HOUR_MS;
-                const tickCount = Math.max(2, Math.min(6, Math.floor(xWidth / 100)));
-                for (let tick = 0; tick <= tickCount; tick += 1) {
-                    const time = originMs + (span * tick / tickCount);
+                const siteOffset = (offsetMinutes(shown[0].source.time) || 0) * 60000;
+                const firstHour = Math.ceil((originMs + siteOffset) / HOUR_MS) * HOUR_MS - siteOffset;
+                const minimumLabelGap = 70;
+                let previousLabelX = left;
+                const labelledTimes = [originMs];
+                for (let time = firstHour; time < displayEndMs; time += HOUR_MS) {
                     const x = xAt(time);
-                    const anchor = tick === 0 ? 'start' : (tick === tickCount ? 'end' : 'middle');
-                    svg.append(graphSvg('line', {class:'pg-grid', x1:x, y1:socBottom, x2:x, y2:evY + evHeight + 4}));
-                    svg.append(graphSvg('text', {class:'pg-axis pg-graph-axis-label plan-graph-axis-label', x, y:190, 'text-anchor':anchor}, formatTime(time, false, sourceTimestampAt(time))));
+                    svg.append(graphSvg('line', {class:'pg-time-grid', x1:x, y1:socTop, x2:x, y2:evY + evHeight + 4}));
+                    if (x - previousLabelX >= minimumLabelGap && xEnd - x >= minimumLabelGap) {
+                        labelledTimes.push(time);
+                        previousLabelX = x;
+                    }
                 }
+                labelledTimes.push(displayEndMs);
+                labelledTimes.forEach((time, tick) => {
+                    const anchor = tick === 0 ? 'start' : (tick === labelledTimes.length - 1 ? 'end' : 'middle');
+                    const fullTime = formatTime(time, false, sourceTimestampAt(time));
+                    const label = fullTime.split(' ')[0];
+                    [430, 590].forEach(y => {
+                        const axisClass = y === 430 ? 'pg-axis pg-graph-axis-label plan-graph-axis-label' : 'pg-axis pg-time-bottom';
+                        const text = graphSvg('text', {class:axisClass, x:xAt(time), y, 'text-anchor':anchor, 'aria-label':formatTime(time, true, sourceTimestampAt(time))}, label);
+                        svg.append(text);
+                    });
+                });
 
                 for (let index = 1; index < shown.length; index += 1) {
                     const previous = shown[index - 1], next = shown[index];
@@ -9113,11 +9178,8 @@ def get_plan_graph_js():
                     }
                 }
 
-                svg.append(graphSvg('text', {class:'pg-caption', x:left, y:344}, 'TARIFA DE IMPORTACIÓN'));
-                svg.append(graphSvg('text', {class:'pg-caption', x:left, y:386}, 'VE · kWh'));
-                const finiteRates = shown.map(row => row.rate).filter(isFiniteNumber);
-                const minRate = finiteRates.length ? Math.min(...finiteRates) : 0;
-                const maxRate = finiteRates.length ? Math.max(...finiteRates) : 0;
+                svg.append(graphSvg('text', {class:'pg-caption', x:left, y:468}, 'TARIFA DE RED · ' + String(data.currency_symbols?.[1] || '') + '/kWh'));
+                svg.append(graphSvg('text', {class:'pg-caption', x:left, y:534}, 'VE · kWh'));
                 shown.forEach(row => {
                     const x0 = xAt(row.startMs), x1 = xAt(row.endMs), durationHours = (row.endMs - row.startMs) / HOUR_MS;
                     if (row.socStart !== null && row.socEnd !== null) {
@@ -9126,6 +9188,7 @@ def get_plan_graph_js():
                         svg.append(battery);
                     }
                     if (isFiniteNumber(row.pvKw)) {
+                        svg.append(graphSvg('path', {class:'pg-solar-area', d:'M ' + x0 + ' ' + yPower(0) + ' V ' + yPower(row.pvKw) + ' H ' + x1 + ' V ' + yPower(0) + ' Z'}));
                         const solar = graphSvg('path', {class:'pg-solar-segment plan-graph-solar-segment', d:'M ' + x0 + ' ' + yPower(row.pvKw) + ' H ' + x1});
                         svgTitle(solar, 'Solar: ' + formatNumber(row.pvKw, 2) + ' kW medios (' + formatNumber(row.pvKwh, 2) + ' kWh en ' + formatNumber(durationHours, 2) + ' h)');
                         svg.append(solar);
@@ -9135,9 +9198,21 @@ def get_plan_graph_js():
                         svgTitle(load, 'Hogar: ' + formatNumber(row.loadKw, 2) + ' kW medios (' + formatNumber(row.loadKwh, 2) + ' kWh en ' + formatNumber(durationHours, 2) + ' h)');
                         svg.append(load);
                     }
-                    const rateRange = maxRate - minRate;
-                    const relativeRate = row.rate === null || !Number.isFinite(rateRange) || rateRange <= 0 ? 1 : Math.max(0, Math.min(1, (row.rate - minRate) / rateRange));
-                    const rateRect = graphSvg('rect', {class:row.rate === null ? 'pg-rate-unknown' : 'pg-rate', x:x0, y:rateY, width:Math.max(.5, x1 - x0), height:rateHeight, opacity:row.rate === null ? 1 : .35 + .65 * relativeRate});
+                    if (isFiniteNumber(row.evKw)) {
+                        const car = graphSvg('path', {class:'pg-ev-power plan-graph-ev-power', d:'M ' + x0 + ' ' + yPower(row.evKw) + ' H ' + x1});
+                        svgTitle(car, 'Coche: ' + formatNumber(row.evKw, 2) + ' kW medios · ' + formatNumber(row.evKwh, 3) + ' kWh previstos');
+                        svg.append(car);
+                    }
+                    row.powerSteps.forEach(step => {
+                        [['grid', 'pg-grid-power plan-graph-grid-power', 'Red · +importación / −exportación'], ['battery', 'pg-battery-power plan-graph-battery-power', 'Batería · +descarga / −carga']].forEach(([key, className, label]) => {
+                            if (!isFiniteNumber(step[key])) return;
+                            const path = graphSvg('path', {class:className, d:'M ' + xAt(step.start) + ' ' + yPower(step[key]) + ' H ' + xAt(step.end)});
+                            svgTitle(path, label + ': ' + formatNumber(step[key], 2) + ' kW previstos');
+                            svg.append(path);
+                        });
+                    });
+                    const rateClass = row.rate === null ? 'pg-rate-unknown' : 'pg-rate pg-rate-' + (row.rate < 10 ? 'green' : row.rate < 20 ? 'yellow' : 'red');
+                    const rateRect = graphSvg('rect', {class:rateClass, x:x0, y:rateY, width:Math.max(.5, x1 - x0), height:rateHeight});
                     svgTitle(rateRect, row.rate === null ? 'Tarifa no disponible para este intervalo' : 'Importación: ' + formatNumber(row.rate, 2) + ' ' + String(data.currency_symbols?.[1] || '') + '/kWh');
                     svg.append(rateRect);
                     if (row.evKwh !== null && row.evKwh > 0) {
@@ -9146,6 +9221,13 @@ def get_plan_graph_js():
                         svg.append(ev);
                     }
                 });
+                const carEnergyKnown = shown.every(row => row.evKwh !== null);
+                const carEnergy = shown.reduce((sum, row) => sum + (row.evKwh || 0), 0);
+                ui.root.querySelector('#planGraphCarSummary').textContent = !carEnergyKnown
+                    ? 'Coche · energía prevista (kWh) incompleta: hay intervalos sin datos; no se sustituyen por cero.'
+                    : carEnergy > 0
+                        ? 'Coche · ' + formatNumber(carEnergy, 2) + ' kWh previstos en este horizonte. La curva muestra potencia media, no confirma carga física.'
+                        : 'Coche · sin carga prevista en este horizonte (0 kWh). No indica que esté desconectado ni confirma su estado físico.';
 
                 const selected = shown[Math.min(selectedIndex, shown.length - 1)];
                 const cursorX = xAt((selected.startMs + selected.endMs) / 2);

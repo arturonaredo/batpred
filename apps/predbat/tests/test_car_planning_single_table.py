@@ -928,7 +928,7 @@ document.querySelector('#planGraphClose').click();
     assert result["solarSegmentCount"] < result["inputRows"], result
     assert "valor" in result["invalidValueWarning"].lower(), result
     assert result["gapCount"] > 0, result
-    assert "UTC" in result["axis"], result
+    assert "03:45" in result["axis"], result
     assert result["initiallyClosed"] and result["focusOnOpen"] == "planGraphClose", result
     assert result["drawerLabelled"], result
     assert result["timestampHidden"] and result["drawerHasPublishedTimestamp"], result
@@ -978,6 +978,7 @@ const axisFont = Math.min(...Array.from(chart.querySelectorAll('.pg-axis')).filt
 const axisBounds = initialAxes.map(el => el.getBoundingClientRect()).sort((a,b) => a.left - b.left);
 const axesDoNotOverlap = axisBounds.every((rect, index) => index === 0 || axisBounds[index - 1].right <= rect.left + 1);
 const axis = initialAxes.map(el => el.textContent).join(' ');
+const axisDates = initialAxes.map(el => el.getAttribute('aria-label')).join(' ');
 const pageDoesNotOverflow = document.documentElement.scrollWidth <= innerWidth;
 chart.focus();
 for (let index = 0; index < 6; index += 1) chart.dispatchEvent(new KeyboardEvent('keydown', {key:'ArrowRight', bubbles:true}));
@@ -1001,14 +1002,14 @@ chart.dispatchEvent(new KeyboardEvent('keydown', {key:'ArrowRight', bubbles:true
 const grossSocHasNoDot = chart.querySelectorAll('.pg-cursor-dot').length === 0;
 const invalidValueWarning = document.querySelector('#planGraphAlert').textContent;
 document.getElementById('graphTestResults').textContent = JSON.stringify({
-  axis, axisFont, axesDoNotOverlap, pageDoesNotOverflow, movedAwayFromFirst, pointerSelectsFirst,
+  axis, axisDates, axisFont, axesDoNotOverlap, pageDoesNotOverflow, movedAwayFromFirst, pointerSelectsFirst,
   clippedSocLine, detailText, missingSocHasNoDot, grossSocHasNoDot, invalidValueWarning
 });
 """
     result = _run_plan_graph_browser(data, exercise, viewport_width=360, timezone_id="UTC")
     if result is None:
         return
-    assert "01:15" in result["axis"] and "UTC+01:00" in result["axis"] and "UTC" in result["axis"], result
+    assert "01:15" in result["axis"] and "UTC+01:00" in result["axisDates"] and "UTC" in result["axisDates"], result
     assert result["axisFont"] >= 9, result
     assert result["axesDoNotOverlap"] and result["pageDoesNotOverflow"], result
     assert result["movedAwayFromFirst"] and result["pointerSelectsFirst"], result
@@ -1497,9 +1498,101 @@ def test_original_table_colours_and_totals():
     assert view["totals"] == {"pv_forecast": 0.2, "load_forecast": 0.5, "car_charging": 0.56, "soc_percent": 51, "total_cost": 1.37, "clipped": 0}
 
 
+def test_plan_graph_full_width_hour_grid_solar_and_rate_bands():
+    """The graph uses available width, clear hourly references and honest tariff bands."""
+    rows = _plan_graph_browser_rows()
+    for index, rate in enumerate([-1, 9.999, 10, 19.999, 20, 45, None]):
+        rows[index]["import_rate"] = rate
+    rows[7]["pv_forecast"] = None
+    data = {"timestamp": datetime.now(timezone.utc).isoformat(), "plan_simulation": True, "currency_symbols": ["€", "c"], "rows": rows}
+    exercise = r"""
+refreshPlan();
+const root = document.getElementById('planGraphRoot');
+const svg = document.getElementById('planGraphSvg');
+const ticks = [...svg.querySelectorAll('.plan-graph-axis-label')];
+const grids = [...svg.querySelectorAll('.pg-time-grid')];
+const rates = [...svg.querySelectorAll('.pg-rate, .pg-rate-unknown')];
+const solar = svg.querySelector('.pg-solar-area');
+const plot = svg.querySelector('.plan-graph-solar-segment').getBBox();
+document.getElementById('graphTestResults').textContent = JSON.stringify({
+    width:root.getBoundingClientRect().width,
+    available:document.getElementById('planContainer').getBoundingClientRect().width,
+    height:svg.getBoundingClientRect().height,
+    shortHours:ticks.every(t=>/^\d{2}:\d{2}$/.test(t.textContent)),
+    wholeHour:ticks.slice(1,-1).every(t=>t.textContent.endsWith(':00')),
+    gridAcross:grids.length>20 && grids.every(g=>Number(g.getAttribute('y1'))<=50 && Number(g.getAttribute('y2'))>=500),
+    bands:rates.slice(0,7).map(r=>r.getAttribute('class')),
+    areaCount:svg.querySelectorAll('.pg-solar-area').length,
+    solarCount:svg.querySelectorAll('.plan-graph-solar-segment').length,
+    solarHeight:solar ? solar.getBBox().height : 0,
+    legend:root.querySelector('.pg-legend').textContent,
+    noOverflow:document.documentElement.scrollWidth<=innerWidth,
+    firstPower:plot.y
+});
+"""
+    result = _run_plan_graph_browser(data, exercise, viewport_width=1920)
+    if result is None:
+        return
+    assert result["width"] >= result["available"] - 2, result
+    assert result["height"] >= 580, result
+    assert result["shortHours"] and result["wholeHour"] and result["gridAcross"], result
+    assert ["green" in band for band in result["bands"][:2]] == [True, True], result
+    assert all("yellow" in band for band in result["bands"][2:4]), result
+    assert all("red" in band for band in result["bands"][4:6]), result
+    assert "unknown" in result["bands"][6], result
+    assert result["areaCount"] == result["solarCount"] == len(rows) - 1, result
+    assert result["solarHeight"] > 80, result
+    assert "&lt;10" in result["legend"] and "≥20" in result["legend"], result
+    assert result["noOverflow"], result
+
+
+def test_plan_graph_combines_power_soc_car_and_native_flows():
+    """One shared plot has kW left, SoC right and real signed native/EV power."""
+    rows = _plan_graph_browser_rows()
+    for index, row in enumerate(rows):
+        row["plan_steps"] = [{"start": row["time"], "end": row["plan_interval_end"], "battery_kw": -2 if index == 0 else 1, "grid_kw": 3 if index == 0 else -0.4}]
+    rows[2]["plan_steps"][0]["end"] = rows[2]["time"]  # Invalid coverage is not drawn.
+    rows[3]["car_charging"] = None
+    data = {"timestamp": datetime.now(timezone.utc).isoformat(), "plan_simulation": True, "currency_symbols": ["€", "c"], "rows": rows}
+    exercise = r"""
+refreshPlan();
+const svg=document.querySelector('#planGraphSvg');
+const title=cls=>svg.querySelector(cls+' title')?.textContent||'';
+const point=cls=>svg.querySelector(cls).getBBox();
+const axis=[...svg.querySelectorAll('.pg-soc-axis')];
+const zero=svg.querySelector('.pg-power-zero');
+const bounds=svg.getBoundingClientRect();
+document.getElementById('graphTestResults').textContent=JSON.stringify({
+ rightAxis:axis.length===6 && axis.every(e=>e.getBBox().x>bounds.width-55),
+ leftAxis:svg.querySelectorAll('.pg-power-axis').length>=3,
+ sharedPlot:Math.abs(point('.plan-graph-battery-line').y-point('.plan-graph-solar-segment').y)<350,
+ socSpan:axis.map(e=>+e.getAttribute('y')).reduce((a,b)=>Math.max(a,b),0)-Math.min(...axis.map(e=>+e.getAttribute('y'))),
+ evCount:svg.querySelectorAll('.plan-graph-ev-power').length,
+ gridCount:svg.querySelectorAll('.plan-graph-grid-power').length,
+ batteryCount:svg.querySelectorAll('.plan-graph-battery-power').length,
+ gridTitle:title('.plan-graph-grid-power'),batteryTitle:title('.plan-graph-battery-power'),
+ zeroInside:zero && +zero.getAttribute('y1')>50 && +zero.getAttribute('y1')<400,
+ carSummary:document.querySelector('#planGraphCarSummary')?.textContent||'',
+ noWrites:!svg.querySelector('input,select')
+});
+"""
+    result = _run_plan_graph_browser(data, exercise)
+    if result is None:
+        return
+    assert result["rightAxis"] and result["leftAxis"] and result["sharedPlot"], result
+    assert result["socSpan"] >= 300, result
+    assert result["evCount"] == len(rows) - 1, result
+    assert result["gridCount"] == result["batteryCount"] == len(rows) - 1, result
+    assert "3,00" in result["gridTitle"] and "-2,00" in result["batteryTitle"], result
+    assert result["zeroInside"] and result["noWrites"], result
+    assert "Coche" in result["carSummary"] and "kWh" in result["carSummary"], result
+
+
 def run_car_planning_single_table_tests(base):
     """Run all single-table integration regressions against the live web stack."""
     tests = [
+        test_plan_graph_combines_power_soc_car_and_native_flows,
+        test_plan_graph_full_width_hour_grid_solar_and_rate_bands,
         test_pv_colour_matches_displayed_energy,
         test_build_car_planning_plan_view_marks_car_planning_simulation,
         test_native_soc_rounding_at_full_battery,
