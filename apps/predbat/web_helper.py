@@ -8659,14 +8659,13 @@ def get_plan_graph_js():
     #planGraphRoot .pg-battery-line { fill:none; stroke:var(--pg-battery); stroke-width:3; stroke-linecap:round; }
     #planGraphRoot .pg-solar-segment { fill:none; stroke:var(--pg-solar); stroke-width:3; stroke-linecap:round; }
     #planGraphRoot .pg-solar-area { fill:var(--pg-solar); opacity:.24; }
-    #planGraphRoot .pg-load-segment { fill:none; stroke:var(--pg-load); stroke-width:2.3; stroke-dasharray:5 3; stroke-linecap:round; }
+    #planGraphRoot .pg-load-segment { fill:none; stroke:var(--pg-load); stroke-width:2.3; stroke-linejoin:round; }
     #planGraphRoot .pg-ev-power { fill:none; stroke:#9c63d5; stroke-width:3.5; }
     #planGraphRoot .pg-grid-power { fill:none; stroke:#408fc5; stroke-width:2; }
-    #planGraphRoot .pg-battery-power { fill:none; stroke:#b66b8a; stroke-width:2; stroke-dasharray:4 3; }
+    #planGraphRoot .pg-battery-power { fill:none; stroke:#b66b8a; stroke-width:2; stroke-linejoin:round; }
     #planGraphRoot .pg-power-zero { stroke:var(--pg-muted); stroke-width:1.3; opacity:.65; }
     #planGraphRoot .pg-car-summary { margin:0; padding:0 18px 14px; font-size:12px; color:var(--pg-muted); white-space:normal; }
     #planGraphRoot .pg-cursor { stroke:var(--pg-battery); stroke-width:1.2; stroke-dasharray:4 4; opacity:.78; }
-    #planGraphRoot .pg-cursor-dot { fill:var(--pg-surface); stroke:var(--pg-battery); stroke-width:3; }
     #planGraphRoot .pg-rate { stroke:var(--pg-surface); stroke-width:.5; }
     #planGraphRoot .pg-rate-green { fill:#269765; background:#269765; }
     #planGraphRoot .pg-rate-yellow { fill:#e9b72e; background:#e9b72e; }
@@ -8679,10 +8678,10 @@ def get_plan_graph_js():
     #planGraphRoot .pg-legend-item { display:inline-flex; align-items:center; gap:7px; color:var(--pg-muted); font-size:11px; }
     #planGraphRoot .pg-key { width:18px; height:0; border-top:3px solid var(--pg-battery); }
     #planGraphRoot .pg-key-solar { border-color:var(--pg-solar); }
-    #planGraphRoot .pg-key-load { border-color:var(--pg-load); border-top-style:dashed; }
+    #planGraphRoot .pg-key-load { border-color:var(--pg-load); }
     #planGraphRoot .pg-key-car { border-color:#9c63d5; }
     #planGraphRoot .pg-key-grid { border-color:#408fc5; }
-    #planGraphRoot .pg-key-battery-power { border-color:#b66b8a; border-top-style:dashed; }
+    #planGraphRoot .pg-key-battery-power { border-color:#b66b8a; }
     #planGraphRoot .pg-key-rate { width:10px; height:10px; border:0; border-radius:2px; }
     #planGraphRoot .pg-key-ev { width:18px; height:10px; border:1px solid #8bb7a4; border-radius:3px; background:repeating-linear-gradient(135deg,#dceddf 0 3px,#a7cbbb 3px 4px); }
     #planGraphRoot .pg-details-button { display:inline-flex; flex:0 0 auto; align-items:center; gap:8px; min-height:39px; padding:0 13px; border:1px solid #bac9bd; border-radius:10px; background:var(--pg-surface); color:var(--pg-ink); font:inherit; font-size:12px; font-weight:650; cursor:pointer; }
@@ -9128,6 +9127,13 @@ def get_plan_graph_js():
                 const powerMax = Math.max(1, Math.ceil(Math.max(0, ...validPower)));
                 const powerMin = Math.min(0, Math.floor(Math.min(0, ...validPower)));
                 const yPower = value => powerBottom - ((value - powerMin) / (powerMax - powerMin)) * (powerBottom - powerTop);
+                function powerLine(start, end, value, previous) {
+                    // A vertical boundary joins adjacent interval means, never
+                    // a slope suggesting unobserved intermediate power values.
+                    const connected = previous && previous.end === start && isFiniteNumber(previous.value);
+                    return 'M ' + xAt(start) + ' ' + yPower(connected ? previous.value : value)
+                        + (connected ? ' V ' + yPower(value) : '') + ' H ' + xAt(end);
+                }
                 const xEnd = chartWidth - right;
 
                 [0, 20, 40, 60, 80, 100].forEach(value => {
@@ -9180,7 +9186,10 @@ def get_plan_graph_js():
 
                 svg.append(graphSvg('text', {class:'pg-caption', x:left, y:468}, 'TARIFA DE RED · ' + String(data.currency_symbols?.[1] || '') + '/kWh'));
                 svg.append(graphSvg('text', {class:'pg-caption', x:left, y:534}, 'VE · kWh'));
-                shown.forEach(row => {
+                const previousNative = {grid:null, battery:null};
+                shown.forEach((row, index) => {
+                    const previous = shown[index - 1];
+                    const previousPower = key => previous ? {end:previous.endMs, value:previous[key]} : null;
                     const x0 = xAt(row.startMs), x1 = xAt(row.endMs), durationHours = (row.endMs - row.startMs) / HOUR_MS;
                     if (row.socStart !== null && row.socEnd !== null) {
                         const battery = graphSvg('path', {class:'pg-battery-line plan-graph-battery-line', d:'M ' + x0 + ' ' + ySoc(row.socStart) + ' L ' + x1 + ' ' + ySoc(row.socEnd)});
@@ -9189,28 +9198,32 @@ def get_plan_graph_js():
                     }
                     if (isFiniteNumber(row.pvKw)) {
                         svg.append(graphSvg('path', {class:'pg-solar-area', d:'M ' + x0 + ' ' + yPower(0) + ' V ' + yPower(row.pvKw) + ' H ' + x1 + ' V ' + yPower(0) + ' Z'}));
-                        const solar = graphSvg('path', {class:'pg-solar-segment plan-graph-solar-segment', d:'M ' + x0 + ' ' + yPower(row.pvKw) + ' H ' + x1});
+                        const solar = graphSvg('path', {class:'pg-solar-segment plan-graph-solar-segment', d:powerLine(row.startMs, row.endMs, row.pvKw, previousPower('pvKw'))});
                         svgTitle(solar, 'Solar: ' + formatNumber(row.pvKw, 2) + ' kW medios (' + formatNumber(row.pvKwh, 2) + ' kWh en ' + formatNumber(durationHours, 2) + ' h)');
                         svg.append(solar);
                     }
                     if (isFiniteNumber(row.loadKw)) {
-                        const load = graphSvg('path', {class:'pg-load-segment plan-graph-load-segment', d:'M ' + x0 + ' ' + yPower(row.loadKw) + ' H ' + x1});
+                        const load = graphSvg('path', {class:'pg-load-segment plan-graph-load-segment', d:powerLine(row.startMs, row.endMs, row.loadKw, previousPower('loadKw'))});
                         svgTitle(load, 'Hogar: ' + formatNumber(row.loadKw, 2) + ' kW medios (' + formatNumber(row.loadKwh, 2) + ' kWh en ' + formatNumber(durationHours, 2) + ' h)');
                         svg.append(load);
                     }
+                    if (!row.powerSteps.length) { previousNative.grid = null; previousNative.battery = null; }
+                    row.powerSteps.forEach(step => {
+                        [['grid', 'pg-grid-power plan-graph-grid-power', 'Red · +importación / −exportación'], ['battery', 'pg-battery-power plan-graph-battery-power', 'Batería · +descarga / −carga']].forEach(([key, className, label]) => {
+                            if (!isFiniteNumber(step[key])) { previousNative[key] = null; return; }
+                            const path = graphSvg('path', {class:className, d:powerLine(step.start, step.end, step[key], previousNative[key])});
+                            svgTitle(path, label + ': ' + formatNumber(step[key], 2) + ' kW previstos');
+                            svg.append(path);
+                            previousNative[key] = {end:step.end, value:step[key]};
+                        });
+                    });
+                    // Keep the car visible even when its zero line coincides
+                    // with grid power. It shares the main kW axis, not a strip.
                     if (isFiniteNumber(row.evKw)) {
-                        const car = graphSvg('path', {class:'pg-ev-power plan-graph-ev-power', d:'M ' + x0 + ' ' + yPower(row.evKw) + ' H ' + x1});
+                        const car = graphSvg('path', {class:'pg-ev-power plan-graph-ev-power', d:powerLine(row.startMs, row.endMs, row.evKw, previousPower('evKw'))});
                         svgTitle(car, 'Coche: ' + formatNumber(row.evKw, 2) + ' kW medios · ' + formatNumber(row.evKwh, 3) + ' kWh previstos');
                         svg.append(car);
                     }
-                    row.powerSteps.forEach(step => {
-                        [['grid', 'pg-grid-power plan-graph-grid-power', 'Red · +importación / −exportación'], ['battery', 'pg-battery-power plan-graph-battery-power', 'Batería · +descarga / −carga']].forEach(([key, className, label]) => {
-                            if (!isFiniteNumber(step[key])) return;
-                            const path = graphSvg('path', {class:className, d:'M ' + xAt(step.start) + ' ' + yPower(step[key]) + ' H ' + xAt(step.end)});
-                            svgTitle(path, label + ': ' + formatNumber(step[key], 2) + ' kW previstos');
-                            svg.append(path);
-                        });
-                    });
                     const rateClass = row.rate === null ? 'pg-rate-unknown' : 'pg-rate pg-rate-' + (row.rate < 10 ? 'green' : row.rate < 20 ? 'yellow' : 'red');
                     const rateRect = graphSvg('rect', {class:rateClass, x:x0, y:rateY, width:Math.max(.5, x1 - x0), height:rateHeight});
                     svgTitle(rateRect, row.rate === null ? 'Tarifa no disponible para este intervalo' : 'Importación: ' + formatNumber(row.rate, 2) + ' ' + String(data.currency_symbols?.[1] || '') + '/kWh');
@@ -9231,9 +9244,7 @@ def get_plan_graph_js():
 
                 const selected = shown[Math.min(selectedIndex, shown.length - 1)];
                 const cursorX = xAt((selected.startMs + selected.endMs) / 2);
-                const cursorY = selected.socStart === null ? socTop : ySoc(selected.socStart);
                 svg.append(graphSvg('line', {class:'pg-cursor', x1:cursorX, y1:socTop, x2:cursorX, y2:evY + evHeight + 3}));
-                if (selected.socStart !== null) svg.append(graphSvg('circle', {class:'pg-cursor-dot', cx:cursorX, cy:cursorY, r:5}));
                 svg.setAttribute('aria-label', 'Plan de ' + formatNumber(rangeHours, 1) + ' horas. Intervalo seleccionado de ' + formatTime(selected.startMs, true, selected.source.time) + ' a ' + formatTime(selected.endMs, true, selected.source.plan_interval_end) + '. Pulsa Intro para ver detalles.');
                 const warnings = [];
                 if (normalised.invalid > 0) warnings.push(normalised.invalid + ' intervalo(s) con fechas inválidas se han omitido.');
