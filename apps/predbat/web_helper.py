@@ -8596,6 +8596,664 @@ def get_plan_renderer_js():
     return text
 
 
+def get_plan_graph_js():
+    """Return the read-only combined-plan graph, scoped to the live /plan page."""
+    text = r"""
+    <style>
+    #planGraphRoot {
+        --pg-surface: #fff;
+        --pg-soft: #f7faf7;
+        --pg-ink: #25332b;
+        --pg-muted: #6f7d73;
+        --pg-line: #e3eae4;
+        --pg-battery: #247d6d;
+        --pg-solar: #d49a28;
+        --pg-load: #657d8a;
+        --pg-warning: #775116;
+        --pg-warning-bg: #fff5df;
+        color: var(--pg-ink);
+        font-family: inherit;
+        margin: 0 auto 18px;
+        max-width: 1160px;
+    }
+    body.dark-mode #planGraphRoot {
+        --pg-surface: #2d2d2d;
+        --pg-soft: #242b27;
+        --pg-ink: #f1f4f1;
+        --pg-muted: #b8c2bb;
+        --pg-line: #48534c;
+        --pg-battery: #6ac4a2;
+        --pg-solar: #e6b958;
+        --pg-load: #a7c0cb;
+        --pg-warning: #f1d092;
+        --pg-warning-bg: #3e3422;
+    }
+    #planGraphRoot * { box-sizing: border-box; }
+    #planGraphRoot .pg-heading { display:flex; align-items:center; justify-content:space-between; gap:16px; margin: 18px 0 12px; }
+    #planGraphRoot h2 { margin:0; color:var(--pg-ink); font-size:clamp(21px, 3vw, 29px); font-weight:620; letter-spacing:-.035em; }
+    #planGraphRoot .pg-subtitle { margin:5px 0 0; color:var(--pg-muted); font-size:12px; }
+    #planGraphRoot .pg-range { display:inline-flex; flex:0 0 auto; gap:2px; padding:3px; border:1px solid var(--pg-line); border-radius:11px; background:var(--pg-soft); }
+    #planGraphRoot .pg-range[hidden] { display:none; }
+    #planGraphRoot .pg-range button { min-width:54px; padding:7px 10px; border:0; border-radius:8px; background:transparent; color:var(--pg-muted); font:inherit; font-size:12px; cursor:pointer; }
+    #planGraphRoot .pg-range button[aria-pressed="true"] { background:var(--pg-surface); color:var(--pg-ink); box-shadow:0 1px 4px #0002; }
+    #planGraphRoot button:focus-visible, #planGraphRoot svg:focus-visible { outline:3px solid #137e6a; outline-offset:3px; }
+    #planGraphRoot .pg-card { overflow:hidden; border:1px solid var(--pg-line); border-radius:19px; background:var(--pg-surface); box-shadow:0 9px 30px #24382b10; }
+    #planGraphRoot .pg-chart-wrap { width:100%; padding:10px 14px 0; }
+    #planGraphRoot .pg-chart { display:block; width:100%; height:420px; overflow:visible; touch-action:manipulation; cursor:crosshair; }
+    #planGraphRoot .pg-chart text { font-family:inherit; user-select:none; }
+    #planGraphRoot .pg-axis { fill:var(--pg-muted); font-size:11px; }
+    #planGraphRoot .pg-axis-strong { fill:var(--pg-ink); font-weight:700; }
+    #planGraphRoot .pg-caption { fill:var(--pg-muted); font-size:10px; font-weight:750; letter-spacing:.1em; }
+    #planGraphRoot .pg-grid { stroke:var(--pg-line); stroke-width:1; }
+    #planGraphRoot .pg-battery-line { fill:none; stroke:var(--pg-battery); stroke-width:3; stroke-linecap:round; }
+    #planGraphRoot .pg-solar-segment { fill:none; stroke:var(--pg-solar); stroke-width:2.5; stroke-linecap:round; }
+    #planGraphRoot .pg-load-segment { fill:none; stroke:var(--pg-load); stroke-width:2.3; stroke-dasharray:5 3; stroke-linecap:round; }
+    #planGraphRoot .pg-cursor { stroke:var(--pg-battery); stroke-width:1.2; stroke-dasharray:4 4; opacity:.78; }
+    #planGraphRoot .pg-cursor-dot { fill:var(--pg-surface); stroke:var(--pg-battery); stroke-width:3; }
+    #planGraphRoot .pg-rate { fill:#2a9478; stroke:var(--pg-surface); stroke-width:.5; }
+    #planGraphRoot .pg-rate-unknown { fill:url(#planGraphHatch); stroke:var(--pg-line); stroke-width:.5; }
+    #planGraphRoot .pg-ev { fill:url(#planGraphEvHatch); stroke:#8bb7a4; stroke-width:.7; }
+    #planGraphRoot .pg-gap { fill:url(#planGraphHatch); stroke:#b9c4bb; stroke-width:.7; }
+    #planGraphRoot .pg-bottom { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:5px 18px 16px; }
+    #planGraphRoot .pg-legend { display:flex; flex-wrap:wrap; gap:9px 16px; }
+    #planGraphRoot .pg-legend-item { display:inline-flex; align-items:center; gap:7px; color:var(--pg-muted); font-size:11px; }
+    #planGraphRoot .pg-key { width:18px; height:0; border-top:3px solid var(--pg-battery); }
+    #planGraphRoot .pg-key-solar { border-color:var(--pg-solar); }
+    #planGraphRoot .pg-key-load { border-color:var(--pg-load); border-top-style:dashed; }
+    #planGraphRoot .pg-key-rate { width:10px; height:10px; border:1px solid #aab7ad; border-radius:3px; background:#9ac8b8; }
+    #planGraphRoot .pg-key-ev { width:18px; height:10px; border:1px solid #8bb7a4; border-radius:3px; background:repeating-linear-gradient(135deg,#dceddf 0 3px,#a7cbbb 3px 4px); }
+    #planGraphRoot .pg-details-button { display:inline-flex; flex:0 0 auto; align-items:center; gap:8px; min-height:39px; padding:0 13px; border:1px solid #bac9bd; border-radius:10px; background:var(--pg-surface); color:var(--pg-ink); font:inherit; font-size:12px; font-weight:650; cursor:pointer; }
+    #planGraphRoot .pg-details-button:hover { background:var(--pg-soft); }
+    #planGraphRoot .pg-alert { margin:0 0 12px; padding:10px 13px; border:1px solid #efd9a4; border-radius:11px; background:var(--pg-warning-bg); color:var(--pg-warning); font-size:12px; }
+    #planGraphRoot .pg-alert[hidden] { display:none; }
+    #planGraphRoot .pg-empty { margin:0 0 12px; padding:17px; border:1px solid var(--pg-line); border-radius:13px; background:var(--pg-soft); color:var(--pg-muted); font-size:14px; }
+    #planGraphRoot .pg-sr-only { position:absolute!important; width:1px!important; height:1px!important; padding:0!important; margin:-1px!important; overflow:hidden!important; clip:rect(0,0,0,0)!important; white-space:nowrap!important; border:0!important; }
+    #planGraphRoot dialog.pg-dialog { position:fixed; inset:0 0 0 auto; width:min(470px,100%); max-width:100%; height:100%; max-height:100dvh; margin:0; padding:0; overflow:auto; border:0; border-left:1px solid var(--pg-line); border-radius:20px 0 0 20px; background:var(--pg-surface); color:var(--pg-ink); box-shadow:-18px 0 60px #0003; }
+    #planGraphRoot dialog.pg-dialog::backdrop { background:#17221b66; backdrop-filter:blur(2px); }
+    #planGraphRoot .pg-drawer { padding:25px 25px 32px; }
+    #planGraphRoot .pg-drawer-head { display:flex; align-items:flex-start; justify-content:space-between; gap:14px; }
+    #planGraphRoot .pg-eyebrow { margin:0 0 6px; color:var(--pg-muted); font-size:10px; font-weight:760; letter-spacing:.12em; }
+    #planGraphRoot .pg-drawer h3 { margin:0; color:var(--pg-ink); font-size:23px; font-weight:620; }
+    #planGraphRoot .pg-close { width:36px; height:36px; border:1px solid var(--pg-line); border-radius:50%; background:var(--pg-surface); color:var(--pg-ink); font-size:20px; cursor:pointer; }
+    #planGraphRoot .pg-period { margin:10px 0 20px; color:var(--pg-muted); font-size:12px; line-height:1.5; }
+    #planGraphRoot .pg-summary { display:grid; grid-template-columns:1fr 1fr; gap:9px; margin:0 0 22px; }
+    #planGraphRoot .pg-summary-cell { min-width:0; padding:12px; border:1px solid var(--pg-line); border-radius:12px; background:var(--pg-soft); }
+    #planGraphRoot .pg-summary-label { display:block; margin-bottom:6px; color:var(--pg-muted); font-size:10px; }
+    #planGraphRoot .pg-summary-value { display:block; overflow-wrap:anywhere; color:var(--pg-ink); font-size:15px; font-weight:680; }
+    #planGraphRoot .pg-drawer-section { margin-top:21px; }
+    #planGraphRoot .pg-drawer-section h4 { margin:0 0 9px; font-size:13px; }
+    #planGraphRoot .pg-drawer-section p, #planGraphRoot .pg-drawer-section li { color:var(--pg-muted); font-size:12px; line-height:1.55; }
+    #planGraphRoot .pg-drawer-section p { margin:5px 0; }
+    #planGraphRoot .pg-steps { margin:0; padding-left:19px; }
+    @media (max-width:700px) {
+        #planGraphRoot .pg-heading { align-items:flex-start; gap:10px; }
+        #planGraphRoot .pg-chart-wrap { padding:7px 5px 0; }
+        #planGraphRoot .pg-chart { height:375px; }
+        #planGraphRoot .pg-bottom { align-items:stretch; flex-direction:column; padding:5px 13px 13px; }
+        #planGraphRoot .pg-details-button { align-self:flex-end; }
+    }
+    @media (max-width:430px) {
+        #planGraphRoot .pg-chart { height:350px; }
+        #planGraphRoot .pg-legend { gap:8px 11px; }
+        #planGraphRoot .pg-legend-item { font-size:10px; }
+        #planGraphRoot dialog.pg-dialog { inset:auto 0 0; width:100%; height:auto; max-height:88dvh; border:0; border-top:1px solid var(--pg-line); border-radius:20px 20px 0 0; }
+        #planGraphRoot .pg-drawer { padding:21px 19px 27px; }
+    }
+    @media (prefers-reduced-motion:reduce) {
+        #planGraphRoot *, #planGraphRoot *::before, #planGraphRoot *::after { scroll-behavior:auto!important; animation-duration:.01ms!important; transition-duration:.01ms!important; }
+    }
+    </style>
+    <script>
+    (function() {
+        'use strict';
+        const SVG_NS = 'http://www.w3.org/2000/svg';
+        const HOUR_MS = 3600000;
+        let selectedRangeHours = null;
+        let selectedStartMs = null;
+
+        function isFiniteNumber(value) {
+            return typeof value === 'number' && Number.isFinite(value);
+        }
+
+        function graphElement(tag, className, text) {
+            const element = document.createElement(tag);
+            if (className) element.className = className;
+            if (text !== undefined) element.textContent = text;
+            return element;
+        }
+
+        function graphSvg(tag, attributes, text) {
+            const element = document.createElementNS(SVG_NS, tag);
+            Object.entries(attributes || {}).forEach(([key, value]) => element.setAttribute(key, String(value)));
+            if (text !== undefined) element.textContent = text;
+            return element;
+        }
+
+        function formatNumber(value, digits) {
+            if (!isFiniteNumber(value)) return '—';
+            return new Intl.NumberFormat('es-ES', {minimumFractionDigits:digits, maximumFractionDigits:digits}).format(value);
+        }
+
+        function formatTime(value, detailed) {
+            if (!isFiniteNumber(value)) return 'Hora no disponible';
+            const options = detailed
+                ? {weekday:'long', day:'numeric', month:'long', year:'numeric', hour:'2-digit', minute:'2-digit', timeZoneName:'short'}
+                : {hour:'2-digit', minute:'2-digit', timeZoneName:'short'};
+            return new Intl.DateTimeFormat('es-ES', options).format(new Date(value));
+        }
+
+        function normaliseRows(data) {
+            const result = {rows:[], invalid:0, invalidValues:0, overlap:false};
+            if (!data || !Array.isArray(data.rows)) return result;
+            for (const source of data.rows) {
+                if (!source || typeof source !== 'object' || typeof source.time !== 'string' || typeof source.plan_interval_end !== 'string') {
+                    result.invalid += 1;
+                    continue;
+                }
+                const startMs = Date.parse(source.time);
+                const endMs = Date.parse(source.plan_interval_end);
+                if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) {
+                    result.invalid += 1;
+                    continue;
+                }
+                const energy = key => {
+                    const value = source[key];
+                    if (value === undefined || value === null) return null;
+                    if (isFiniteNumber(value) && value >= 0) return value;
+                    result.invalidValues += 1;
+                    return null;
+                };
+                const soc = key => {
+                    const value = source[key];
+                    if (value === undefined || value === null) return null;
+                    if (isFiniteNumber(value) && value >= 0 && value <= 100) return value;
+                    result.invalidValues += 1;
+                    return null;
+                };
+                let rate = null;
+                if (source.plan_rates_unavailable !== true && source.import_rate !== undefined && source.import_rate !== null) {
+                    if (isFiniteNumber(source.import_rate)) rate = source.import_rate;
+                    else result.invalidValues += 1;
+                }
+                let cost = null;
+                if (source.cost_change !== undefined && source.cost_change !== null) {
+                    if (isFiniteNumber(source.cost_change)) cost = source.cost_change;
+                    else result.invalidValues += 1;
+                }
+                result.rows.push({
+                    source, startMs, endMs,
+                    socStart:soc('soc_percent'), socEnd:soc('soc_end_percent'),
+                    pvKwh:energy('pv_forecast'), loadKwh:energy('load_forecast'), evKwh:energy('car_charging'),
+                    rate, cost
+                });
+            }
+            result.rows.sort((left, right) => left.startMs - right.startMs || left.endMs - right.endMs);
+            for (let index = 1; index < result.rows.length; index += 1) {
+                if (result.rows[index].startMs < result.rows[index - 1].endMs) result.overlap = true;
+            }
+            return result;
+        }
+
+        function availableRanges(rows) {
+            if (!rows.length) return [];
+            const origin = rows[0].startMs;
+            const boundaries = new Set();
+            rows.forEach(row => { boundaries.add(row.startMs); boundaries.add(row.endMs); });
+            return [24, 48].filter(hours => boundaries.has(origin + hours * HOUR_MS));
+        }
+
+        function createShell(container) {
+            container.replaceChildren();
+            const root = graphElement('section', 'plan-graph-root');
+            root.id = 'planGraphRoot';
+            root.setAttribute('aria-label', 'Gráfico del plan energético previsto, solo lectura');
+            const heading = graphElement('header', 'pg-heading');
+            const titleGroup = graphElement('div');
+            titleGroup.append(graphElement('h2', '', 'Plan energético'));
+            titleGroup.append(graphElement('p', 'pg-subtitle', 'Previsión · solo lectura · los huecos no se interpolan'));
+            const range = graphElement('div', 'pg-range');
+            range.id = 'planGraphRange';
+            range.setAttribute('role', 'group');
+            range.setAttribute('aria-label', 'Horizonte del gráfico');
+            heading.append(titleGroup, range);
+            const alert = graphElement('div', 'pg-alert');
+            alert.id = 'planGraphAlert';
+            alert.setAttribute('role', 'status');
+            alert.hidden = true;
+            const card = graphElement('section', 'pg-card');
+            card.setAttribute('aria-label', 'Previsión de batería y flujos de energía');
+            const chartWrap = graphElement('div', 'pg-chart-wrap');
+            const chart = graphSvg('svg', {class:'pg-chart', viewBox:'0 0 1000 445', preserveAspectRatio:'none', role:'img', tabindex:'0', 'aria-describedby':'planGraphInstructions'});
+            chart.id = 'planGraphSvg';
+            chart.append(graphSvg('title', {id:'planGraphTitle'}, 'Plan energético estimado'), graphSvg('desc', {id:'planGraphDescription'}, 'Batería, potencia media, tarifa y energía reservada para vehículo eléctrico. Las interrupciones visibles no se rellenan.'));
+            chartWrap.append(chart);
+            const bottom = graphElement('div', 'pg-bottom');
+            const legend = graphElement('div', 'pg-legend');
+            legend.setAttribute('aria-label', 'Leyenda del gráfico');
+            const legendItems = [
+                ['pg-key', 'Batería · %'], ['pg-key pg-key-solar', 'Solar · kW medios'],
+                ['pg-key pg-key-load', 'Hogar · kW medios'], ['pg-key pg-key-rate', 'Tarifa importación'],
+                ['pg-key pg-key-ev', 'VE · kWh reservados']
+            ];
+            legendItems.forEach(([keyClass, label]) => {
+                const item = graphElement('span', 'pg-legend-item');
+                item.append(graphElement('i', keyClass), graphElement('span', '', label));
+                legend.append(item);
+            });
+            const detailsButton = graphElement('button', 'pg-details-button', 'Ver detalle del intervalo');
+            detailsButton.id = 'planGraphDetails';
+            detailsButton.type = 'button';
+            detailsButton.disabled = true;
+            bottom.append(legend, detailsButton);
+            card.append(chartWrap, bottom);
+            const instructions = graphElement('p', 'pg-sr-only', 'Enfoca el gráfico y usa las flechas izquierda y derecha para seleccionar un intervalo. Pulsa Intro para abrir sus detalles.');
+            instructions.id = 'planGraphInstructions';
+            const announcement = graphElement('p', 'pg-sr-only', '');
+            announcement.id = 'planGraphAnnouncement';
+            announcement.setAttribute('aria-live', 'polite');
+            announcement.setAttribute('aria-atomic', 'true');
+            const dialog = graphElement('dialog', 'pg-dialog');
+            dialog.id = 'planGraphDialog';
+            dialog.setAttribute('aria-labelledby', 'planGraphDrawerTitle');
+            const drawer = graphElement('div', 'pg-drawer');
+            const drawerHead = graphElement('header', 'pg-drawer-head');
+            const drawerTitleGroup = graphElement('div');
+            drawerTitleGroup.append(graphElement('p', 'pg-eyebrow', 'INTERVALO · PREVISIÓN'));
+            const drawerTitle = graphElement('h3', '', 'Detalle de energía');
+            drawerTitle.id = 'planGraphDrawerTitle';
+            drawerTitleGroup.append(drawerTitle);
+            const close = graphElement('button', 'pg-close', '×');
+            close.id = 'planGraphClose';
+            close.type = 'button';
+            close.setAttribute('aria-label', 'Cerrar detalle');
+            drawerHead.append(drawerTitleGroup, close);
+            const period = graphElement('p', 'pg-period', '');
+            period.id = 'planGraphPeriod';
+            const summary = graphElement('div', 'pg-summary');
+            summary.id = 'planGraphSummary';
+            const flowsSection = graphElement('section', 'pg-drawer-section');
+            flowsSection.append(graphElement('h4', '', 'Energía del intervalo'));
+            const flows = graphElement('div');
+            flows.id = 'planGraphFlows';
+            flowsSection.append(flows);
+            const costsSection = graphElement('section', 'pg-drawer-section');
+            costsSection.append(graphElement('h4', '', 'Coste y tarifa'));
+            const costs = graphElement('div');
+            costs.id = 'planGraphCosts';
+            costsSection.append(costs);
+            const reasonSection = graphElement('section', 'pg-drawer-section');
+            reasonSection.append(graphElement('h4', '', 'Acción prevista y explicación'));
+            const reason = graphElement('div');
+            reason.id = 'planGraphReason';
+            reasonSection.append(reason);
+            const stepsSection = graphElement('section', 'pg-drawer-section');
+            stepsSection.append(graphElement('h4', '', 'Detalle de subintervalos'));
+            const steps = graphElement('div');
+            steps.id = 'planGraphSteps';
+            stepsSection.append(steps);
+            const explanationSection = graphElement('section', 'pg-drawer-section');
+            explanationSection.append(graphElement('h4', '', 'Cómo leer esta previsión'));
+            explanationSection.append(graphElement('p', '', 'La energía de cada fila está en kWh; la potencia media se obtiene dividiendo por la duración real del intervalo. Los costes son estimaciones, no una factura. El gráfico no confirma el estado físico ni la ejecución de ningún equipo.'));
+            drawer.append(drawerHead, period, summary, flowsSection, costsSection, reasonSection, stepsSection, explanationSection);
+            dialog.append(drawer);
+            root.append(heading, alert, card, instructions, announcement, dialog);
+            container.append(root);
+            return {root, range, alert, card, chart, detailsButton, dialog, close, period, summary, flows, costs, reason, steps, announcement};
+        }
+
+        function renderPredbatPlanGraph(container, data) {
+            if (!container) return;
+            const previousDialog = container.querySelector('#planGraphDialog');
+            const preserveDialog = Boolean(previousDialog && previousDialog.open);
+            const focusWasInDialog = preserveDialog && previousDialog.contains(document.activeElement);
+            const ui = createShell(container);
+            const blocked = Boolean(data && data.execution_blocked);
+            const unavailable = data && (data.plan_unavailable === true || blocked);
+            const authority = data && (data.plan_simulation === true || data.plan_execution === true);
+            const normalised = normaliseRows(data);
+            const rows = normalised.rows;
+            const noDataMessage = blocked
+                ? 'El plan aplicado está bloqueado. No se muestra ninguna trayectoria anterior.'
+                : data && data.plan_unavailable
+                    ? 'No hay una previsión reciente y validada para mostrar.'
+                    : !authority
+                        ? 'Este gráfico solo se muestra para planes combinados validados.'
+                        : 'No hay intervalos válidos para mostrar en el gráfico.';
+
+            if (unavailable || !authority || normalised.overlap || rows.length === 0) {
+                ui.card.hidden = true;
+                ui.range.hidden = true;
+                ui.detailsButton.disabled = true;
+                const empty = graphElement('p', 'pg-empty', normalised.overlap
+                    ? 'Los intervalos se solapan; no se dibuja una trayectoria ambigua.'
+                    : noDataMessage);
+                empty.setAttribute('role', unavailable ? 'status' : 'alert');
+                ui.root.insertBefore(empty, ui.card);
+                return;
+            }
+
+            const ranges = availableRanges(rows);
+            if (selectedRangeHours !== null && !ranges.includes(selectedRangeHours)) selectedRangeHours = null;
+            if (selectedRangeHours === null) selectedRangeHours = ranges.includes(48) ? 48 : (ranges.includes(24) ? 24 : null);
+            ui.range.hidden = ranges.length === 0;
+            ranges.forEach(hours => {
+                const button = graphElement('button', '', hours + ' h');
+                button.type = 'button';
+                button.dataset.range = String(hours);
+                button.setAttribute('aria-pressed', String(selectedRangeHours === hours));
+                button.addEventListener('click', () => {
+                    selectedRangeHours = hours;
+                    ui.range.querySelectorAll('button').forEach(item => item.setAttribute('aria-pressed', String(item === button)));
+                    drawChart();
+                });
+                ui.range.append(button);
+            });
+
+            const originMs = rows[0].startMs;
+            const actualEndMs = rows[rows.length - 1].endMs;
+            let selectedIndex = rows.findIndex(row => row.startMs === selectedStartMs);
+            if (selectedIndex < 0) selectedIndex = 0;
+            let visibleRows = [];
+            let displayEndMs = actualEndMs;
+
+            function visibleWindow() {
+                displayEndMs = selectedRangeHours === null ? actualEndMs : originMs + selectedRangeHours * HOUR_MS;
+                visibleRows = rows.filter(row => row.startMs < displayEndMs && row.endMs <= displayEndMs);
+                if (selectedIndex >= visibleRows.length) selectedIndex = Math.max(0, visibleRows.length - 1);
+                return visibleRows;
+            }
+
+            function chosenRow() {
+                visibleWindow();
+                return visibleRows[selectedIndex] || null;
+            }
+
+            function svgTitle(parent, text) {
+                parent.append(graphSvg('title', {}, text));
+            }
+
+            function setAlert(message) {
+                ui.alert.textContent = message || '';
+                ui.alert.hidden = !message;
+            }
+
+            function drawChart() {
+                const shown = visibleWindow();
+                if (!shown.length) {
+                    ui.card.hidden = true;
+                    return;
+                }
+                ui.card.hidden = false;
+                ui.detailsButton.disabled = false;
+                const svg = ui.chart;
+                svg.replaceChildren();
+                svg.append(graphSvg('title', {id:'planGraphTitle'}, 'Plan energético estimado para ' + formatNumber((displayEndMs - originMs) / HOUR_MS, 1) + ' horas'));
+                svg.append(graphSvg('desc', {id:'planGraphDescription'}, 'SoC previsto, potencia media de solar y hogar, tarifa y reserva de vehículo eléctrico. Las interrupciones no se interpolan.'));
+                const defs = graphSvg('defs');
+                const hatch = graphSvg('pattern', {id:'planGraphHatch', width:6, height:6, patternUnits:'userSpaceOnUse', patternTransform:'rotate(45)'});
+                hatch.append(graphSvg('rect', {width:6, height:6, fill:'#e6ebe6'}), graphSvg('line', {x1:0, y1:0, x2:0, y2:6, stroke:'#aab5ac', 'stroke-width':1.2}));
+                const evHatch = graphSvg('pattern', {id:'planGraphEvHatch', width:6, height:6, patternUnits:'userSpaceOnUse', patternTransform:'rotate(45)'});
+                evHatch.append(graphSvg('rect', {width:6, height:6, fill:'#e0efe9'}), graphSvg('line', {x1:0, y1:0, x2:0, y2:6, stroke:'#a9cec0', 'stroke-width':1.5}));
+                defs.append(hatch, evHatch);
+                svg.append(defs);
+
+                const left = 62, right = 24, xWidth = 1000 - left - right;
+                const socTop = 30, socBottom = 168, powerTop = 226, powerBottom = 319;
+                const rateY = 356, rateHeight = 15, evY = 394, evHeight = 14;
+                const span = Math.max(1, displayEndMs - originMs);
+                const xAt = time => left + ((time - originMs) / span) * xWidth;
+                const ySoc = value => socBottom - (value / 100) * (socBottom - socTop);
+                const validPower = [];
+                shown.forEach(row => {
+                    const durationHours = (row.endMs - row.startMs) / HOUR_MS;
+                    row.pvKw = row.pvKwh === null ? null : row.pvKwh / durationHours;
+                    row.loadKw = row.loadKwh === null ? null : row.loadKwh / durationHours;
+                    if (isFiniteNumber(row.pvKw)) validPower.push(row.pvKw);
+                    if (isFiniteNumber(row.loadKw)) validPower.push(row.loadKw);
+                });
+                const powerMax = Math.max(1, Math.ceil(Math.max(0, ...validPower)));
+                const yPower = value => powerBottom - (value / powerMax) * (powerBottom - powerTop);
+                const xEnd = 1000 - right;
+
+                [0, 20, 40, 60, 80, 100].forEach(value => {
+                    const y = ySoc(value);
+                    svg.append(graphSvg('line', {class:'pg-grid', x1:left, y1:y, x2:xEnd, y2:y}));
+                    svg.append(graphSvg('text', {class:'pg-axis', x:left - 9, y:y + 4, 'text-anchor':'end'}, value + '%'));
+                });
+                svg.append(graphSvg('text', {class:'pg-caption', x:left, y:19}, 'BATERÍA · %'));
+                svg.append(graphSvg('text', {class:'pg-caption', x:left, y:211}, 'POTENCIA MEDIA · kW'));
+                [0, powerMax / 2, powerMax].forEach(value => {
+                    const y = yPower(value);
+                    svg.append(graphSvg('line', {class:'pg-grid', x1:left, y1:y, x2:xEnd, y2:y}));
+                    svg.append(graphSvg('text', {class:'pg-axis', x:left - 9, y:y + 4, 'text-anchor':'end'}, formatNumber(value, value % 1 ? 1 : 0)));
+                });
+
+                const rangeHours = span / HOUR_MS;
+                const tickCount = 4;
+                for (let tick = 0; tick <= tickCount; tick += 1) {
+                    const time = originMs + (span * tick / tickCount);
+                    const x = xAt(time);
+                    const anchor = tick === 0 ? 'start' : (tick === tickCount ? 'end' : 'middle');
+                    svg.append(graphSvg('line', {class:'pg-grid', x1:x, y1:socBottom, x2:x, y2:evY + evHeight + 4}));
+                    svg.append(graphSvg('text', {class:'pg-axis pg-graph-axis-label plan-graph-axis-label', x, y:190, 'text-anchor':anchor}, formatTime(time, false)));
+                }
+
+                for (let index = 1; index < shown.length; index += 1) {
+                    const previous = shown[index - 1], next = shown[index];
+                    if (next.startMs > previous.endMs) {
+                        const gap = graphSvg('rect', {class:'pg-gap plan-graph-gap', x:xAt(previous.endMs), y:socTop, width:Math.max(1, xAt(next.startMs) - xAt(previous.endMs)), height:evY + evHeight - socTop});
+                        svgTitle(gap, 'Sin datos entre ' + formatTime(previous.endMs, true) + ' y ' + formatTime(next.startMs, true) + '. No se interpola.');
+                        svg.append(gap);
+                    }
+                }
+
+                svg.append(graphSvg('text', {class:'pg-caption', x:left, y:344}, 'TARIFA DE IMPORTACIÓN'));
+                svg.append(graphSvg('text', {class:'pg-caption', x:left, y:386}, 'VE · kWh'));
+                const finiteRates = shown.map(row => row.rate).filter(isFiniteNumber);
+                const minRate = finiteRates.length ? Math.min(...finiteRates) : 0;
+                const maxRate = finiteRates.length ? Math.max(...finiteRates) : 0;
+                shown.forEach(row => {
+                    const x0 = xAt(row.startMs), x1 = xAt(row.endMs), durationHours = (row.endMs - row.startMs) / HOUR_MS;
+                    if (row.socStart !== null && row.socEnd !== null) {
+                        const battery = graphSvg('path', {class:'pg-battery-line plan-graph-battery-line', d:'M ' + x0 + ' ' + ySoc(row.socStart) + ' L ' + x1 + ' ' + ySoc(row.socEnd)});
+                        svgTitle(battery, 'Batería: ' + formatNumber(row.socStart, 1) + '% a ' + formatNumber(row.socEnd, 1) + '% entre ' + formatTime(row.startMs, true) + ' y ' + formatTime(row.endMs, true));
+                        svg.append(battery);
+                    }
+                    if (isFiniteNumber(row.pvKw)) {
+                        const solar = graphSvg('path', {class:'pg-solar-segment plan-graph-solar-segment', d:'M ' + x0 + ' ' + yPower(row.pvKw) + ' H ' + x1});
+                        svgTitle(solar, 'Solar: ' + formatNumber(row.pvKw, 2) + ' kW medios (' + formatNumber(row.pvKwh, 2) + ' kWh en ' + formatNumber(durationHours, 2) + ' h)');
+                        svg.append(solar);
+                    }
+                    if (isFiniteNumber(row.loadKw)) {
+                        const load = graphSvg('path', {class:'pg-load-segment plan-graph-load-segment', d:'M ' + x0 + ' ' + yPower(row.loadKw) + ' H ' + x1});
+                        svgTitle(load, 'Hogar: ' + formatNumber(row.loadKw, 2) + ' kW medios (' + formatNumber(row.loadKwh, 2) + ' kWh en ' + formatNumber(durationHours, 2) + ' h)');
+                        svg.append(load);
+                    }
+                    const rateRange = maxRate - minRate;
+                    const relativeRate = row.rate === null || !Number.isFinite(rateRange) || rateRange <= 0 ? 1 : Math.max(0, Math.min(1, (row.rate - minRate) / rateRange));
+                    const rateRect = graphSvg('rect', {class:row.rate === null ? 'pg-rate-unknown' : 'pg-rate', x:x0, y:rateY, width:Math.max(.5, x1 - x0), height:rateHeight, opacity:row.rate === null ? 1 : .35 + .65 * relativeRate});
+                    svgTitle(rateRect, row.rate === null ? 'Tarifa no disponible para este intervalo' : 'Importación: ' + formatNumber(row.rate, 2) + ' ' + String(data.currency_symbols?.[1] || '') + '/kWh');
+                    svg.append(rateRect);
+                    if (row.evKwh !== null && row.evKwh > 0) {
+                        const ev = graphSvg('rect', {class:'pg-ev', x:x0, y:evY, width:Math.max(.5, x1 - x0), height:evHeight, rx:3});
+                        svgTitle(ev, 'Reserva prevista de vehículo eléctrico: ' + formatNumber(row.evKwh, 3) + ' kWh');
+                        svg.append(ev);
+                    }
+                });
+
+                const selected = shown[Math.min(selectedIndex, shown.length - 1)];
+                const cursorX = xAt((selected.startMs + selected.endMs) / 2);
+                const cursorY = selected.socStart === null ? socTop : ySoc(selected.socStart);
+                svg.append(graphSvg('line', {class:'pg-cursor', x1:cursorX, y1:socTop, x2:cursorX, y2:evY + evHeight + 3}));
+                svg.append(graphSvg('circle', {class:'pg-cursor-dot', cx:cursorX, cy:cursorY, r:5}));
+                svg.setAttribute('aria-label', 'Plan de ' + formatNumber(rangeHours, 1) + ' horas. Intervalo seleccionado de ' + formatTime(selected.startMs, true) + ' a ' + formatTime(selected.endMs, true) + '. Pulsa Intro para ver detalles.');
+                const warnings = [];
+                if (normalised.invalid > 0) warnings.push(normalised.invalid + ' intervalo(s) con fechas inválidas se han omitido.');
+                if (normalised.invalidValues > 0) warnings.push(normalised.invalidValues + ' valor(es) no válido(s) no se muestran; no se han sustituido por datos estimados.');
+                if (shown.some((row, index) => index > 0 && row.startMs > shown[index - 1].endMs)) warnings.push('Hay huecos sin datos en este horizonte; se muestran vacíos, sin interpolación.');
+                setAlert(warnings.join(' '));
+            }
+
+            function summaryCell(label, value) {
+                const cell = graphElement('div', 'pg-summary-cell');
+                cell.append(graphElement('span', 'pg-summary-label', label), graphElement('strong', 'pg-summary-value', value));
+                return cell;
+            }
+
+            function formatMoney(value, symbols) {
+                if (!isFiniteNumber(value)) return '—';
+                return String(symbols?.[0] || '') + formatNumber(value, 2);
+            }
+
+            function renderDetails(row) {
+                if (!row) return;
+                const source = row.source;
+                const durationHours = (row.endMs - row.startMs) / HOUR_MS;
+                const pvKw = row.pvKwh === null ? null : row.pvKwh / durationHours;
+                const loadKw = row.loadKwh === null ? null : row.loadKwh / durationHours;
+                ui.period.textContent = formatTime(row.startMs, true) + ' – ' + formatTime(row.endMs, true) + ' · ' + formatNumber(durationHours, 2) + ' h reales';
+                ui.summary.replaceChildren(
+                    summaryCell('Batería · inicio → fin', row.socStart === null || row.socEnd === null ? '—' : formatNumber(row.socStart, 1) + '% → ' + formatNumber(row.socEnd, 1) + '%'),
+                    summaryCell('Coste estimado del intervalo', formatMoney(row.cost, data.currency_symbols)),
+                    summaryCell('Coste registrado', formatMoney(data.recorded_cost, data.currency_symbols)),
+                    summaryCell('Duración real', formatNumber(durationHours, 2) + ' h'),
+                    summaryCell('Datos actualizados', formatTime(Date.parse(data.timestamp), true))
+                );
+                const flowLines = [
+                    ['Solar prevista', row.pvKwh, pvKw],
+                    ['Consumo del hogar', row.loadKwh, loadKw],
+                    ['Reserva del vehículo eléctrico', row.evKwh, null]
+                ];
+                ui.flows.replaceChildren();
+                flowLines.forEach(([label, energy, power]) => {
+                    const line = graphElement('p', '', label + ': ' + (energy === null ? '—' : formatNumber(energy, 3) + ' kWh') + (power === null ? '' : ' · ' + formatNumber(power, 2) + ' kW medios'));
+                    ui.flows.append(line);
+                });
+                const rateText = row.rate === null ? 'no disponible' : formatNumber(row.rate, 2) + ' ' + String(data.currency_symbols?.[1] || '') + '/kWh';
+                let visibleCost = null;
+                const shown = visibleWindow();
+                const contiguous = shown.length > 0 && shown[0].startMs === originMs && shown[shown.length - 1].endMs === displayEndMs && shown.every((item, index) => index === 0 || item.startMs === shown[index - 1].endMs);
+                if (contiguous && shown.every(item => item.cost !== null)) visibleCost = shown.reduce((sum, item) => sum + item.cost, 0);
+                ui.costs.replaceChildren(
+                    graphElement('p', '', 'Tarifa de importación: ' + rateText),
+                    graphElement('p', '', 'Coste previsto del horizonte: ' + (visibleCost === null ? 'no disponible para todos los intervalos' : formatMoney(visibleCost, data.currency_symbols)))
+                );
+                const action = typeof source.plan_action === 'string' && source.plan_action ? source.plan_action : 'Sin acción etiquetada';
+                const explanation = typeof source.plan_reason === 'string' && source.plan_reason ? source.plan_reason : 'No hay explicación disponible.';
+                ui.reason.replaceChildren(graphElement('p', '', 'Acción: ' + action), graphElement('p', '', 'Motivo: ' + explanation));
+                ui.steps.replaceChildren();
+                if (Array.isArray(source.plan_steps) && source.plan_steps.length) {
+                    const list = graphElement('ul', 'pg-steps');
+                    source.plan_steps.forEach(step => {
+                        if (!step || typeof step !== 'object') return;
+                        const start = typeof step.start === 'string' ? Date.parse(step.start) : NaN;
+                        const end = typeof step.end === 'string' ? Date.parse(step.end) : NaN;
+                        if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return;
+                        const battery = isFiniteNumber(step.battery_kw) ? formatNumber(step.battery_kw, 2) + ' kW batería' : 'batería no disponible';
+                        const grid = isFiniteNumber(step.grid_kw) ? formatNumber(step.grid_kw, 2) + ' kW red' : 'red no disponible';
+                        list.append(graphElement('li', '', formatTime(start, true) + ' – ' + formatTime(end, true) + ' · ' + battery + ' · ' + grid));
+                    });
+                    ui.steps.append(list);
+                } else {
+                    ui.steps.append(graphElement('p', '', 'No hay subintervalos de flujo disponibles para esta fila.'));
+                }
+            }
+
+            function selectRow(index, announce) {
+                const shown = visibleWindow();
+                if (!shown.length) return;
+                selectedIndex = Math.max(0, Math.min(shown.length - 1, index));
+                selectedStartMs = shown[selectedIndex].startMs;
+                drawChart();
+                if (announce) ui.announcement.textContent = 'Intervalo seleccionado: ' + formatTime(shown[selectedIndex].startMs, true) + '.';
+            }
+
+            function openDetails() {
+                const row = chosenRow();
+                if (!row) return;
+                const trigger = document.activeElement || ui.detailsButton;
+                renderDetails(row);
+                if (!ui.dialog.open) ui.dialog.showModal();
+                ui.close.focus();
+                ui.dialog._returnFocusTo = trigger;
+            }
+
+            ui.detailsButton.addEventListener('click', openDetails);
+            ui.close.addEventListener('click', () => ui.dialog.close());
+            ui.dialog.addEventListener('close', () => {
+                const target = ui.dialog._returnFocusTo;
+                if (target && target.isConnected && typeof target.focus === 'function') target.focus();
+                ui.dialog._returnFocusTo = null;
+            });
+            ui.dialog.addEventListener('click', event => { if (event.target === ui.dialog) ui.dialog.close(); });
+            ui.chart.addEventListener('keydown', event => {
+                if (event.key === 'ArrowRight' || event.key === 'ArrowLeft') {
+                    event.preventDefault();
+                    selectRow(selectedIndex + (event.key === 'ArrowRight' ? 1 : -1), true);
+                } else if (event.key === 'Home' || event.key === 'End') {
+                    event.preventDefault();
+                    selectRow(event.key === 'Home' ? 0 : visibleWindow().length - 1, true);
+                } else if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    openDetails();
+                }
+            });
+            ui.chart.addEventListener('click', event => {
+                const bounds = ui.chart.getBoundingClientRect();
+                const normalized = Math.max(0, Math.min(1, (event.clientX - bounds.left) / Math.max(1, bounds.width)));
+                const targetTime = originMs + normalized * (displayEndMs - originMs);
+                const shown = visibleWindow();
+                let nearest = 0, distance = Infinity;
+                shown.forEach((row, index) => {
+                    const midpoint = (row.startMs + row.endMs) / 2;
+                    if (Math.abs(midpoint - targetTime) < distance) { nearest = index; distance = Math.abs(midpoint - targetTime); }
+                });
+                selectRow(nearest, true);
+            });
+
+            drawChart();
+            if (preserveDialog && chosenRow()) {
+                renderDetails(chosenRow());
+                ui.dialog.showModal();
+                ui.dialog._returnFocusTo = ui.detailsButton;
+                if (focusWasInDialog) ui.close.focus();
+            }
+        }
+
+        window.renderPredbatPlanGraph = renderPredbatPlanGraph;
+
+        const legacyRefreshPlan = refreshPlan;
+        refreshPlan = function() {
+            const data = currentViewData();
+            const combined = data && (data.plan_simulation === true || data.plan_execution === true);
+            const timestamp = document.getElementById('planTimestamp');
+            if (currentView !== 'plan' || !combined) {
+                if (timestamp) timestamp.style.display = '';
+                return legacyRefreshPlan();
+            }
+            const container = document.getElementById('planContainer');
+            if (!container) return legacyRefreshPlan();
+            checkStaleness(data);
+            const debugToggle = document.getElementById('debugToggle');
+            const showDebug = debugToggle ? debugToggle.checked : false;
+            document.querySelectorAll('#carChargingPreview .car-charging-preview-debug').forEach(element => { element.style.display = showDebug ? '' : 'none'; });
+            const age = Date.now() - Date.parse(data.timestamp);
+            const stale = !Number.isFinite(age) || age > 900000 || age < -60000;
+            const blocked = data.execution_blocked === true || (typeof data.execution_blocked === 'string' && data.execution_blocked.length > 0);
+            const validRows = normaliseRows(data);
+            const plotReady = !stale && !blocked && data.plan_unavailable !== true && validRows.rows.length > 0 && !validRows.overlap;
+            if (timestamp) timestamp.style.display = plotReady ? 'none' : '';
+            const safeData = stale || blocked || data.plan_unavailable === true
+                ? {...data, rows:[], plan_unavailable:!blocked, execution_blocked:blocked ? data.execution_blocked : false}
+                : data;
+            renderPredbatPlanGraph(container, safeData);
+        };
+    })();
+    </script>
+    """
+    return text
+
+
 def get_header_html(title, calculating, default_page, arg_errors, THIS_VERSION, battery_status_icon, refresh=0, codemirror=False, chat_enabled=False):
     """
     Return the HTML header for a page
