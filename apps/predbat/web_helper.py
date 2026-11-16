@@ -8482,13 +8482,18 @@ def get_plan_renderer_js():
             if (data.unchanged === true) {
                 // Data hasn't changed, no need to update
                 // Still check staleness, against the data the current view shows
-                checkStaleness(currentViewData());
+                const cachedView = currentViewData();
+                checkStaleness(cachedView);
 
                 // Hide error message
                 const errorDiv = document.getElementById('planError');
                 if (errorDiv) {
                     errorDiv.style.display = 'none';
                 }
+                // Applied receipts have a shorter authority lease than the plan
+                // data timestamp. Re-run only the display gate on an unchanged
+                // response so expiry clears the graph and any open drawer.
+                if (currentView === 'plan' && cachedView && cachedView.plan_execution === true) refreshPlan();
                 return; // Exit early, no updates needed
             }
 
@@ -8641,7 +8646,7 @@ def get_plan_graph_js():
     #planGraphRoot .pg-chart-wrap { width:100%; padding:10px 14px 0; }
     #planGraphRoot .pg-chart { display:block; width:100%; height:420px; overflow:visible; touch-action:manipulation; cursor:crosshair; }
     #planGraphRoot .pg-chart text { font-family:inherit; user-select:none; }
-    #planGraphRoot .pg-axis { fill:var(--pg-muted); font-size:11px; }
+    #planGraphRoot .pg-axis { fill:var(--pg-muted); font-size:12px; }
     #planGraphRoot .pg-axis-strong { fill:var(--pg-ink); font-weight:700; }
     #planGraphRoot .pg-caption { fill:var(--pg-muted); font-size:10px; font-weight:750; letter-spacing:.1em; }
     #planGraphRoot .pg-grid { stroke:var(--pg-line); stroke-width:1; }
@@ -8734,8 +8739,33 @@ def get_plan_graph_js():
             return new Intl.NumberFormat('es-ES', {minimumFractionDigits:digits, maximumFractionDigits:digits}).format(value);
         }
 
-        function formatTime(value, detailed) {
+        function offsetMinutes(timestamp) {
+            if (typeof timestamp !== 'string') return null;
+            if (/Z$/.test(timestamp)) return 0;
+            const match = timestamp.match(/([+-])(\d{2}):?(\d{2})$/);
+            if (!match) return null;
+            const minutes = Number(match[2]) * 60 + Number(match[3]);
+            if (!Number.isFinite(minutes) || minutes > 14 * 60) return null;
+            return match[1] === '+' ? minutes : -minutes;
+        }
+
+        function formatOffset(minutes) {
+            if (minutes === 0) return 'UTC';
+            const sign = minutes > 0 ? '+' : '-';
+            const absolute = Math.abs(minutes);
+            return 'UTC' + sign + String(Math.floor(absolute / 60)).padStart(2, '0') + ':' + String(absolute % 60).padStart(2, '0');
+        }
+
+        function formatTime(value, detailed, sourceTimestamp) {
             if (!isFiniteNumber(value)) return 'Hora no disponible';
+            const offset = offsetMinutes(sourceTimestamp);
+            if (offset !== null) {
+                const options = detailed
+                    ? {weekday:'long', day:'numeric', month:'long', year:'numeric', hour:'2-digit', minute:'2-digit', hourCycle:'h23', timeZone:'UTC'}
+                    : {hour:'2-digit', minute:'2-digit', hourCycle:'h23', timeZone:'UTC'};
+                const siteClock = new Intl.DateTimeFormat('es-ES', options).format(new Date(value + offset * 60000));
+                return siteClock + ' ' + formatOffset(offset);
+            }
             const options = detailed
                 ? {weekday:'long', day:'numeric', month:'long', year:'numeric', hour:'2-digit', minute:'2-digit', timeZoneName:'short'}
                 : {hour:'2-digit', minute:'2-digit', timeZoneName:'short'};
@@ -8766,7 +8796,7 @@ def get_plan_graph_js():
                 const soc = key => {
                     const value = source[key];
                     if (value === undefined || value === null) return null;
-                    if (isFiniteNumber(value) && value >= 0 && value <= 100) return value;
+                    if (isFiniteNumber(value) && value >= -0.1 && value <= 100.1) return value;
                     result.invalidValues += 1;
                     return null;
                 };
@@ -8871,6 +8901,13 @@ def get_plan_graph_js():
             period.id = 'planGraphPeriod';
             const summary = graphElement('div', 'pg-summary');
             summary.id = 'planGraphSummary';
+            const executionContext = graphElement('section', 'pg-drawer-section');
+            executionContext.id = 'planGraphExecutionContext';
+            executionContext.hidden = true;
+            executionContext.append(
+                graphElement('h4', '', 'Estado del plan'),
+                graphElement('p', '', 'Plan aplicado: solo la respuesta observada más reciente es actual; cada intervalo posterior es una previsión futura que se revalidará en el próximo ciclo. Las observaciones de Home Assistant no confirman por sí solas el estado físico del equipo.') // cspell:disable-line
+            );
             const flowsSection = graphElement('section', 'pg-drawer-section');
             flowsSection.append(graphElement('h4', '', 'Energía del intervalo'));
             const flows = graphElement('div');
@@ -8894,11 +8931,11 @@ def get_plan_graph_js():
             const explanationSection = graphElement('section', 'pg-drawer-section');
             explanationSection.append(graphElement('h4', '', 'Cómo leer esta previsión'));
             explanationSection.append(graphElement('p', '', 'La energía de cada fila está en kWh; la potencia media se obtiene dividiendo por la duración real del intervalo. Los costes son estimaciones, no una factura. El gráfico no confirma el estado físico ni la ejecución de ningún equipo.'));
-            drawer.append(drawerHead, period, summary, flowsSection, costsSection, reasonSection, stepsSection, explanationSection);
+            drawer.append(drawerHead, period, summary, executionContext, flowsSection, costsSection, reasonSection, stepsSection, explanationSection);
             dialog.append(drawer);
             root.append(heading, alert, card, instructions, announcement, dialog);
             container.append(root);
-            return {root, range, alert, card, chart, detailsButton, dialog, close, period, summary, flows, costs, reason, steps, announcement};
+            return {root, range, alert, card, chart, detailsButton, dialog, close, period, summary, executionContext, flows, costs, reason, steps, announcement};
         }
 
         function renderPredbatPlanGraph(container, data) {
@@ -8906,12 +8943,32 @@ def get_plan_graph_js():
             const previousDialog = container.querySelector('#planGraphDialog');
             const preserveDialog = Boolean(previousDialog && previousDialog.open);
             const focusWasInDialog = preserveDialog && previousDialog.contains(document.activeElement);
+            const previousReturnFocusId = previousDialog && previousDialog._returnFocusTo ? previousDialog._returnFocusTo.id : '';
+            const activeElement = document.activeElement;
+            const focusWasInGraph = Boolean(activeElement && container.contains(activeElement));
+            const previousFocusId = focusWasInGraph ? activeElement.id : '';
+            const previousRange = focusWasInGraph && activeElement.dataset ? activeElement.dataset.range : '';
             const ui = createShell(container);
+            ui.executionContext.hidden = !data || data.plan_execution !== true || Boolean(data.execution_blocked) || !validAppliedReceiptForDisplay(data);
             const blocked = Boolean(data && data.execution_blocked);
             const unavailable = data && (data.plan_unavailable === true || blocked);
             const authority = data && (data.plan_simulation === true || data.plan_execution === true);
             const normalised = normaliseRows(data);
             const rows = normalised.rows;
+            function sourceTimestampAt(value) {
+                const exactStart = rows.find(row => row.startMs === value);
+                if (exactStart) return exactStart.source.time;
+                const covering = rows.find(row => row.startMs <= value && value < row.endMs);
+                if (covering) return covering.source.time;
+                const exactEnd = rows.find(row => row.endMs === value);
+                if (exactEnd) return exactEnd.source.plan_interval_end;
+                let previous = null;
+                for (const row of rows) {
+                    if (row.endMs <= value) previous = row;
+                    else break;
+                }
+                return previous ? previous.source.plan_interval_end : (rows[0] ? rows[0].source.time : null);
+            }
             const noDataMessage = blocked
                 ? 'El plan aplicado está bloqueado. No se muestra ninguna trayectoria anterior.'
                 : data && data.plan_unavailable
@@ -8955,6 +9012,10 @@ def get_plan_graph_js():
             if (selectedIndex < 0) selectedIndex = 0;
             let visibleRows = [];
             let displayEndMs = actualEndMs;
+            let chartWidth = 1000;
+            let plotLeft = 62;
+            let plotRight = 24;
+            let plotWidth = chartWidth - plotLeft - plotRight;
 
             function visibleWindow() {
                 displayEndMs = selectedRangeHours === null ? actualEndMs : originMs + selectedRangeHours * HOUR_MS;
@@ -8997,12 +9058,17 @@ def get_plan_graph_js():
                 defs.append(hatch, evHatch);
                 svg.append(defs);
 
-                const left = 62, right = 24, xWidth = 1000 - left - right;
+                chartWidth = Math.max(320, Math.round(svg.clientWidth || 1000));
+                plotLeft = chartWidth <= 430 ? 48 : 62;
+                plotRight = chartWidth <= 430 ? 16 : 24;
+                plotWidth = chartWidth - plotLeft - plotRight;
+                svg.setAttribute('viewBox', '0 0 ' + chartWidth + ' 445');
+                const left = plotLeft, right = plotRight, xWidth = plotWidth;
                 const socTop = 30, socBottom = 168, powerTop = 226, powerBottom = 319;
                 const rateY = 356, rateHeight = 15, evY = 394, evHeight = 14;
                 const span = Math.max(1, displayEndMs - originMs);
                 const xAt = time => left + ((time - originMs) / span) * xWidth;
-                const ySoc = value => socBottom - (value / 100) * (socBottom - socTop);
+                const ySoc = value => socBottom - (Math.max(0, Math.min(100, value)) / 100) * (socBottom - socTop);
                 const validPower = [];
                 shown.forEach(row => {
                     const durationHours = (row.endMs - row.startMs) / HOUR_MS;
@@ -9013,7 +9079,7 @@ def get_plan_graph_js():
                 });
                 const powerMax = Math.max(1, Math.ceil(Math.max(0, ...validPower)));
                 const yPower = value => powerBottom - (value / powerMax) * (powerBottom - powerTop);
-                const xEnd = 1000 - right;
+                const xEnd = chartWidth - right;
 
                 [0, 20, 40, 60, 80, 100].forEach(value => {
                     const y = ySoc(value);
@@ -9029,20 +9095,20 @@ def get_plan_graph_js():
                 });
 
                 const rangeHours = span / HOUR_MS;
-                const tickCount = 4;
+                const tickCount = Math.max(2, Math.min(6, Math.floor(xWidth / 100)));
                 for (let tick = 0; tick <= tickCount; tick += 1) {
                     const time = originMs + (span * tick / tickCount);
                     const x = xAt(time);
                     const anchor = tick === 0 ? 'start' : (tick === tickCount ? 'end' : 'middle');
                     svg.append(graphSvg('line', {class:'pg-grid', x1:x, y1:socBottom, x2:x, y2:evY + evHeight + 4}));
-                    svg.append(graphSvg('text', {class:'pg-axis pg-graph-axis-label plan-graph-axis-label', x, y:190, 'text-anchor':anchor}, formatTime(time, false)));
+                    svg.append(graphSvg('text', {class:'pg-axis pg-graph-axis-label plan-graph-axis-label', x, y:190, 'text-anchor':anchor}, formatTime(time, false, sourceTimestampAt(time))));
                 }
 
                 for (let index = 1; index < shown.length; index += 1) {
                     const previous = shown[index - 1], next = shown[index];
                     if (next.startMs > previous.endMs) {
                         const gap = graphSvg('rect', {class:'pg-gap plan-graph-gap', x:xAt(previous.endMs), y:socTop, width:Math.max(1, xAt(next.startMs) - xAt(previous.endMs)), height:evY + evHeight - socTop});
-                        svgTitle(gap, 'Sin datos entre ' + formatTime(previous.endMs, true) + ' y ' + formatTime(next.startMs, true) + '. No se interpola.');
+                        svgTitle(gap, 'Sin datos entre ' + formatTime(previous.endMs, true, previous.source.plan_interval_end) + ' y ' + formatTime(next.startMs, true, next.source.time) + '. No se interpola.');
                         svg.append(gap);
                     }
                 }
@@ -9056,7 +9122,7 @@ def get_plan_graph_js():
                     const x0 = xAt(row.startMs), x1 = xAt(row.endMs), durationHours = (row.endMs - row.startMs) / HOUR_MS;
                     if (row.socStart !== null && row.socEnd !== null) {
                         const battery = graphSvg('path', {class:'pg-battery-line plan-graph-battery-line', d:'M ' + x0 + ' ' + ySoc(row.socStart) + ' L ' + x1 + ' ' + ySoc(row.socEnd)});
-                        svgTitle(battery, 'Batería: ' + formatNumber(row.socStart, 1) + '% a ' + formatNumber(row.socEnd, 1) + '% entre ' + formatTime(row.startMs, true) + ' y ' + formatTime(row.endMs, true));
+                        svgTitle(battery, 'Batería: ' + formatNumber(row.socStart, 1) + '% a ' + formatNumber(row.socEnd, 1) + '% entre ' + formatTime(row.startMs, true, row.source.time) + ' y ' + formatTime(row.endMs, true, row.source.plan_interval_end));
                         svg.append(battery);
                     }
                     if (isFiniteNumber(row.pvKw)) {
@@ -9085,8 +9151,8 @@ def get_plan_graph_js():
                 const cursorX = xAt((selected.startMs + selected.endMs) / 2);
                 const cursorY = selected.socStart === null ? socTop : ySoc(selected.socStart);
                 svg.append(graphSvg('line', {class:'pg-cursor', x1:cursorX, y1:socTop, x2:cursorX, y2:evY + evHeight + 3}));
-                svg.append(graphSvg('circle', {class:'pg-cursor-dot', cx:cursorX, cy:cursorY, r:5}));
-                svg.setAttribute('aria-label', 'Plan de ' + formatNumber(rangeHours, 1) + ' horas. Intervalo seleccionado de ' + formatTime(selected.startMs, true) + ' a ' + formatTime(selected.endMs, true) + '. Pulsa Intro para ver detalles.');
+                if (selected.socStart !== null) svg.append(graphSvg('circle', {class:'pg-cursor-dot', cx:cursorX, cy:cursorY, r:5}));
+                svg.setAttribute('aria-label', 'Plan de ' + formatNumber(rangeHours, 1) + ' horas. Intervalo seleccionado de ' + formatTime(selected.startMs, true, selected.source.time) + ' a ' + formatTime(selected.endMs, true, selected.source.plan_interval_end) + '. Pulsa Intro para ver detalles.');
                 const warnings = [];
                 if (normalised.invalid > 0) warnings.push(normalised.invalid + ' intervalo(s) con fechas inválidas se han omitido.');
                 if (normalised.invalidValues > 0) warnings.push(normalised.invalidValues + ' valor(es) no válido(s) no se muestran; no se han sustituido por datos estimados.');
@@ -9111,13 +9177,13 @@ def get_plan_graph_js():
                 const durationHours = (row.endMs - row.startMs) / HOUR_MS;
                 const pvKw = row.pvKwh === null ? null : row.pvKwh / durationHours;
                 const loadKw = row.loadKwh === null ? null : row.loadKwh / durationHours;
-                ui.period.textContent = formatTime(row.startMs, true) + ' – ' + formatTime(row.endMs, true) + ' · ' + formatNumber(durationHours, 2) + ' h reales';
+                ui.period.textContent = formatTime(row.startMs, true, source.time) + ' – ' + formatTime(row.endMs, true, source.plan_interval_end) + ' · ' + formatNumber(durationHours, 2) + ' h reales';
                 ui.summary.replaceChildren(
                     summaryCell('Batería · inicio → fin', row.socStart === null || row.socEnd === null ? '—' : formatNumber(row.socStart, 1) + '% → ' + formatNumber(row.socEnd, 1) + '%'),
                     summaryCell('Coste estimado del intervalo', formatMoney(row.cost, data.currency_symbols)),
                     summaryCell('Coste registrado', formatMoney(data.recorded_cost, data.currency_symbols)),
                     summaryCell('Duración real', formatNumber(durationHours, 2) + ' h'),
-                    summaryCell('Datos actualizados', formatTime(Date.parse(data.timestamp), true))
+                    summaryCell('Datos actualizados', formatTime(Date.parse(data.timestamp), true, data.timestamp))
                 );
                 const flowLines = [
                     ['Solar prevista', row.pvKwh, pvKw],
@@ -9151,7 +9217,7 @@ def get_plan_graph_js():
                         if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return;
                         const battery = isFiniteNumber(step.battery_kw) ? formatNumber(step.battery_kw, 2) + ' kW batería' : 'batería no disponible';
                         const grid = isFiniteNumber(step.grid_kw) ? formatNumber(step.grid_kw, 2) + ' kW red' : 'red no disponible';
-                        list.append(graphElement('li', '', formatTime(start, true) + ' – ' + formatTime(end, true) + ' · ' + battery + ' · ' + grid));
+                        list.append(graphElement('li', '', formatTime(start, true, step.start) + ' – ' + formatTime(end, true, step.end) + ' · ' + battery + ' · ' + grid));
                     });
                     ui.steps.append(list);
                 } else {
@@ -9165,7 +9231,7 @@ def get_plan_graph_js():
                 selectedIndex = Math.max(0, Math.min(shown.length - 1, index));
                 selectedStartMs = shown[selectedIndex].startMs;
                 drawChart();
-                if (announce) ui.announcement.textContent = 'Intervalo seleccionado: ' + formatTime(shown[selectedIndex].startMs, true) + '.';
+                if (announce) ui.announcement.textContent = 'Intervalo seleccionado: ' + formatTime(shown[selectedIndex].startMs, true, shown[selectedIndex].source.time) + '.';
             }
 
             function openDetails() {
@@ -9182,8 +9248,12 @@ def get_plan_graph_js():
             ui.close.addEventListener('click', () => ui.dialog.close());
             ui.dialog.addEventListener('close', () => {
                 const target = ui.dialog._returnFocusTo;
-                if (target && target.isConnected && typeof target.focus === 'function') target.focus();
                 ui.dialog._returnFocusTo = null;
+                if (target && typeof target.focus === 'function') {
+                    // Let the browser finish its native dialog focus restoration
+                    // before returning to the chart/button from the refreshed UI.
+                    setTimeout(() => { if (target.isConnected) target.focus({preventScroll:true}); }, 0);
+                }
             });
             ui.dialog.addEventListener('click', event => { if (event.target === ui.dialog) ui.dialog.close(); });
             ui.chart.addEventListener('keydown', event => {
@@ -9199,8 +9269,18 @@ def get_plan_graph_js():
                 }
             });
             ui.chart.addEventListener('click', event => {
-                const bounds = ui.chart.getBoundingClientRect();
-                const normalized = Math.max(0, Math.min(1, (event.clientX - bounds.left) / Math.max(1, bounds.width)));
+                let chartX;
+                const matrix = ui.chart.getScreenCTM();
+                if (matrix && typeof ui.chart.createSVGPoint === 'function') {
+                    const point = ui.chart.createSVGPoint();
+                    point.x = event.clientX;
+                    point.y = event.clientY;
+                    chartX = point.matrixTransform(matrix.inverse()).x;
+                } else {
+                    const bounds = ui.chart.getBoundingClientRect();
+                    chartX = (event.clientX - bounds.left) * chartWidth / Math.max(1, bounds.width);
+                }
+                const normalized = Math.max(0, Math.min(1, (chartX - plotLeft) / Math.max(1, plotWidth)));
                 const targetTime = originMs + normalized * (displayEndMs - originMs);
                 const shown = visibleWindow();
                 let nearest = 0, distance = Infinity;
@@ -9215,9 +9295,30 @@ def get_plan_graph_js():
             if (preserveDialog && chosenRow()) {
                 renderDetails(chosenRow());
                 ui.dialog.showModal();
-                ui.dialog._returnFocusTo = ui.detailsButton;
+                ui.dialog._returnFocusTo = (previousReturnFocusId && document.getElementById(previousReturnFocusId)) || ui.detailsButton;
                 if (focusWasInDialog) ui.close.focus();
+            } else if (focusWasInGraph) {
+                const target = previousRange
+                    ? ui.range.querySelector('[data-range="' + previousRange + '"]')
+                    : (previousFocusId ? ui.root.querySelector('#' + previousFocusId) : null);
+                (target && !target.disabled ? target : ui.chart).focus({preventScroll:true});
             }
+        }
+
+        function parseReceiptTimestamp(value) {
+            if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})$/.test(value)) return null;
+            const milliseconds = Date.parse(value);
+            return Number.isFinite(milliseconds) ? milliseconds : null;
+        }
+
+        function validAppliedReceiptForDisplay(data, now = Date.now()) {
+            if (!data || data.plan_execution !== true) return true;
+            const generated = parseReceiptTimestamp(data.timestamp);
+            const observed = parseReceiptTimestamp(data.execution_observed_at);
+            const expires = parseReceiptTimestamp(data.execution_valid_until);
+            if (generated === null || observed === null || expires === null) return false;
+            const ttl = expires - observed;
+            return ttl > 0 && ttl <= 300000 && observed <= now && now < expires && generated <= observed && generated <= now && now - generated < 600000;
         }
 
         window.renderPredbatPlanGraph = renderPredbatPlanGraph;
@@ -9239,12 +9340,15 @@ def get_plan_graph_js():
             document.querySelectorAll('#carChargingPreview .car-charging-preview-debug').forEach(element => { element.style.display = showDebug ? '' : 'none'; });
             const age = Date.now() - Date.parse(data.timestamp);
             const stale = !Number.isFinite(age) || age > 900000 || age < -60000;
-            const blocked = data.execution_blocked === true || (typeof data.execution_blocked === 'string' && data.execution_blocked.length > 0);
+            const serverBlocked = data.execution_blocked === true || (typeof data.execution_blocked === 'string' && data.execution_blocked.length > 0);
+            const invalidAppliedReceipt = data.plan_execution === true && !validAppliedReceiptForDisplay(data);
+            const blocked = serverBlocked || invalidAppliedReceipt;
+            const blockedReason = serverBlocked ? data.execution_blocked : (invalidAppliedReceipt ? 'invalid or expired execution receipt' : false);
             const validRows = normaliseRows(data);
             const plotReady = !stale && !blocked && data.plan_unavailable !== true && validRows.rows.length > 0 && !validRows.overlap;
             if (timestamp) timestamp.style.display = plotReady ? 'none' : '';
             const safeData = stale || blocked || data.plan_unavailable === true
-                ? {...data, rows:[], plan_unavailable:!blocked, execution_blocked:blocked ? data.execution_blocked : false}
+                ? {...data, rows:[], plan_unavailable:!blocked, execution_blocked:blocked ? blockedReason : false}
                 : data;
             renderPredbatPlanGraph(container, safeData);
         };

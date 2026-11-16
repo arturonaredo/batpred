@@ -41,6 +41,7 @@ import shutil
 import subprocess
 import tempfile
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 from car_charging_view import (
     build_car_charging_plan_view,
@@ -779,22 +780,23 @@ def test_html_plan_includes_the_scoped_combined_plan_graph():
     assert "setInterval(fetchAndRenderPlan, 5000)" in html
 
 
-def _plan_graph_browser_rows():
-    """Return literal forecast rows spanning 48 elapsed hours, with a partial slot and a gap."""
-    start = datetime(2026, 11, 1, 3, 45, tzinfo=timezone.utc)
-    stop = start + timedelta(hours=48)
+def _plan_graph_browser_rows(start=None):
+    """Return forecast rows spanning 48 elapsed hours, with a partial slot and a gap."""
+    start = start if start is not None else datetime(2026, 11, 1, 3, 45, tzinfo=timezone.utc)
+    start_utc = start.astimezone(timezone.utc)
+    stop = start_utc + timedelta(hours=48)
     rows = []
-    cursor = start
+    cursor = start_utc
     index = 0
     while cursor < stop:
-        horizon_end = start + timedelta(hours=24 if cursor < start + timedelta(hours=24) else 48)
+        horizon_end = start_utc + timedelta(hours=24 if cursor < start_utc + timedelta(hours=24) else 48)
         minutes = min(15 if index == 0 else 30, int((horizon_end - cursor).total_seconds() / 60))
         next_cursor = cursor + timedelta(minutes=minutes)
         if index != 12:  # An intentional missing interval must stay visibly empty.
             rows.append(
                 {
-                    "time": cursor.isoformat(),
-                    "plan_interval_end": next_cursor.isoformat(),
+                    "time": cursor.astimezone(start.tzinfo).isoformat(),
+                    "plan_interval_end": next_cursor.astimezone(start.tzinfo).isoformat(),
                     "soc_percent": 50 + index / 10,
                     "soc_end_percent": 50.1 + index / 10,
                     "pv_forecast": 0.3 if index == 0 else 0.2,
@@ -811,7 +813,7 @@ def _plan_graph_browser_rows():
     return rows
 
 
-def _run_plan_graph_browser(data, exercise_graph):
+def _run_plan_graph_browser(data, exercise_graph, preview_html="", viewport_width=1280, timezone_id="UTC"):
     """Execute the real Plan renderer in headless Chrome and return its DOM assertions."""
     import web_helper
 
@@ -824,11 +826,11 @@ def _run_plan_graph_browser(data, exercise_graph):
     document = """<!doctype html>
 <html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Plan graph browser test</title></head><body>
-<div id="carChargingPreview"></div><div id="staleWarning" style="display:none"></div>
+<div id="carChargingPreview">PREVIEW_HTML</div><div id="staleWarning" style="display:none"></div>
 <div id="planError" style="display:none"></div><input id="debugToggle" type="checkbox"><span id="planTimestamp"></span>
 <div id="planContainer"></div><pre id="graphTestResults"></pre>
 <script>window.planData = DATA;</script>
-""".replace("DATA", encoded_data)
+""".replace("DATA", encoded_data).replace("PREVIEW_HTML", preview_html)
     document += web_helper.get_plan_renderer_js()
     document += graph_renderer()
     document += "<script>" + exercise_graph + "</script></body></html>"
@@ -836,12 +838,12 @@ def _run_plan_graph_browser(data, exercise_graph):
         page_file.write(document)
         page_file.flush()
         result = subprocess.run(
-            [chrome, "--headless", "--no-sandbox", "--disable-gpu", "--force-time-zone=America/New_York", "--window-size=1280,900", "--virtual-time-budget=1500", "--dump-dom", "file://" + page_file.name],
+            [chrome, "--headless", "--no-sandbox", "--disable-gpu", "--force-time-zone=" + timezone_id, "--window-size={},900".format(viewport_width), "--virtual-time-budget=1500", "--dump-dom", "file://" + page_file.name],
             capture_output=True,
             text=True,
             check=False,
             timeout=30,
-            env={**os.environ, "TZ": "America/New_York"},
+            env={**os.environ, "TZ": timezone_id},
         )
     assert result.returncode == 0, result.stderr
     match = re.search(r'<pre id="graphTestResults">(.*?)</pre>', result.stdout, flags=re.DOTALL)
@@ -926,7 +928,7 @@ document.querySelector('#planGraphClose').click();
     assert result["solarSegmentCount"] < result["inputRows"], result
     assert "valor" in result["invalidValueWarning"].lower(), result
     assert result["gapCount"] > 0, result
-    assert "GMT-4" in result["axis"] and "GMT-5" in result["axis"], result
+    assert "UTC" in result["axis"], result
     assert result["initiallyClosed"] and result["focusOnOpen"] == "planGraphClose", result
     assert result["drawerLabelled"], result
     assert result["timestampHidden"] and result["drawerHasPublishedTimestamp"], result
@@ -935,6 +937,241 @@ document.querySelector('#planGraphClose').click();
     assert result["unsupportedRangeHidden"], result
     assert result["unavailableCleared"] and result["blockedCleared"] and result["staleCleared"], result
     assert result["timestampVisibleWhenStale"], result
+
+
+def _fresh_applied_report(now):
+    """Build a paired applied receipt suitable for the full /plan display path."""
+    report = _good_report(status="applied", now=now, generated_minutes_ago=5)
+    report.update(
+        requested_mode="apply",
+        execution_enabled=True,
+        actuator_signals_modified=True,
+        execution_observed_at=(now - timedelta(seconds=30)).isoformat(),
+        execution_valid_until=(now + timedelta(seconds=270)).isoformat(),
+    )
+    return report
+
+
+def test_plan_graph_browser_preserves_site_clock_and_mobile_plot_interactions():
+    """At 360px, site offsets/DST remain visible and plot clicks map to the plotted time range."""
+
+    now = datetime.now(timezone.utc)
+    start = datetime(2026, 10, 25, 1, 15, tzinfo=ZoneInfo("Europe/London"))
+    rows = _plan_graph_browser_rows(start)
+    rows[0]["soc_percent"] = -0.05
+    rows[0]["soc_end_percent"] = 100.05
+    rows[1]["soc_percent"] = None
+    rows[1]["soc_end_percent"] = None
+    rows[2]["soc_percent"] = 140
+    data = {
+        "timestamp": now.isoformat(),
+        "plan_simulation": True,
+        "currency_symbols": ["£", "p"],
+        "recorded_cost": 1.25,
+        "rows": rows,
+    }
+    exercise = r"""
+refreshPlan();
+let chart = document.querySelector('#planGraphSvg');
+const initialAxes = Array.from(chart.querySelectorAll('.plan-graph-axis-label'));
+const axisFont = Math.min(...Array.from(chart.querySelectorAll('.pg-axis')).filter(el => /\d/.test(el.textContent)).map(el => parseFloat(getComputedStyle(el).fontSize) * el.getScreenCTM().a));
+const axisBounds = initialAxes.map(el => el.getBoundingClientRect()).sort((a,b) => a.left - b.left);
+const axesDoNotOverlap = axisBounds.every((rect, index) => index === 0 || axisBounds[index - 1].right <= rect.left + 1);
+const axis = initialAxes.map(el => el.textContent).join(' ');
+const pageDoesNotOverflow = document.documentElement.scrollWidth <= innerWidth;
+chart.focus();
+for (let index = 0; index < 6; index += 1) chart.dispatchEvent(new KeyboardEvent('keydown', {key:'ArrowRight', bubbles:true}));
+const movedAwayFromFirst = !chart.getAttribute('aria-label').includes('01:15');
+const firstSegment = chart.querySelector('.plan-graph-battery-line');
+const box = firstSegment.getBBox();
+const point = new DOMPoint(box.x + box.width / 2, box.y + box.height / 2).matrixTransform(firstSegment.getScreenCTM());
+chart.dispatchEvent(new MouseEvent('click', {clientX:point.x, clientY:point.y, bubbles:true}));
+const pointerSelectsFirst = chart.getAttribute('aria-label').includes('01:15');
+const clippedSocLine = chart.querySelector('.plan-graph-battery-line title')?.textContent || '';
+chart.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', bubbles:true}));
+const details = document.querySelector('#planGraphDialog');
+const detailText = details.textContent;
+details.close();
+chart = document.querySelector('#planGraphSvg');
+chart.focus();
+chart.dispatchEvent(new KeyboardEvent('keydown', {key:'Home', bubbles:true}));
+chart.dispatchEvent(new KeyboardEvent('keydown', {key:'ArrowRight', bubbles:true}));
+const missingSocHasNoDot = chart.querySelectorAll('.pg-cursor-dot').length === 0;
+chart.dispatchEvent(new KeyboardEvent('keydown', {key:'ArrowRight', bubbles:true}));
+const grossSocHasNoDot = chart.querySelectorAll('.pg-cursor-dot').length === 0;
+const invalidValueWarning = document.querySelector('#planGraphAlert').textContent;
+document.getElementById('graphTestResults').textContent = JSON.stringify({
+  axis, axisFont, axesDoNotOverlap, pageDoesNotOverflow, movedAwayFromFirst, pointerSelectsFirst,
+  clippedSocLine, detailText, missingSocHasNoDot, grossSocHasNoDot, invalidValueWarning
+});
+"""
+    result = _run_plan_graph_browser(data, exercise, viewport_width=360, timezone_id="UTC")
+    if result is None:
+        return
+    assert "01:15" in result["axis"] and "UTC+01:00" in result["axis"] and "UTC" in result["axis"], result
+    assert result["axisFont"] >= 9, result
+    assert result["axesDoNotOverlap"] and result["pageDoesNotOverflow"], result
+    assert result["movedAwayFromFirst"] and result["pointerSelectsFirst"], result
+    assert "-0,1%" in result["clippedSocLine"] and "100,1%" in result["clippedSocLine"], result
+    assert "01:15" in result["detailText"] and "UTC+01:00" in result["detailText"], result
+    assert result["missingSocHasNoDot"] and result["grossSocHasNoDot"], result
+    assert "valor" in result["invalidValueWarning"].lower(), result
+
+
+def test_plan_graph_browser_preserves_chart_focus_and_dialog_return_target():
+    """A healthy redraw retains SVG keyboard focus so the next arrow still advances selection."""
+    now = datetime.now(timezone.utc)
+    data = {
+        "timestamp": now.isoformat(),
+        "plan_simulation": True,
+        "currency_symbols": ["£", "p"],
+        "recorded_cost": 1.25,
+        "rows": _plan_graph_browser_rows(),
+    }
+    exercise = r"""
+refreshPlan();
+let chart = document.querySelector('#planGraphSvg');
+chart.focus();
+chart.dispatchEvent(new KeyboardEvent('keydown', {key:'ArrowRight', bubbles:true}));
+const selectedBeforeRefresh = chart.getAttribute('aria-label');
+refreshPlan();
+chart = document.querySelector('#planGraphSvg');
+const focusAfterRefresh = document.activeElement === chart;
+const selectedAfterRefresh = chart.getAttribute('aria-label');
+chart.dispatchEvent(new KeyboardEvent('keydown', {key:'ArrowRight', bubbles:true}));
+const selectedAfterNextArrow = chart.getAttribute('aria-label');
+chart.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', bubbles:true}));
+const dialog = document.querySelector('#planGraphDialog');
+refreshPlan();
+const refreshedDialog = document.querySelector('#planGraphDialog');
+const focusInsideRefreshedDialog = refreshedDialog.open && document.activeElement.id === 'planGraphClose';
+const returnTargetAfterRefresh = refreshedDialog._returnFocusTo?.id || '';
+refreshedDialog.addEventListener('close', () => setTimeout(() => document.getElementById('graphTestResults').textContent = JSON.stringify({
+  selectedBeforeRefresh, selectedAfterRefresh, selectedAfterNextArrow, focusAfterRefresh,
+  focusInsideRefreshedDialog, returnTargetAfterRefresh,
+  focusReturnedToChart:document.activeElement.id === 'planGraphSvg', focusReturnId:document.activeElement.id
+}), 0), {once:true});
+refreshedDialog.querySelector('#planGraphClose').click();
+"""
+    result = _run_plan_graph_browser(data, exercise)
+    if result is None:
+        return
+    assert result["focusAfterRefresh"], result
+    assert result["selectedBeforeRefresh"] == result["selectedAfterRefresh"], result
+    assert result["selectedAfterNextArrow"] != result["selectedAfterRefresh"], result
+    assert result["focusInsideRefreshedDialog"] and result["focusReturnedToChart"], result
+
+
+def test_plan_page_browser_keeps_healthy_applied_copy_in_the_closed_drawer():
+    """The real preview root remains while healthy explanatory text is quiet until its drawer opens."""
+
+    now = datetime.now(timezone.utc)
+    report = _fresh_applied_report(now)
+    preview_html = render_car_charging_preview(report, _native_diagnostic("ok", peak_w=5400, limit_w=6000), now=now)
+    data = {
+        "timestamp": report["generated_at"],
+        "plan_simulation": False,
+        "plan_execution": True,
+        "execution_observed_at": report["execution_observed_at"],
+        "execution_valid_until": report["execution_valid_until"],
+        "currency_symbols": ["£", "p"],
+        "recorded_cost": 1.25,
+        "rows": _plan_graph_browser_rows(),
+    }
+    exercise = r"""
+(async () => {
+refreshPlan();
+const previewRootExists = !!document.querySelector('#carChargingPreview .car-charging-preview');
+const oldCopyHidden = !/(Active plan|Command observed|Recorded so far|Forecast cost|Future forecast|Flows \/ interval detail)/i.test(document.body.innerText);
+const defaultDrawerClosed = !document.querySelector('#planGraphDialog').open;
+const chart = document.querySelector('#planGraphSvg');
+chart.focus();
+chart.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', bubbles:true}));
+const drawerText = document.querySelector('#planGraphDialog').innerText;
+const appliedContextInDrawer = drawerText.includes('Plan aplicado') && drawerText.includes('previsión futura'); // cspell:disable-line
+window.fetch = async () => ({ok:true, json:async() => ({
+  plan:window.planData, yesterday:null, baseline:null, overrides:{}, overrides_hash:'',
+  history_days:[], car_charging_view:'<section class="car-charging-preview"><div id="graph-test-warning" role="alert">Safety warning remains visible after polling</div></section>'
+})});
+await fetchAndRenderPlan();
+const warningVisibleAfterPoll = document.querySelector('#graph-test-warning')?.getAttribute('role') === 'alert' && document.querySelector('#graph-test-warning').offsetParent !== null;
+const previewRootSurvivesPoll = !!document.querySelector('#carChargingPreview');
+document.getElementById('graphTestResults').textContent = JSON.stringify({previewRootExists, oldCopyHidden, defaultDrawerClosed, appliedContextInDrawer, warningVisibleAfterPoll, previewRootSurvivesPoll});
+})();
+"""
+    result = _run_plan_graph_browser(data, exercise, preview_html=preview_html)
+    if result is None:
+        return
+    assert result["previewRootExists"] and result["previewRootSurvivesPoll"], result
+    assert result["oldCopyHidden"] and result["defaultDrawerClosed"], result
+    assert result["appliedContextInDrawer"], result
+    assert result["warningVisibleAfterPoll"], result
+
+
+def test_plan_graph_browser_rejects_invalid_applied_receipts_and_expires_unchanged_cache():
+    """Applied graph details fail closed for bad receipts, including unchanged responses after expiry."""
+    now = datetime.now(timezone.utc)
+    now_ms = int(now.timestamp() * 1000)
+    data = {
+        "timestamp": (now - timedelta(seconds=60)).isoformat(),
+        "plan_simulation": False,
+        "plan_execution": True,
+        "execution_observed_at": (now - timedelta(seconds=30)).isoformat(),
+        "execution_valid_until": (now + timedelta(seconds=270)).isoformat(),
+        "currency_symbols": ["£", "p"],
+        "recorded_cost": 1.25,
+        "rows": _plan_graph_browser_rows(),
+    }
+    exercise = r"""
+(async () => {
+const originalDateNow = Date.now;
+const now = NOW_MS;
+Date.now = () => now;
+const source = window.planData;
+const sourceJson = JSON.stringify(source);
+const validUntil = Date.parse(source.execution_valid_until);
+const badReceipts = [
+  {...source, execution_observed_at:undefined},
+  {...source, execution_observed_at:'not-an-iso-date'},
+  {...source, execution_observed_at:new Date(now + 1000).toISOString()},
+  {...source, execution_valid_until:new Date(now).toISOString()},
+  {...source, execution_valid_until:new Date(Date.parse(source.execution_observed_at) + 301000).toISOString()},
+  {...source, timestamp:new Date(now + 1000).toISOString()},
+  {...source, timestamp:'malformed'},
+];
+const invalidReceiptsCleared = badReceipts.every(receipt => {
+  window.planData = receipt;
+  refreshPlan();
+  return document.querySelectorAll('#planGraphSvg .plan-graph-battery-line').length === 0 &&
+    !document.querySelector('#planGraphDialog[open]') && document.querySelector('#planGraphExecutionContext').hidden;
+});
+window.planData = source;
+refreshPlan();
+document.querySelector('#planGraphDetails').click();
+const detailWasOpen = !!document.querySelector('#planGraphDialog[open]');
+window.fetch = async () => ({ok:true, json:async() => ({unchanged:true})});
+Date.now = () => validUntil + 1;
+await fetchAndRenderPlan();
+const cachedExpiryClearedGraph = document.querySelectorAll('#planGraphSvg .plan-graph-battery-line').length === 0;
+const cachedExpiryClosedDetail = !document.querySelector('#planGraphDialog[open]');
+const appliedSourceUnchanged = JSON.stringify(source) === sourceJson;
+Date.now = () => now;
+window.planData = {...source, plan_execution:false, plan_simulation:true, execution_observed_at:'bad', execution_valid_until:'bad'};
+refreshPlan();
+const shadowCandidateStillVisible = document.querySelectorAll('#planGraphSvg .plan-graph-battery-line').length > 0;
+Date.now = originalDateNow;
+document.getElementById('graphTestResults').textContent = JSON.stringify({
+  invalidReceiptsCleared, detailWasOpen, cachedExpiryClearedGraph, cachedExpiryClosedDetail,
+  appliedSourceUnchanged, shadowCandidateStillVisible
+});
+})();
+""".replace("NOW_MS", str(now_ms))
+    result = _run_plan_graph_browser(data, exercise)
+    if result is None:
+        return
+    assert result["invalidReceiptsCleared"] and result["detailWasOpen"], result
+    assert result["cachedExpiryClearedGraph"] and result["cachedExpiryClosedDetail"], result
+    assert result["appliedSourceUnchanged"] and result["shadowCandidateStillVisible"], result
 
 
 def test_html_plan_embeds_car_planning_plan_data_with_car_planning_simulation_flag():
@@ -1316,6 +1553,10 @@ def run_car_planning_single_table_tests(base):
         test_html_plan_contains_no_second_table,
         test_html_plan_includes_the_scoped_combined_plan_graph,
         test_plan_graph_browser_uses_interval_data_and_safe_accessible_details,
+        test_plan_graph_browser_preserves_site_clock_and_mobile_plot_interactions,
+        test_plan_graph_browser_preserves_chart_focus_and_dialog_return_target,
+        test_plan_page_browser_keeps_healthy_applied_copy_in_the_closed_drawer,
+        test_plan_graph_browser_rejects_invalid_applied_receipts_and_expires_unchanged_cache,
         test_html_plan_embeds_car_planning_plan_data_with_car_planning_simulation_flag,
         test_html_plan_plan_data_timestamp_is_report_generated_at,
         test_html_plan_car_planning_banner_appears_above_container,
