@@ -1588,9 +1588,44 @@ document.getElementById('graphTestResults').textContent=JSON.stringify({
     assert "Coche" in result["carSummary"] and "kWh" in result["carSummary"], result
 
 
+def test_plan_graph_uses_connected_lines_without_bridging_unknowns():
+    """All power series connect at known boundaries; missing data and gaps stay open."""
+    rows = _plan_graph_browser_rows()
+    for index, row in enumerate(rows):
+        row["plan_steps"] = [{"start": row["time"], "end": row["plan_interval_end"], "battery_kw": -2 if index == 0 else 1, "grid_kw": 3 if index == 0 else 0}]
+    rows[2].update(pv_forecast=None, car_charging=None, plan_steps=[])
+    data = {"timestamp": datetime.now(timezone.utc).isoformat(), "plan_simulation": True, "currency_symbols": ["€", "c"], "rows": rows}
+    exercise = r"""
+refreshPlan();
+const svg=document.getElementById('planGraphSvg');
+const paths=cls=>[...svg.querySelectorAll(cls)];
+const connected=path=>path.getAttribute('d').includes(' V ');
+const classes=['.plan-graph-solar-segment','.plan-graph-load-segment','.plan-graph-ev-power','.plan-graph-grid-power','.plan-graph-battery-power'];
+const gapIndex=window.planData.rows.findIndex((r,i)=>i>0 && Date.parse(r.time)>Date.parse(window.planData.rows[i-1].plan_interval_end));
+const solar=paths(classes[0]),car=paths(classes[2]),native=paths(classes[3]);
+document.getElementById('graphTestResults').textContent=JSON.stringify({
+ connected:classes.every(cls=>connected(paths(cls)[1])),
+ noBridgeMissing:!connected(solar[2]) && !connected(car[2]) && !connected(native[2]),
+ noBridgeGap:!connected(solar[gapIndex-1]) && !connected(car[gapIndex-1]) && !connected(native[gapIndex-1]),
+ solidLines:classes.every(cls=>getComputedStyle(paths(cls)[0]).strokeDasharray==='none'),
+ noDots:svg.querySelectorAll('circle').length===0,
+ carInMainPlot:car[0].getBBox().y>=50 && car[0].getBBox().y<=400,
+ carOnTop:[...svg.children].indexOf(car[0])>[...svg.children].indexOf(paths('.plan-graph-grid-power')[0]),
+ carTitle:car[3].querySelector('title').textContent,
+ inputUnchanged:window.planData.rows[2].car_charging===null && window.planData.rows[2].pv_forecast===null
+});
+"""
+    result = _run_plan_graph_browser(data, exercise)
+    if result is None:
+        return
+    assert all(result[key] for key in ("connected", "noBridgeMissing", "noBridgeGap", "solidLines", "noDots", "carInMainPlot", "carOnTop", "inputUnchanged")), result
+    assert "0,50 kW" in result["carTitle"] and "0,250 kWh" in result["carTitle"], result
+
+
 def run_car_planning_single_table_tests(base):
     """Run all single-table integration regressions against the live web stack."""
     tests = [
+        test_plan_graph_uses_connected_lines_without_bridging_unknowns,
         test_plan_graph_combines_power_soc_car_and_native_flows,
         test_plan_graph_full_width_hour_grid_solar_and_rate_bands,
         test_pv_colour_matches_displayed_energy,
