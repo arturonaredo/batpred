@@ -605,8 +605,115 @@ def test_empty_battery_readiness_keeps_live_safety_checks(base):
         assert base.car_charging_execution is None, (fault, base.car_charging_report)
 
 
+def test_continuous_targets_keep_ev_prices_and_policy_boundaries(base):
+    """Only consolidate declining targets inside a same-price eligible readiness run."""
+    from power_readiness import prepare_candidate, continuous_charge_windows
+
+    options, slots, seed = _inputs(base)
+    options["ev_charging_priority"] = "cost"
+    prepared = prepare_candidate(base, options, seed, slots, ([], [], []))
+    original = deepcopy(prepared.native_policy_windows)
+    # Use explicit alternating native targets, not a modified SOC drawing.
+    windows = ([], [{"start": base.minutes_now + s.start_min, "end": base.minutes_now + s.start_min + s.duration_min, "average": s.import_price} for s in slots[:72]], [base.soc_max * (0.35 if i % 2 == 0 else 0.56) for i in range(72)])
+    before = deepcopy(windows)
+    joined, evidence = continuous_charge_windows(base, options, prepared, slots, windows)
+    assert joined[0] == windows[0] and windows == before
+    assert joined[1] == [{"start": windows[1][0]["start"], "end": windows[1][-1]["end"], "average": windows[1][0]["average"]}]
+    assert joined[2] == [base.soc_max * 0.56]
+    assert evidence["target_changes_after"] < evidence["target_changes_before"]
+    assert prepared.native_policy_windows == original
+    for priority in ("now", "solar", "asap"):
+        unchanged, proof = continuous_charge_windows(base, {**options, "ev_charging_priority": priority}, prepared, slots, windows)
+        assert unchanged == windows and proof["changed"] is False
+    # A missing interval, tariff boundary or explicit non-charge mode is not bridged.
+    gap_slots = list(slots)
+    gap_slots.pop(5)
+    unchanged, proof = continuous_charge_windows(base, options, prepared, gap_slots, windows)
+    assert unchanged == windows and proof["changed"] is False
+    from dataclasses import replace
+
+    priced_slots = [replace(slot, import_price=9.0) if 30 <= i < 72 else slot for i, slot in enumerate(slots)]
+    priced_windows = deepcopy(windows)
+    for window in priced_windows[1][30:]:
+        window["average"] = 9.0
+    joined, _ = continuous_charge_windows(base, options, prepared, priced_slots, priced_windows)
+    assert len(joined[1]) == 2 and joined[1][0]["average"] == 8.1 and joined[1][1]["average"] == 9.0
+    dear_slots = [replace(slot, import_price=10.0) for slot in slots]
+    unchanged, proof = continuous_charge_windows(base, options, prepared, dear_slots, windows)
+    assert unchanged == windows and not proof["changed"]
+    manual = deepcopy(prepared)
+    manual.actions[35].battery_mode = "demand"
+    manual_windows = deepcopy(windows)
+    manual_windows[2][35] = base.soc_max * 0.35
+    joined, _ = continuous_charge_windows(base, options, manual, slots, manual_windows)
+    boundary = base.minutes_now + slots[35].start_min
+    assert not any(w["start"] < boundary < w["end"] for w in joined[1])
+
+
+def test_continuous_targets_require_real_paired_non_regression(base):
+    """A real native replay must remove charge pulses without buying a worse plan."""
+    from car_charging_plan import _continuous_charge_alternative, _replay_candidate
+    from car_charging_household import _native_adjusted_cost
+    from power_readiness import prepare_candidate
+
+    options, slots, seed = _inputs(base)
+    options.update(ev_charging_priority="cost")
+    base.soc_kw = base.soc_max * 0.45
+    prepared = prepare_candidate(base, options, seed, slots, ([], [], []))
+    windows = ([], [{"start": base.minutes_now + s.start_min, "end": base.minutes_now + s.start_min + s.duration_min, "average": s.import_price} for s in slots[:72]], [base.soc_max * (0.35 if i % 2 == 0 else 0.56) for i in range(72)])
+    prepared.native_policy_windows = deepcopy(windows)
+    windows, checks = _replay_candidate(base, options, prepared, slots)
+    assert all(check["passed"] for check in checks.values()), checks
+    costs = _native_adjusted_cost(base, checks)
+    chosen = {
+        "result": prepared,
+        "slots": slots,
+        "windows": windows,
+        "checks": checks,
+        "options": options,
+        "commands": [],
+        "sort_costs": costs,
+        "economic_comparison": {"status": "native_reference_alternative", "reference_costs": costs, "candidate_costs": costs, "battery_plan_improvement": False},
+    }
+    alternative, proof = _continuous_charge_alternative(base, chosen)
+    assert proof["accepted"] is True, proof
+    assert len(alternative["windows"][1]) < len(windows[1])
+    assert alternative["result"].actions == prepared.actions
+    assert alternative["windows"][0] == windows[0]
+    assert all(alternative["sort_costs"][name] <= costs[name] + 0.002 for name in ("nominal", "pv10"))
+    assert chosen["windows"] == windows and chosen["checks"] == checks
+    from car_charging_plan import _replay
+
+    for fault in ("unsafe", "incomplete", "ev_delivery", "expensive"):
+
+        def reject(*args, **kwargs):
+            """Alter only one native replay certificate after executing the real forecast."""
+            check = _replay(*args, **kwargs)
+            if fault == "unsafe":
+                check["passed"] = False
+            elif fault == "incomplete":
+                check["checked_minutes"] -= 5
+            elif fault == "ev_delivery":
+                check["final_ev_kwh"] += 1
+            else:
+                check["horizon_energy_cost"] += 1000
+            return check
+
+        with patch("car_charging_plan._replay", side_effect=reject):
+            rejected, evidence = _continuous_charge_alternative(base, chosen)
+        assert rejected is chosen and evidence["accepted"] is False, (fault, evidence)
+    strict = deepcopy(chosen)
+    strict["economic_comparison"].update(status="componentwise_improvement", reference_battery_mode_switches=0)
+    with patch("car_charging_household._joint_cost_improvement", return_value=False) as gate:
+        rejected, evidence = _continuous_charge_alternative(base, strict)
+    gate.assert_called_once()
+    assert rejected is strict and evidence["reason"] == "continuity_material_improvement_lost"
+
+
 def run_power_readiness_tests(base):
     """Run service-policy and complete native numerical regressions."""
+    test_continuous_targets_keep_ev_prices_and_policy_boundaries(base)
+    test_continuous_targets_require_real_paired_non_regression(base)
     test_cheap_peak_cover_rejects_unapproved_targets_and_ev_authority(base)
     test_cheap_only_peak_cover_uses_authorised_cap_without_economic_solver(base)
     test_readiness_does_not_enable_economic_continuation_for_late_peak(base)

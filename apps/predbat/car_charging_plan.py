@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import math
+from types import SimpleNamespace
 
 from const import PREDICT_STEP, PREDBAT_MAX_CARS
 from prediction import Prediction
@@ -1180,6 +1181,49 @@ def _digest(value):
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _continuous_charge_alternative(base, selected):
+    """Prefer stable readiness targets only after paired native and monetary non-regression checks."""
+    from power_readiness import continuous_charge_windows
+    from car_charging_household import _native_adjusted_cost, _paired_passed, _joint_cost_improvement
+
+    result, slots, original = selected["result"], selected["slots"], selected["windows"]
+    rejected = {"accepted": False}
+    try:
+        windows, proposal = continuous_charge_windows(base, selected["options"], result, slots, original)
+        if not proposal["changed"]:
+            return selected, {**rejected, **proposal}
+        if not _paired_passed(selected["checks"], base.forecast_minutes):
+            return selected, {**rejected, "reason": "original_replay_incomplete"}
+        original_costs = _native_adjusted_cost(base, selected["checks"])
+        if original_costs is None:
+            return selected, {**rejected, "reason": "original_costs_unavailable"}
+        trial = SimpleNamespace(**vars(result))
+        trial.native_policy_windows = deepcopy(windows)
+        checks = {name: _replay(base, selected["options"], trial, slots, windows, scenario) for name, scenario in (("nominal", 0), ("pv10", 1))}
+        for check in checks.values():
+            check.pop("_charge_peak_kwh", None)
+        if not _paired_passed(checks, base.forecast_minutes):
+            return selected, {**rejected, "reason": "continuity_replay_unsafe_or_incomplete", "native_reasons": _check_reasons(checks)}
+        if windows[0] != original[0] or any(abs(checks[name]["final_ev_kwh"] - selected["checks"][name]["final_ev_kwh"]) > 0.002 for name in ("nominal", "pv10")):
+            return selected, {**rejected, "reason": "continuity_ev_delivery_changed"}
+        costs = _native_adjusted_cost(base, checks)
+        if costs is None or any(costs[name] > original_costs[name] + 0.002 for name in ("nominal", "pv10")):
+            return selected, {**rejected, "reason": "continuity_cost_regression"}
+        comparison = deepcopy(selected["economic_comparison"])
+        reference = comparison["reference_costs"]
+        deltas = {name: costs[name] - reference[name] for name in ("nominal", "pv10")}
+        if any(delta > 0.002 for delta in deltas.values()):
+            return selected, {**rejected, "reason": "continuity_reference_cost_regression"}
+        if comparison.get("status") == "componentwise_improvement" and not _joint_cost_improvement(costs, reference, _battery_mode_switches(trial), comparison["reference_battery_mode_switches"]):
+            return selected, {**rejected, "reason": "continuity_material_improvement_lost"}
+        proof = {**proposal, "accepted": True, "original_costs": original_costs, "candidate_costs": costs, "original_windows_sha256": _digest(original), "candidate_windows_sha256": _digest(windows), "paired_replay_passed": True}
+        comparison.update(candidate_costs=costs, candidate_minus_reference=deltas, componentwise_non_regression=True, charge_continuity=proof)
+        chosen = {**selected, "result": trial, "windows": windows, "checks": checks, "sort_costs": costs, "commands": _candidate_commands(base, trial, slots, windows), "economic_comparison": comparison}
+        return chosen, proof
+    except (ValueError, TypeError, KeyError, AttributeError, IndexError):
+        return selected, {**rejected, "reason": "continuity_evidence_invalid"}
+
+
 def _search_joint_cost_candidates(base, options, native_snapshot, configured_candidate, continuous_attempts):
     """Compare all bounded COST candidates with a paired replay of the current native battery plan."""
     from car_charging_household import (
@@ -1543,6 +1587,8 @@ def _search_joint_cost_candidates(base, options, native_snapshot, configured_can
     if not accepted:
         return None, attempts
     selected = min(accepted, key=lambda item: (max(item["sort_costs"].values()), sum(item["sort_costs"].values()), item["source"] != "native_reference_alternative"))
+    selected, continuity = _continuous_charge_alternative(base, selected)
+    selected = {**selected, "economic_comparison": {**selected["economic_comparison"], "charge_continuity_attempt": continuity}}
     return selected, attempts
 
 
