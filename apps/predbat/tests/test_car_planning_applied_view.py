@@ -423,14 +423,15 @@ def test_block_reason_uses_now_check_when_no_reason():
 
 
 def test_block_reason_inverter_observed_label_generic():
-    """Do not present an observation disclaimer as a physical confirmation."""
+    """Do not confuse missing display data with a hardware confirmation failure."""
     from car_charging_view import _applied_block_reason
 
     now = _wall_now()
     report = _applied_report(now=now)
     report["execution_reason"] = "inverter_observed_not_hardware_confirmed"
+    report.pop("preview")
     reason = _applied_block_reason(report, now)
-    assert reason == "awaiting hardware confirmation", reason
+    assert reason == "paired replay preview missing or invalid", reason
 
 
 # ----------------------------------------------------------------------
