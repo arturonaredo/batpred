@@ -7265,9 +7265,9 @@ def get_plan_renderer_js():
                 const future = jsonData.rows.map(row => row.cost_change);
                 const money = value => Number.isFinite(value) ? `${escapePlanText(jsonData.currency_symbols?.[0] || '')}${value.toFixed(2)}` : '—';
                 const estimated = future.every(Number.isFinite) ? future.reduce((a,b) => a+b,0) : null;
-                html += `<p class="plan-cost-summary">Recorded so far: <b>${money(jsonData.recorded_cost)}</b> · Forecast cost (shown horizon): <b>${money(estimated)}</b></p>`;
-                html += `<p style="font-size:0.9em">Future forecast · Predbat local time (${zone}; each timestamp keeps its own offset). Targets are ceilings, not discharge orders. Flows are predictions, not hardware confirmation.</p>`;
-                html += '<style>.plan-table-scroll{max-width:100%;overflow-x:auto}.plan-table-scroll th{position:sticky;top:0;background:var(--bg-color,#fff);z-index:1}.plan-table-scroll td{vertical-align:top}.plan-table-scroll details table{font-size:0.85em;white-space:nowrap}.plan-table-scroll summary{cursor:pointer}.plan-table-scroll .plan-reason{min-width:10em;max-width:16em}</style>';
+                html += `<p class="plan-cost-summary" style="white-space:normal">Recorded so far: <b>${money(jsonData.recorded_cost)}</b> · Forecast cost (shown horizon): <b>${money(estimated)}</b></p>`;
+                html += `<p style="font-size:0.9em;white-space:normal">Future forecast · Predbat local time (${zone}; each timestamp keeps its own offset). Targets are ceilings, not discharge orders. Flows are predictions, not hardware confirmation. Scroll the table sideways for all columns.</p>`;
+                html += '<style>.plan-table-scroll{max-width:100%;overflow-x:auto}.plan-table-scroll>table{min-width:960px;font-size:13px!important}.plan-table-scroll th{position:sticky;top:0;background:var(--bg-color,#fff);z-index:1}.plan-table-scroll td{vertical-align:top}.plan-table-scroll details table{font-size:0.85em;white-space:nowrap}.plan-table-scroll summary{cursor:pointer}.plan-table-scroll .plan-reason{min-width:10em;max-width:16em}</style>';
             }
             html += '<div class="plan-table-scroll"><table>';
             const cellStyle = 'style="padding: 4px;"';
