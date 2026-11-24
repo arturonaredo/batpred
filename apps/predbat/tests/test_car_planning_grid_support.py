@@ -496,6 +496,84 @@ def test_joint_native_reference_reuses_identical_ev_pattern_and_native_battery_w
     assert all(check["passed"] for check in checks.values())
 
 
+def test_native_plan_snapshot_clips_only_to_replay_horizon_and_preserves_provenance(base):
+    """An active native window and one crossing the horizon remain exact except for clipped bounds."""
+    from car_charging_household import _snapshot_native_plan, _replay_native_joint_plan
+
+    _setup(base, minutes=10)
+    now = base.minutes_now
+    first = {"start": now - 5, "end": now + 5, "average": 8.1, "target": base.soc_max * 0.88, "mode": "charge", "source": "native"}
+    second = {"start": now + 5, "end": now + 15, "average": 4.2, "target": base.soc_max, "mode": "charge", "source": "native"}
+    base.plan_valid = True
+    base.plan_made_by_version = "current-cycle-version"
+    base.plan_last_updated = base.now_utc
+    base.plan_last_updated_minutes = now
+    base.charge_window_best = [deepcopy(first), deepcopy(second)]
+    base.charge_limit_best = [first["target"], second["target"]]
+    base.export_window_best = []
+    base.export_limits_best = []
+
+    snapshot = _snapshot_native_plan(base)
+
+    expected_first = {**first, "start": now}
+    expected_second = {**second, "end": now + base.forecast_minutes}
+    assert snapshot == {
+        "plan_valid": True,
+        "plan_provenance": {
+            "plan_made_by_version": "current-cycle-version",
+            "plan_last_updated": base.now_utc,
+            "plan_last_updated_minutes": now,
+        },
+        "charge_windows": [expected_first, expected_second],
+        "charge_limits": [first["target"], second["target"]],
+    }
+
+    slots = [Slot(index, index * 5, 5, 0.1, 0, 10, 0) for index in range(2)]
+    candidate = SimpleNamespace(actions=tuple(SimpleNamespace(slot_index=index, battery_mode="demand", ev_action="on" if index == 0 else "off", discharge_limit_kw=None) for index in range(2)))
+    ev_windows = _native_windows(base, candidate, slots)[0]
+    replayed = []
+
+    def capture_replay(_base, _options, result, observed_slots, windows, scenario):
+        """Record the clipped native charge modes replayed alongside the fixed EV slots."""
+        replayed.append(([(action.battery_mode, action.ev_action) for action in result.actions], windows, scenario))
+        return {"passed": True, "reasons": [], "checked_minutes": base.forecast_minutes}
+
+    with patch("car_charging_plan._replay", side_effect=capture_replay):
+        result, windows, checks = _replay_native_joint_plan(base, {}, snapshot, candidate, slots, ev_windows)
+
+    assert result.actions[0].battery_mode == result.actions[1].battery_mode == "charge"
+    assert windows[1] == snapshot["charge_windows"]
+    assert [item[2] for item in replayed] == [0, 1]
+    assert all(check["passed"] for check in checks.values())
+
+
+def test_native_plan_snapshot_accepts_empty_plan_and_rejects_unsafe_shapes(base):
+    """Empty demand-only plans are valid; malformed, overlapping, misaligned and export plans fail closed."""
+    from car_charging_household import _snapshot_native_plan
+
+    _setup(base, minutes=60)
+    now = base.minutes_now
+    base.plan_valid = True
+    base.export_window_best = []
+    base.export_limits_best = []
+    base.charge_window_best = []
+    base.charge_limit_best = []
+    assert _snapshot_native_plan(base)["charge_windows"] == []
+
+    invalid_plans = (
+        ([{"start": now, "end": now + 10}, {"start": now + 5, "end": now + 15}], [base.soc_max, base.soc_max], [], []),
+        ([{"start": now + 1, "end": now + 10}], [base.soc_max], [], []),
+        ([{"start": now, "target": base.soc_max}], [base.soc_max], [], []),
+        ([{"start": now, "end": now + 5}], [base.soc_max], [{"start": now, "end": now + 5}], [base.soc_max]),
+    )
+    for windows, limits, export_windows, export_limits in invalid_plans:
+        base.charge_window_best = windows
+        base.charge_limit_best = limits
+        base.export_window_best = export_windows
+        base.export_limits_best = export_limits
+        assert _snapshot_native_plan(base) is None
+
+
 def test_joint_cost_improvement_uses_raw_paired_vectors_and_switch_floor():
     """Numerical noise, one-scenario savings, and extra switching cannot qualify COST."""
     from car_charging_household import _joint_cost_improvement
@@ -534,7 +612,7 @@ def test_incident_shaped_early_100_at_19_1_is_rejected_for_native_88_at_8_1(base
         [base.soc_max],
     )
     candidate_checks = {name: {"passed": True, "reasons": [], "checked_minutes": 10, "horizon_energy_cost": 19.1, "battery_cycle_kwh": 0, "final_battery_kwh": 10, "final_ev_kwh": 1} for name in ("nominal", "pv10")}
-    reference_checks = {name: {"passed": True, "reasons": [], "checked_minutes": 10, "horizon_energy_cost": 8.1, "battery_cycle_kwh": 0, "final_battery_kwh": 10, "final_ev_kwh": 1} for name in ("nominal", "pv10")}
+    reference_checks = {name: {"passed": True, "reasons": [], "checked_minutes": 10, "horizon_energy_cost": 8.1, "battery_cycle_kwh": 0, "final_battery_kwh": 10, "final_ev_kwh": 1, "validated_ev_target_kwh": 1} for name in ("nominal", "pv10")}
     native_snapshot = {
         "plan_valid": True,
         "charge_windows": [{"start": base.minutes_now + 5, "end": base.minutes_now + 10, "average": 8.1, "target": base.soc_max * 0.88}],
@@ -569,6 +647,148 @@ def test_incident_shaped_early_100_at_19_1_is_rejected_for_native_88_at_8_1(base
     assert attempts[0]["economic_rejection"] == "no_material_battery_improvement"
 
 
+def test_unsafe_configured_battery_candidate_can_select_safe_native_reference(base):
+    """A failed proposed battery replay still evaluates the same EV timeline on the native battery plan."""
+    from car_charging_plan import _search_joint_cost_candidates
+
+    _setup(base, minutes=10)
+    base.metric_battery_cycle = 0
+    base.metric_battery_value_scaling = 0
+    base.battery_value_rate = lambda _minute: 0
+    options = {"beam": 512, "mode": "apply", "ev_charging_priority": "cost", "control_model": "deye_solarman"}
+    slots = [Slot(index, index * 5, 5, 0.1, 0, 10, 0) for index in range(2)]
+    candidate = SimpleNamespace(
+        status="feasible",
+        total_cost=0,
+        actions=tuple(SimpleNamespace(slot_index=index, battery_mode="charge", ev_action="on" if index == 0 else "off", discharge_limit_kw=None) for index in range(2)),
+    )
+    ev_windows = _native_windows(base, candidate, slots)[0]
+    candidate_windows = (ev_windows, [], [])
+    unsafe_checks = {name: {"passed": False, "reasons": ["site_import_exceeded"], "checked_minutes": 10, "final_ev_kwh": 3, "validated_ev_target_kwh": 3} for name in ("nominal", "pv10")}
+    safe_reference_checks = {name: {"passed": True, "reasons": [], "checked_minutes": 10, "horizon_energy_cost": 12, "battery_cycle_kwh": 0, "final_battery_kwh": 10, "final_ev_kwh": 3, "validated_ev_target_kwh": 3} for name in ("nominal", "pv10")}
+    native_snapshot = {"plan_valid": True, "charge_windows": [], "charge_limits": []}
+    reference_result = SimpleNamespace(
+        status="ordinary_native_joint_reference",
+        actions=tuple(SimpleNamespace(slot_index=index, battery_mode="demand", ev_action="on" if index == 0 else "off", discharge_limit_kw=None) for index in range(2)),
+    )
+    replayed_ev_windows = []
+
+    def replay_reference(_base, _options, snapshot, _candidate, _slots, windows):
+        """Record the reservation that receives its own independent native proof."""
+        assert snapshot == native_snapshot
+        replayed_ev_windows.append(deepcopy(windows))
+        return reference_result, (deepcopy(windows), [], []), deepcopy(safe_reference_checks)
+
+    with (
+        patch("car_charging_plan._replay_candidate", return_value=(candidate_windows, unsafe_checks)),
+        patch("car_charging_household._replay_native_joint_plan", side_effect=replay_reference),
+    ):
+        selected, attempts = _search_joint_cost_candidates(base, options, native_snapshot, (candidate, slots), [])
+
+    assert selected is not None and selected["source"] == "native_reference_alternative"
+    assert replayed_ev_windows == [ev_windows]
+    assert all(not command["ev_on"] or command["start"] < base.minutes_now + 5 for command in selected["commands"])
+    assert selected["economic_comparison"]["battery_plan_improvement"] is False
+    assert selected["economic_comparison"]["same_ev_delivery"] is True
+    assert selected["economic_comparison"]["proposed_candidate_same_ev_delivery"] is None
+    assert selected["economic_comparison"]["candidate_costs"] == selected["economic_comparison"]["reference_costs"]
+    assert attempts[0]["native_passed"] is False
+    assert attempts[0]["economic_rejection"] == "candidate_native_replay_unsafe_or_incomplete"
+
+
+def test_failed_continuous_battery_replay_is_retained_for_native_alternative_only(base):
+    """COST apply may reuse a bounded solver EV block after battery replay fails, but selects only native battery commands."""
+    from car_charging_household import _snapshot_native_plan
+    from car_charging_plan import _continuous_grid_support_shadow, _search_joint_cost_candidates
+
+    _setup(base, minutes=60)
+    base.metric_battery_cycle = 0
+    base.metric_battery_value_scaling = 0
+    base.battery_value_rate = lambda _minute: 0
+    base.plan_valid = True
+    base.charge_window_best = []
+    base.charge_limit_best = []
+    base.export_window_best = []
+    base.export_limits_best = []
+    options = {
+        "arrival": 0,
+        "beam": 512,
+        "control_model": "deye_solarman",
+        "deadline": 60,
+        "ev_charging_priority": "cost",
+        "ev_soc": 0,
+        "grid_charge_support_w": 6000,
+        "house_only": False,
+        "initial_off_minutes": 10,
+        "initially_on": False,
+        "mode": "apply",
+        "off_minutes": 10,
+        "self_consumption_first": False,
+    }
+    slots = [Slot(index, index * 5, 5, 0.1, 0, 10, 0) for index in range(12)]
+    unsafe_checks = {name: {"passed": False, "reasons": ["site_import_exceeded"], "checked_minutes": 60, "final_ev_kwh": 3.1, "validated_ev_target_kwh": 3} for name in ("nominal", "pv10")}
+    safe_reference_checks = {name: {"passed": True, "reasons": [], "checked_minutes": 60, "horizon_energy_cost": 12, "battery_cycle_kwh": 0, "final_battery_kwh": 10, "final_ev_kwh": 3.1, "validated_ev_target_kwh": 3} for name in ("nominal", "pv10")}
+    unsafe_reference_checks = {
+        name: {"passed": False, "reasons": ["site_import_exceeded"], "checked_minutes": 60, "horizon_energy_cost": 12, "battery_cycle_kwh": 0, "final_battery_kwh": 10, "final_ev_kwh": 3.1, "validated_ev_target_kwh": 3} for name in ("nominal", "pv10")
+    }
+
+    def build(_base, trial):
+        """Return solver-feasible actions for the fixed block and a separate flexible attempt."""
+        block = trial.get("ev_continuous_block")
+        actions = tuple(
+            SimpleNamespace(
+                slot_index=slot.index,
+                battery_mode="charge" if block else "demand",
+                ev_action="on" if block and block[0] <= slot.start_min < block[1] else "off",
+                discharge_limit_kw=None,
+            )
+            for slot in slots
+        )
+        return SimpleNamespace(status="feasible", actions=actions, total_cost=1), slots
+
+    def replay_candidate(_base, _trial, result, observed_slots):
+        """Give the proposed battery plan a complete but unsafe paired trace."""
+        return (_native_windows(base, result, observed_slots)[0], [], []), deepcopy(unsafe_checks)
+
+    native_result = SimpleNamespace(
+        status="ordinary_native_joint_reference",
+        actions=tuple(SimpleNamespace(slot_index=slot.index, battery_mode="demand", ev_action="on" if slot.start_min < 30 else "off", discharge_limit_kw=None) for slot in slots),
+    )
+    native_snapshot = _snapshot_native_plan(base)
+    reference_calls = []
+    reference_checks_to_return = [unsafe_reference_checks, safe_reference_checks]
+
+    def replay_reference(_base, _trial, snapshot, candidate, observed_slots, ev_windows):
+        """Accept only the exact solver EV reservation on the current empty native plan."""
+        assert snapshot == native_snapshot
+        assert [(action.ev_action) for action in candidate.actions] == ["on"] * 6 + ["off"] * 6
+        reference_calls.append(deepcopy(ev_windows))
+        windows = (deepcopy(ev_windows), [], [])
+        return native_result, windows, deepcopy(reference_checks_to_return.pop(0))
+
+    with (
+        patch("car_charging_plan._priority_block_starts", return_value=[(0, "coupled_cost")]),
+        patch("car_charging_plan.build_candidate", side_effect=build),
+        patch("car_charging_plan._replay_candidate", side_effect=replay_candidate),
+        patch("car_charging_household._replay_native_joint_plan", side_effect=replay_reference),
+    ):
+        continuous, continuous_attempts = _continuous_grid_support_shadow(base, options)
+        assert continuous is None
+        failed_attempt = next(attempt for attempt in continuous_attempts if "start_offset" in attempt)
+        assert failed_attempt["native_passed"] is False and "_candidate" in failed_attempt
+        unsafe_reference, unsafe_attempts = _search_joint_cost_candidates(base, options, native_snapshot, None, continuous_attempts)
+        assert unsafe_reference is None
+        assert unsafe_attempts[0]["economic_rejection"] == "native_reference_unsafe_or_incomplete"
+        selected, attempts = _search_joint_cost_candidates(base, options, native_snapshot, None, continuous_attempts)
+
+    assert selected is not None and selected["source"] == "native_reference_alternative"
+    assert reference_calls and reference_calls[0]
+    assert all(command["target_soc"] == 0 and not command["freeze"] for command in selected["commands"])
+    assert [command["ev_on"] for command in selected["commands"]] == [True] * 6 + [False] * 6
+    assert attempts[0]["native_passed"] is False
+    assert attempts[0]["economic_rejection"] == "candidate_native_replay_unsafe_or_incomplete"
+
+
 def test_joint_cost_search_keeps_configured_and_continuous_candidates_when_512_fails(base):
     """A failed unrestricted refinement cannot erase an earlier continuous winner or its reasons."""
     from car_charging_plan import _search_joint_cost_candidates
@@ -589,7 +809,7 @@ def test_joint_cost_search_keeps_configured_and_continuous_candidates_when_512_f
     continuous = make_result("continuous", "charge")
     refined = make_result("refined")
     safe_checks = {name: {"passed": True, "reasons": [], "checked_minutes": 10, "horizon_energy_cost": 98.0, "battery_cycle_kwh": 0, "final_battery_kwh": 0, "final_ev_kwh": 3} for name in ("nominal", "pv10")}
-    baseline_checks = {name: {"passed": True, "reasons": [], "checked_minutes": 10, "horizon_energy_cost": 100.0, "battery_cycle_kwh": 0, "final_battery_kwh": 0, "final_ev_kwh": 3} for name in ("nominal", "pv10")}
+    baseline_checks = {name: {"passed": True, "reasons": [], "checked_minutes": 10, "horizon_energy_cost": 100.0, "battery_cycle_kwh": 0, "final_battery_kwh": 0, "final_ev_kwh": 3, "validated_ev_target_kwh": 3} for name in ("nominal", "pv10")}
     refined_failure = {name: {"passed": False, "reasons": ["site_import_exceeded"], "checked_minutes": 10} for name in ("nominal", "pv10")}
     windows = ([], [], [])
     continuous_attempt = {
@@ -768,10 +988,11 @@ def test_household_authorized_metered_route_does_not_require_ev_reads(base):
 
 
 def test_household_fallback_refuses_to_stage_without_a_valid_native_plan(base):
-    """An empty or invalid ordinary plan cannot be replaced by a fabricated Demand baseline."""
+    """An invalid ordinary plan cannot be replaced by a fabricated Demand baseline."""
     from car_charging_household import evaluate_household_fallback
 
     _household_template_fixture(base, minutes=60)
+    base.plan_valid = False
     base.charge_window_best = []
     base.charge_limit_best = []
     searched = []
@@ -872,7 +1093,16 @@ def test_household_baseline_uses_native_schedule_after_current_cycle_recompute(b
     current_windows = deepcopy(base.charge_window_best)
     current_limits = deepcopy(base.charge_limit_best)
     assert current_windows != previous_windows, (previous_windows, current_windows)
-    expected_snapshot = {"plan_valid": True, "charge_windows": current_windows, "charge_limits": current_limits}
+    expected_snapshot = {
+        "plan_valid": True,
+        "plan_provenance": {
+            "plan_made_by_version": base.plan_made_by_version,
+            "plan_last_updated": base.plan_last_updated,
+            "plan_last_updated_minutes": base.plan_last_updated_minutes,
+        },
+        "charge_windows": current_windows,
+        "charge_limits": current_limits,
+    }
     assert native_snapshots == [expected_snapshot], (
         native_snapshots,
         base.car_charging_report,
@@ -1611,6 +1841,8 @@ def run_car_planning_grid_support_tests(base):
     test_grid_support_options_fail_closed(base)
     test_grid_support_continuous_candidate_is_paired(base)
     test_joint_native_reference_reuses_identical_ev_pattern_and_native_battery_windows(base)
+    test_native_plan_snapshot_clips_only_to_replay_horizon_and_preserves_provenance(base)
+    test_native_plan_snapshot_accepts_empty_plan_and_rejects_unsafe_shapes(base)
     test_joint_cost_improvement_uses_raw_paired_vectors_and_switch_floor()
     test_joint_cost_search_keeps_configured_and_continuous_candidates_when_512_fails(base)
     test_joint_cost_search_retains_equal_native_battery_plan_for_ev_delivery(base)
@@ -1622,6 +1854,8 @@ def run_car_planning_grid_support_tests(base):
     test_grid_support_replay_rejects_hidden_reserve_tail(base)
     test_grid_support_capped_plan_fails_closed_without_pv_and_accepts_solar(base)
     test_incident_shaped_early_100_at_19_1_is_rejected_for_native_88_at_8_1(base)
+    test_unsafe_configured_battery_candidate_can_select_safe_native_reference(base)
+    test_failed_continuous_battery_replay_is_retained_for_native_alternative_only(base)
     test_initial_demand_is_a_scoped_search_constraint()
     test_self_consumption_preference_is_paired_and_explicit(base)
     test_household_demand_comparison_uses_an_all_demand_baseline(base)
