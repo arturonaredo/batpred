@@ -114,10 +114,68 @@ def test_web_preview_entry_points(base):
     assert any(row[0] == "predbat.best_import_limit" and row[2] for row in reads)
 
 
+def test_domestic_readiness_preview_uses_paired_replay_and_no_ev_surface(base):
+    """Publish the domestic service's paired native traces into an applied, EV-free plan view."""
+    from car_charging_view import build_car_charging_plan_view
+    from tests.test_car_planning_grid_support import _household_template_fixture
+    from tests.test_infra import reset_rates
+
+    _household_template_fixture(base, minutes=360, economic_fallback=False)
+    reset_rates(base, 8.1, 0)
+    base.args["battery_power_readiness"] = {"enabled": True}
+    base.soc_kw = base.reserve
+    original = base.ha_interface.api_call
+    reads = []
+
+    def observe_read(endpoint, **kwargs):
+        """Record the fixture's live-state reads while keeping transport local."""
+        reads.append(endpoint)
+        return original(endpoint, **kwargs)
+
+    with patch("car_charging_plan._observation_clock", return_value=base.now_utc), patch.object(base.ha_interface, "api_call", side_effect=observe_read):
+        report = evaluate_car_charging(base, publish=False)
+
+    assert report["status"] == "candidate", report
+    assert report["power_readiness_service"] is True, report
+    assert set(report.get("preview", {})) == {"nominal", "pv10"}, report
+    for scenario in ("nominal", "pv10"):
+        rows = report["preview"][scenario]
+        assert sum(row["minutes"] for row in rows) == base.forecast_minutes
+        assert all(row["ev_on_minutes"] == 0 and row["ev_reserved_kwh"] == 0 for row in rows)
+        assert report["native_checks"][scenario]["passed"] is True
+        assert "_preview_rows" not in report["native_checks"][scenario]
+
+    applied = deepcopy(report)
+    observed = base.now_utc
+    applied.update(
+        status="applied",
+        execution_enabled=True,
+        actuator_signals_modified=True,
+        execution_reason="inverter_observed_not_hardware_confirmed",
+        execution_blockers=[],
+        execution_observed_at=observed.isoformat(),
+        execution_valid_until=(observed + timedelta(seconds=300)).isoformat(),
+        hardware_confirmed=False,
+    )
+    before = deepcopy(applied)
+    view = build_car_charging_plan_view({}, applied, base.now_utc)
+    assert view["plan_execution"] is True and view["plan_simulation"] is False
+    assert view["rows"] and len(view["rows"]) == len(report["preview"]["nominal"])
+    assert view["num_cars"] == 0
+    assert all(row["car_charging"] == 0 for row in view["rows"])
+    assert all("ev_soc" not in endpoint and "permission" not in endpoint for endpoint in reads)
+    assert applied == before
+
+
 def run_car_planning_preview_integration_tests(base):
     """Run the actual-entry-point regressions using the repository registry convention."""
     failed = False
-    for test in (test_real_preview_isolation, test_preview_failure_is_not_control_failure, test_web_preview_entry_points):
+    for test in (
+        test_real_preview_isolation,
+        test_preview_failure_is_not_control_failure,
+        test_web_preview_entry_points,
+        test_domestic_readiness_preview_uses_paired_replay_and_no_ev_surface,
+    ):
         print("Test: " + test.__name__)
         try:
             test(base)

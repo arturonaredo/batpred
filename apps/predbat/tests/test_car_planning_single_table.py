@@ -214,6 +214,16 @@ def test_build_car_planning_plan_view_sets_num_cars_iboost_carbon_off():
     assert view.get("carbon_enable") is False
 
 
+def test_build_car_planning_plan_view_hides_ev_column_for_domestic_only_report():
+    """A domestic-only replay keeps its battery rows but does not claim a car schedule."""
+    report = _good_report()
+    report["domestic_only"] = True
+    view = build_car_charging_plan_view(_native_plan(), report)
+    assert view["rows"]
+    assert view["num_cars"] == 0
+    assert all(row["car_charging"] == 0 and row["plan_ev_on_minutes"] == 0 for row in view["rows"])
+
+
 def test_build_car_planning_plan_view_returns_one_row_per_preview_row():
     """Row count matches the preview's bin count; nothing is collapsed or duplicated."""
     report = _good_report()
@@ -1588,6 +1598,51 @@ document.getElementById('graphTestResults').textContent=JSON.stringify({
     assert "Coche" in result["carSummary"] and "kWh" in result["carSummary"], result
 
 
+def test_plan_graph_domestic_only_hides_ev_presentation_and_keeps_battery_chart():
+    """Domestic replay still plots power, SoC and tariffs without an invented EV series."""
+    rows = _plan_graph_browser_rows()
+    for row in rows:
+        row["plan_steps"] = [{"start": row["time"], "end": row["plan_interval_end"], "battery_kw": -1.5, "grid_kw": 2.0}]
+    data = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "plan_simulation": True,
+        "num_cars": 0,
+        "currency_symbols": ["£", "p"],
+        "rows": rows,
+    }
+    exercise = r"""
+refreshPlan();
+const root=document.querySelector('#planGraphRoot');
+const svg=document.querySelector('#planGraphSvg');
+const legend=root.querySelector('.pg-legend').textContent;
+root.querySelector('#planGraphDetails').click();
+const detailFlows=root.querySelector('#planGraphFlows').textContent;
+document.getElementById('graphTestResults').textContent=JSON.stringify({
+ battery:svg.querySelectorAll('.plan-graph-battery-line').length,
+ grid:svg.querySelectorAll('.plan-graph-grid-power').length,
+ evPower:svg.querySelectorAll('.plan-graph-ev-power').length,
+ evBands:svg.querySelectorAll('.pg-ev').length,
+ evCaption:[...svg.querySelectorAll('.pg-caption')].some(node=>node.textContent.includes('VE')),
+ evLegend:legend.includes('Coche')||legend.includes('VE'),
+ evDetails:detailFlows.includes('vehículo')||detailFlows.includes('Coche'),
+ summaryHidden:root.querySelector('#planGraphCarSummary').hidden,
+ tariffs:svg.querySelectorAll('.pg-rate, .pg-rate-unknown').length,
+ socAxis:svg.querySelectorAll('.pg-soc-axis').length,
+ powerAxis:svg.querySelectorAll('.pg-power-axis').length,
+ width:root.getBoundingClientRect().width,
+ available:document.querySelector('#planContainer').getBoundingClientRect().width
+});
+"""
+    result = _run_plan_graph_browser(data, exercise, viewport_width=1920)
+    if result is None:
+        return
+    assert result["battery"] > 0 and result["grid"] > 0, result
+    assert result["evPower"] == result["evBands"] == 0, result
+    assert not result["evCaption"] and not result["evLegend"] and not result["evDetails"] and result["summaryHidden"], result
+    assert result["tariffs"] > 0 and result["socAxis"] == 6 and result["powerAxis"] >= 3, result
+    assert result["width"] >= result["available"] - 2, result
+
+
 def test_plan_graph_uses_connected_lines_without_bridging_unknowns():
     """All power series connect at known boundaries; missing data and gaps stay open."""
     rows = _plan_graph_browser_rows()
@@ -1626,6 +1681,7 @@ def run_car_planning_single_table_tests(base):
     """Run all single-table integration regressions against the live web stack."""
     tests = [
         test_plan_graph_uses_connected_lines_without_bridging_unknowns,
+        test_plan_graph_domestic_only_hides_ev_presentation_and_keeps_battery_chart,
         test_plan_graph_combines_power_soc_car_and_native_flows,
         test_plan_graph_full_width_hour_grid_solar_and_rate_bands,
         test_pv_colour_matches_displayed_energy,
@@ -1636,6 +1692,7 @@ def run_car_planning_single_table_tests(base):
         test_build_car_planning_plan_view_preserves_time_midnight_reference,
         test_build_car_planning_plan_view_sets_timestamp_from_report,
         test_build_car_planning_plan_view_sets_num_cars_iboost_carbon_off,
+        test_build_car_planning_plan_view_hides_ev_column_for_domestic_only_report,
         test_build_car_planning_plan_view_returns_one_row_per_preview_row,
         test_build_car_planning_plan_view_row_carries_required_field_set,
         test_build_car_planning_plan_view_row_time_is_preview_start,

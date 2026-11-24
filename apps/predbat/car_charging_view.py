@@ -55,7 +55,7 @@ _DOMESTIC_READINESS_MAX_HORIZON_HOURS = 96
 # future-dated receipt or a now == observed timestamp is rejected.
 _RECEIPT_COHERENCE_WINDOW_SECONDS = 300
 # Known replay provenance, not evidence of safety or execution authority.
-_REPLAY_DISPLAY_STATUSES = frozenset({"feasible", "ordinary_native_joint_reference", "generated_low_rates_native_reference", "ordinary_native_household_plan"})
+_REPLAY_DISPLAY_STATUSES = frozenset({"feasible", "power_readiness_service", "ordinary_native_joint_reference", "generated_low_rates_native_reference", "ordinary_native_household_plan"})
 # Bounded executor-failure labels; do not echo arbitrary internal strings.
 _ALLOWED_BLOCKED_REASONS = frozenset(
     {
@@ -562,7 +562,7 @@ def build_car_charging_plan_view(native_plan, report, now=None):
     now = now if now is not None else datetime.now(timezone.utc)
     native = native_plan if isinstance(native_plan, dict) else {}
     view = {key: native[key] for key in ("time", "currency_symbols", "reason_templates", "import_cost_threshold", "export_cost_threshold", "recorded_cost") if key in native}
-    view.update({"timestamp": report.get("generated_at"), "num_cars": 1, "iboost_enable": False, "carbon_enable": False, "rows": []})
+    view.update({"timestamp": report.get("generated_at"), "num_cars": 0 if report.get("domestic_only") is True else 1, "iboost_enable": False, "carbon_enable": False, "rows": []})
     view.setdefault("currency_symbols", ["", ""])
     status = report.get("status")
     is_applied = status == "applied"

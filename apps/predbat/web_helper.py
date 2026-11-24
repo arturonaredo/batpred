@@ -8849,7 +8849,7 @@ def get_plan_graph_js():
             return [24, 48].filter(hours => boundaries.has(origin + hours * HOUR_MS));
         }
 
-        function createShell(container, data) {
+        function createShell(container, data, hasEv) {
             container.replaceChildren();
             const root = graphElement('section', 'plan-graph-root');
             root.id = 'planGraphRoot';
@@ -8872,7 +8872,7 @@ def get_plan_graph_js():
             const chartWrap = graphElement('div', 'pg-chart-wrap');
             const chart = graphSvg('svg', {class:'pg-chart', viewBox:'0 0 1000 445', preserveAspectRatio:'none', role:'img', tabindex:'0', 'aria-describedby':'planGraphInstructions'});
             chart.id = 'planGraphSvg';
-            chart.append(graphSvg('title', {id:'planGraphTitle'}, 'Plan energético estimado'), graphSvg('desc', {id:'planGraphDescription'}, 'Batería, potencia media, tarifa y energía reservada para vehículo eléctrico. Las interrupciones visibles no se rellenan.'));
+            chart.append(graphSvg('title', {id:'planGraphTitle'}, 'Plan energético estimado'), graphSvg('desc', {id:'planGraphDescription'}, hasEv ? 'Batería, potencia media, tarifa y energía reservada para vehículo eléctrico. Las interrupciones visibles no se rellenan.' : 'Batería, potencia media del hogar y la red, tarifa. Las interrupciones visibles no se rellenan.'));
             chartWrap.append(chart);
             const bottom = graphElement('div', 'pg-bottom');
             const legend = graphElement('div', 'pg-legend');
@@ -8880,13 +8880,13 @@ def get_plan_graph_js():
             const legendItems = [
                 ['pg-key', 'Batería · %'], ['pg-key pg-key-solar', 'Solar · kW medios'],
                 ['pg-key pg-key-load', 'Hogar · kW medios'],
-                ['pg-key pg-key-car', 'Coche · kW medios'],
+                ...(hasEv ? [['pg-key pg-key-car', 'Coche · kW medios']] : []),
                 ['pg-key pg-key-grid', 'Red · +importación / −exportación'],
                 ['pg-key pg-key-battery-power', 'Batería · +descarga / −carga'],
                 ['pg-key-rate pg-rate-green', 'Red <10 ' + String(data?.currency_symbols?.[1] || '') + '/kWh'],
                 ['pg-key-rate pg-rate-yellow', 'Red 10–<20 ' + String(data?.currency_symbols?.[1] || '') + '/kWh'],
                 ['pg-key-rate pg-rate-red', 'Red ≥20 ' + String(data?.currency_symbols?.[1] || '') + '/kWh'],
-                ['pg-key pg-key-ev', 'VE · kWh reservados']
+                ...(hasEv ? [['pg-key pg-key-ev', 'VE · kWh reservados']] : [])
             ];
             legendItems.forEach(([keyClass, label]) => {
                 const item = graphElement('span', 'pg-legend-item');
@@ -8900,6 +8900,7 @@ def get_plan_graph_js():
             bottom.append(legend, detailsButton);
             const carSummary = graphElement('p', 'pg-car-summary');
             carSummary.id = 'planGraphCarSummary';
+            carSummary.hidden = !hasEv;
             card.append(chartWrap, bottom, carSummary);
             const instructions = graphElement('p', 'pg-sr-only', 'Enfoca el gráfico y usa las flechas izquierda y derecha para seleccionar un intervalo. Pulsa Intro para abrir sus detalles.');
             instructions.id = 'planGraphInstructions';
@@ -8965,6 +8966,7 @@ def get_plan_graph_js():
 
         function renderPredbatPlanGraph(container, data) {
             if (!container) return;
+            const hasEv = !data || data.num_cars !== 0;
             const previousDialog = container.querySelector('#planGraphDialog');
             const preserveDialog = Boolean(previousDialog && previousDialog.open);
             const focusWasInDialog = preserveDialog && previousDialog.contains(document.activeElement);
@@ -8973,7 +8975,7 @@ def get_plan_graph_js():
             const focusWasInGraph = Boolean(activeElement && container.contains(activeElement));
             const previousFocusId = focusWasInGraph ? activeElement.id : '';
             const previousRange = focusWasInGraph && activeElement.dataset ? activeElement.dataset.range : '';
-            const ui = createShell(container, data);
+            const ui = createShell(container, data, hasEv);
             ui.executionContext.hidden = !data || data.plan_execution !== true || Boolean(data.execution_blocked) || !validAppliedReceiptForDisplay(data);
             const blocked = Boolean(data && data.execution_blocked);
             const unavailable = data && (data.plan_unavailable === true || blocked);
@@ -9078,7 +9080,7 @@ def get_plan_graph_js():
                 const svg = ui.chart;
                 svg.replaceChildren();
                 svg.append(graphSvg('title', {id:'planGraphTitle'}, 'Plan energético estimado para ' + formatNumber((displayEndMs - originMs) / HOUR_MS, 1) + ' horas'));
-                svg.append(graphSvg('desc', {id:'planGraphDescription'}, 'SoC previsto, potencia media de solar y hogar, tarifa y reserva de vehículo eléctrico. Las interrupciones no se interpolan.'));
+                svg.append(graphSvg('desc', {id:'planGraphDescription'}, hasEv ? 'SoC previsto, potencia media de solar y hogar, tarifa y reserva de vehículo eléctrico. Las interrupciones no se interpolan.' : 'SoC previsto, potencia media de solar, hogar y red, y tarifa. Las interrupciones no se interpolan.'));
                 const defs = graphSvg('defs');
                 const hatch = graphSvg('pattern', {id:'planGraphHatch', width:6, height:6, patternUnits:'userSpaceOnUse', patternTransform:'rotate(45)'});
                 hatch.append(graphSvg('rect', {width:6, height:6, fill:'#e6ebe6'}), graphSvg('line', {x1:0, y1:0, x2:0, y2:6, stroke:'#aab5ac', 'stroke-width':1.2}));
@@ -9106,7 +9108,7 @@ def get_plan_graph_js():
                     row.evKw = row.evKwh === null ? null : row.evKwh / durationHours;
                     if (isFiniteNumber(row.pvKw)) validPower.push(row.pvKw);
                     if (isFiniteNumber(row.loadKw)) validPower.push(row.loadKw);
-                    if (isFiniteNumber(row.evKw)) validPower.push(row.evKw);
+                    if (hasEv && isFiniteNumber(row.evKw)) validPower.push(row.evKw);
                     // Plot published subinterval power only with complete, ordered
                     // coverage. Do not infer grid/battery power from SoC or load.
                     let previousEnd = row.startMs;
@@ -9157,7 +9159,7 @@ def get_plan_graph_js():
                 const labelledTimes = [originMs];
                 for (let time = firstHour; time < displayEndMs; time += HOUR_MS) {
                     const x = xAt(time);
-                    svg.append(graphSvg('line', {class:'pg-time-grid', x1:x, y1:socTop, x2:x, y2:evY + evHeight + 4}));
+                    svg.append(graphSvg('line', {class:'pg-time-grid', x1:x, y1:socTop, x2:x, y2:hasEv ? evY + evHeight + 4 : rateY + rateHeight + 4}));
                     if (x - previousLabelX >= minimumLabelGap && xEnd - x >= minimumLabelGap) {
                         labelledTimes.push(time);
                         previousLabelX = x;
@@ -9185,7 +9187,7 @@ def get_plan_graph_js():
                 }
 
                 svg.append(graphSvg('text', {class:'pg-caption', x:left, y:468}, 'TARIFA DE RED · ' + String(data.currency_symbols?.[1] || '') + '/kWh'));
-                svg.append(graphSvg('text', {class:'pg-caption', x:left, y:534}, 'VE · kWh'));
+                if (hasEv) svg.append(graphSvg('text', {class:'pg-caption', x:left, y:534}, 'VE · kWh'));
                 const previousNative = {grid:null, battery:null};
                 shown.forEach((row, index) => {
                     const previous = shown[index - 1];
@@ -9219,7 +9221,7 @@ def get_plan_graph_js():
                     });
                     // Keep the car visible even when its zero line coincides
                     // with grid power. It shares the main kW axis, not a strip.
-                    if (isFiniteNumber(row.evKw)) {
+                    if (hasEv && isFiniteNumber(row.evKw)) {
                         const car = graphSvg('path', {class:'pg-ev-power plan-graph-ev-power', d:powerLine(row.startMs, row.endMs, row.evKw, previousPower('evKw'))});
                         svgTitle(car, 'Coche: ' + formatNumber(row.evKw, 2) + ' kW medios · ' + formatNumber(row.evKwh, 3) + ' kWh previstos');
                         svg.append(car);
@@ -9228,23 +9230,25 @@ def get_plan_graph_js():
                     const rateRect = graphSvg('rect', {class:rateClass, x:x0, y:rateY, width:Math.max(.5, x1 - x0), height:rateHeight});
                     svgTitle(rateRect, row.rate === null ? 'Tarifa no disponible para este intervalo' : 'Importación: ' + formatNumber(row.rate, 2) + ' ' + String(data.currency_symbols?.[1] || '') + '/kWh');
                     svg.append(rateRect);
-                    if (row.evKwh !== null && row.evKwh > 0) {
+                    if (hasEv && row.evKwh !== null && row.evKwh > 0) {
                         const ev = graphSvg('rect', {class:'pg-ev', x:x0, y:evY, width:Math.max(.5, x1 - x0), height:evHeight, rx:3});
                         svgTitle(ev, 'Reserva prevista de vehículo eléctrico: ' + formatNumber(row.evKwh, 3) + ' kWh');
                         svg.append(ev);
                     }
                 });
-                const carEnergyKnown = shown.every(row => row.evKwh !== null);
-                const carEnergy = shown.reduce((sum, row) => sum + (row.evKwh || 0), 0);
-                ui.root.querySelector('#planGraphCarSummary').textContent = !carEnergyKnown
-                    ? 'Coche · energía prevista (kWh) incompleta: hay intervalos sin datos; no se sustituyen por cero.'
-                    : carEnergy > 0
-                        ? 'Coche · ' + formatNumber(carEnergy, 2) + ' kWh previstos en este horizonte. La curva muestra potencia media, no confirma carga física.'
-                        : 'Coche · sin carga prevista en este horizonte (0 kWh). No indica que esté desconectado ni confirma su estado físico.';
+                if (hasEv) {
+                    const carEnergyKnown = shown.every(row => row.evKwh !== null);
+                    const carEnergy = shown.reduce((sum, row) => sum + (row.evKwh || 0), 0);
+                    ui.root.querySelector('#planGraphCarSummary').textContent = !carEnergyKnown
+                        ? 'Coche · energía prevista (kWh) incompleta: hay intervalos sin datos; no se sustituyen por cero.'
+                        : carEnergy > 0
+                            ? 'Coche · ' + formatNumber(carEnergy, 2) + ' kWh previstos en este horizonte. La curva muestra potencia media, no confirma carga física.'
+                            : 'Coche · sin carga prevista en este horizonte (0 kWh). No indica que esté desconectado ni confirma su estado físico.';
+                }
 
                 const selected = shown[Math.min(selectedIndex, shown.length - 1)];
                 const cursorX = xAt((selected.startMs + selected.endMs) / 2);
-                svg.append(graphSvg('line', {class:'pg-cursor', x1:cursorX, y1:socTop, x2:cursorX, y2:evY + evHeight + 3}));
+                svg.append(graphSvg('line', {class:'pg-cursor', x1:cursorX, y1:socTop, x2:cursorX, y2:hasEv ? evY + evHeight + 3 : rateY + rateHeight + 3}));
                 svg.setAttribute('aria-label', 'Plan de ' + formatNumber(rangeHours, 1) + ' horas. Intervalo seleccionado de ' + formatTime(selected.startMs, true, selected.source.time) + ' a ' + formatTime(selected.endMs, true, selected.source.plan_interval_end) + '. Pulsa Intro para ver detalles.');
                 const warnings = [];
                 if (normalised.invalid > 0) warnings.push(normalised.invalid + ' intervalo(s) con fechas inválidas se han omitido.');
@@ -9281,7 +9285,7 @@ def get_plan_graph_js():
                 const flowLines = [
                     ['Solar prevista', row.pvKwh, pvKw],
                     ['Consumo del hogar', row.loadKwh, loadKw],
-                    ['Reserva del vehículo eléctrico', row.evKwh, null]
+                    ...(hasEv ? [['Reserva del vehículo eléctrico', row.evKwh, null]] : [])
                 ];
                 ui.flows.replaceChildren();
                 flowLines.forEach(([label, energy, power]) => {
