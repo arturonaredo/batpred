@@ -203,6 +203,75 @@ def prepare_candidate(base, options, result, slots, windows=None, service_target
     return prepared
 
 
+def continuous_charge_windows(base, options, result, slots, windows):
+    """Propose constant same-price readiness targets, never grant replay or execution authority."""
+    unchanged = {"changed": False, "reason": "not_eligible"}
+    settings = readiness_settings(base)
+    profile = getattr(result, "power_readiness", {})
+    if not settings.get("enabled") or not isinstance(profile, dict) or not profile.get("active") or options.get("ev_charging_priority") != "cost" or options.get("control_model") != "deye_solarman" or not options.get("grid_charge_support_w"):
+        return windows, unchanged
+    if len(getattr(result, "actions", ())) != len(slots) or not slots or len(windows) != 3 or len(windows[1]) != len(windows[2]):
+        return windows, {**unchanged, "reason": "incomplete_timeline"}
+    previous_end = slots[0].start_min
+    targets, active, covered, keys = [], [], [0] * len(windows[1]), []
+    for slot, action in zip(slots, result.actions):
+        if slot.start_min != previous_end or slot.duration_min != 5 or action.slot_index != slot.index:
+            return windows, {**unchanged, "reason": "incomplete_timeline"}
+        previous_end = slot.start_min + slot.duration_min
+        start, end = base.minutes_now + slot.start_min, base.minutes_now + previous_end
+        matches = [i for i, window in enumerate(windows[1]) if window["start"] < end and window["end"] > start]
+        if len(matches) > 1 or any(not windows[1][i]["start"] <= start < end <= windows[1][i]["end"] for i in matches):
+            return windows, {**unchanged, "reason": "ambiguous_native_windows"}
+        index = matches[0] if matches else None
+        target = windows[2][index] if index is not None else None
+        if index is not None:
+            if type(target) not in (int, float) or not math.isfinite(target) or not 0 <= target <= base.soc_max:
+                return windows, {**unchanged, "reason": "invalid_target"}
+            covered[index] += slot.duration_min
+        active.append(index)
+        targets.append(target)
+        period = next((i for i, p in enumerate(profile.get("periods", [])) if p["start"] <= start < end <= p["end"]), None)
+        price = slot.import_price
+        eligible = period is not None and index is not None and action.battery_mode == "charge" and "charge" in getattr(slot, "allowed_battery_modes", ("demand", "charge"))
+        eligible = eligible and type(price) in (int, float) and math.isfinite(price) and price < settings["cheap_price_ceiling"] and windows[1][index]["average"] == price
+        keys.append((period, price) if eligible else None)
+    if any(minutes != window["end"] - window["start"] for minutes, window in zip(covered, windows[1])):
+        return windows, {**unchanged, "reason": "incomplete_native_windows"}
+    proposed, changes_before, changes_after, groups = list(targets), 0, 0, 0
+    first = 0
+    while first < len(slots):
+        stop = first + 1
+        while keys[first] is not None and stop < len(slots) and keys[stop] == keys[first]:
+            stop += 1
+        original = targets[first:stop]
+        if keys[first] is not None and any(right < left - 1e-9 for left, right in zip(original, original[1:])):
+            proposed[first:stop] = [max(original)] * len(original)
+            changes_before += sum(abs(right - left) > 1e-9 for left, right in zip(original, original[1:]))
+            groups += 1
+        first = stop
+    if not groups:
+        return windows, {**unchanged, "reason": "no_target_drops"}
+    new_windows, new_limits = [], []
+    for slot, index, target in zip(slots, active, proposed):
+        if index is None:
+            continue
+        start = base.minutes_now + slot.start_min
+        price = windows[1][index]["average"]
+        if new_windows and new_windows[-1]["end"] == start and new_windows[-1]["average"] == price and new_limits[-1] == target:
+            new_windows[-1]["end"] = start + slot.duration_min
+        else:
+            new_windows.append({"start": start, "end": start + slot.duration_min, "average": price})
+            new_limits.append(target)
+    return (deepcopy(windows[0]), new_windows, new_limits), {
+        "changed": True,
+        "same_price_groups": groups,
+        "target_changes_before": changes_before,
+        "target_changes_after": changes_after,
+        "maximum_existing_target_preserved": True,
+        "ev_schedule_unchanged": True,
+    }
+
+
 def readiness_input_fingerprint(base):
     """Bind a domestic service to actual tariff and forecast inputs while SOC is independently replayed."""
     import hashlib
