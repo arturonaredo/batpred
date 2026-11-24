@@ -262,7 +262,8 @@ def test_real_template_charge_then_house_only(base):
     assert all(base.ha_interface.get_state(entity) == "Grid" for entity in sources)
     assert all(float(base.ha_interface.get_state(entity)) == 100 for entity in targets)
     # The existing verified sequence skips the already-observed Disabled phase.
-    assert [name for name, _ in writes] == ["number/set_value", "select/select_option"]
+    assert [name for name, _ in writes] == ["number/set_value"] * 6 + ["select/select_option"] * 6
+    assert [data["entity_id"] for _, data in writes] == targets + sources
     assert not any(base.car_charging_slots) and session == original
 
 

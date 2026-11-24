@@ -201,7 +201,7 @@ def test_sequence_partial_group(base):
         fixture.unobserved.add("number.other")
         steps = sequence_steps(number="number.target, number.other")
         fixture.run(steps)
-        assert len(fixture.calls) == 2 and fixture.errors
+        assert [data["entity_id"] for _, data in fixture.calls] == ["select.source", "number.target", "number.other"] and fixture.errors
         assert fixture.read("number.target") == 80 and fixture.read("number.other") == 40
         assert fixture.read("select.source") == "Disabled"
         fixture.unobserved.clear()
@@ -253,10 +253,44 @@ def test_sequence_service_domains(base):
             assert len(fixture.calls) == 1 and fixture.read(entity) == expected and not fixture.errors, service
 
 
+def test_verified_groups_are_serial_observed_entity_writes(base):
+    """A verified phase must never ask HA to run several device read/write operations concurrently."""
+    sources = ["select.source_" + str(index) for index in range(1, 7)]
+    targets = ["number.target_" + str(index) for index in range(1, 7)]
+    for unobserved in (None, sources[1]):
+        with SequenceFixture(base) as fixture:
+            fixture.states = {**{entity: {"state": "Grid", "options": ["Disabled", "Grid"]} for entity in sources}, **{entity: {"state": 10, "min": 0, "max": 100, "step": 1} for entity in targets}}
+            if unobserved:
+                fixture.unobserved.add(unobserved)
+            fixture.run(sequence_steps(target=35, source=",".join(sources), number=",".join(targets)))
+            assert all("," not in data["entity_id"] for _, data in fixture.calls), fixture.calls
+            if unobserved:
+                assert [data["entity_id"] for _, data in fixture.calls] == sources[:2], fixture.calls
+                assert fixture.errors
+                assert all(fixture.read(entity) == 10 for entity in targets)
+            else:
+                assert [data["entity_id"] for _, data in fixture.calls] == sources + targets + sources, fixture.calls
+                assert not fixture.errors
+                assert all(fixture.read(entity) == "Grid" for entity in sources)
+                assert all(fixture.read(entity) == 35 for entity in targets)
+                assert fixture.inv.count_register_writes == 18
+                before = list(fixture.calls)
+                fixture.run(sequence_steps(target=35, source=",".join(sources), number=",".join(targets)))
+                assert fixture.calls == before, "Unchanged final intent must remain a no-op"
+
+
 def run_service_sequence_tests(my_predbat):
     """Report all contract groups without hiding later groups after an assertion failure."""
     failed = False
-    for test in (test_sequence_observation_and_drift, test_sequence_failure_barriers, test_sequence_preflight, test_sequence_partial_group, test_sequence_resolution_and_noop, test_sequence_service_domains):
+    for test in (
+        test_verified_groups_are_serial_observed_entity_writes,
+        test_sequence_observation_and_drift,
+        test_sequence_failure_barriers,
+        test_sequence_preflight,
+        test_sequence_partial_group,
+        test_sequence_resolution_and_noop,
+        test_sequence_service_domains,
+    ):
         try:
             test(my_predbat)
             print("PASS: " + test.__name__)

@@ -3478,16 +3478,21 @@ class Inverter(BatteryCurve):
             for service_name, service_data, entities, expected in steps:
                 if not all(self.service_sequence_matches(entity, value) for entity, value in observed.items()):
                     raise ServiceSequenceError("an earlier step no longer reads as observed")
-                if not all(self.service_sequence_matches(entity, expected) for entity in entities):
-                    if not self.base.call_service_wrapper(service_name, **service_data):
-                        raise ServiceSequenceError("{} was not accepted".format(service_name))
-                    # Wait on HA only; this does not request faster hardware polling.
-                    for entity in entities:
+                # HA dispatches a multi-entity action concurrently. A verified
+                # device sequence must keep each read/write operation ordered,
+                # not merely the three outer disable/target/enable phases.
+                for entity in entities:
+                    if not all(self.service_sequence_matches(previous, value) for previous, value in observed.items()):
+                        raise ServiceSequenceError("an earlier step no longer reads as observed")
+                    if not self.service_sequence_matches(entity, expected):
+                        if not self.base.call_service_wrapper(service_name, **{**service_data, "entity_id": entity}):
+                            raise ServiceSequenceError("{} was not accepted".format(service_name))
+                        # Wait on HA only; this is not hardware confirmation.
                         state = self._poll_after_write(entity, lambda state, expected=expected: self.service_sequence_state_matches(state, expected))
                         if not self.service_sequence_state_matches(state, expected):
                             raise ServiceSequenceError("{} was not observed".format(entity))
-                    self.count_register_writes += len(entities)
-                observed.update({entity: expected for entity in entities})
+                        self.count_register_writes += 1
+                    observed[entity] = expected
                 if not all(self.service_sequence_matches(entity, value) for entity, value in observed.items()):
                     raise ServiceSequenceError("{} was not observed".format(service_name))
             self.log("Inverter {} service {} final state observed in Home Assistant".format(self.id, service))

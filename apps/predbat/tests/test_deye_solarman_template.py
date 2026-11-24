@@ -106,7 +106,8 @@ def run_deye_solarman_template_tests(my_predbat):
 
         inv.adjust_charge_immediate(80)
         check(rows("Grid", 80), "charge must set all six targets and sources")
-        check([data.get("option", data.get("value")) for _, data in writes] == ["Disabled", 80.0, "Grid"], "charge must observe disable → SOC → enable")
+        check([data.get("option", data.get("value")) for _, data in writes] == ["Disabled"] * 6 + [80.0] * 6 + ["Grid"] * 6, "charge must observe each row in disable → SOC → enable order")
+        check([data["entity_id"] for _, data in writes] == sources + targets + sources, "verified rows must be sent individually, not concurrently")
         writes.clear()
         inv.adjust_charge_immediate(80)
         inv.adjust_export_immediate(100)
