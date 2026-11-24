@@ -153,7 +153,9 @@ def _domestic_readiness_applied_report(now=None, **overrides):
         execution_blockers=[],
         execution_reason="inverter_observed_not_hardware_confirmed",
         hardware_confirmed=False,
-        forecast_plan_hours=48,
+        # The displayed planner horizon may be shorter than the full native
+        # forecast replay horizon published in the paired checks.
+        forecast_plan_hours=24,
         native_checks={name: {"passed": True, "checked_minutes": 2880} for name in ("nominal", "pv10")},
     )
     report.update(overrides)
@@ -672,12 +674,13 @@ def test_html_api_plan_data_shows_domestic_readiness_without_preview_as_observed
     assert "Domestic power-readiness command observed" in preview, preview
     assert "paired chart preview unavailable" in preview, preview
     assert "not hardware-confirmed" in preview, preview
-    assert "Baseline native import forecast exceeds the configured limit" in preview, preview
+    assert "Native import forecast exceeds the configured limit" in preview, preview
     warning = re.search(r'<div class="car-charging-preview-warning" role="alert"[^>]*>(.*?)</div>', preview, flags=re.DOTALL)
     assert warning, preview
     visible_warning = re.sub(r'<span class="car-charging-preview-debug"[^>]*>.*?</span>', "", warning.group(1), flags=re.DOTALL)
     assert "9969.783 W" in visible_warning and "6000 W" in visible_warning and "130 minute" in visible_warning, visible_warning
     assert "not current measured load" in visible_warning, visible_warning
+    assert "not the applied plan" not in visible_warning, visible_warning
     assert "830" not in preview, "The view must not invent a current load value"
     assert "Active plan" not in preview, preview
 
@@ -710,6 +713,22 @@ def test_domestic_missing_preview_still_fails_closed_on_stale_or_invalid_evidenc
                 "pv10": {"passed": True, "checked_minutes": 60},
             },
         ),
+        "mismatched paired-check horizons": _domestic_readiness_applied_report(
+            now=now,
+            native_checks={
+                "nominal": {"passed": True, "checked_minutes": 2880},
+                "pv10": {"passed": True, "checked_minutes": 2820},
+            },
+        ),
+        "display horizon below minimum": _domestic_readiness_applied_report(now=now, forecast_plan_hours=7),
+        "display horizon above maximum": _domestic_readiness_applied_report(now=now, forecast_plan_hours=97),
+        "paired horizon above maximum": _domestic_readiness_applied_report(
+            now=now,
+            native_checks={
+                "nominal": {"passed": True, "checked_minutes": 5761},
+                "pv10": {"passed": True, "checked_minutes": 5761},
+            },
+        ),
         "invalid chart payload": _domestic_readiness_applied_report(now=now, preview={"nominal": [], "pv10": []}),
         "unexpected EV window": _domestic_readiness_applied_report(now=now, proposed_ev_windows=[{"start": 720, "end": 780}]),
         "hardware confirmation claim": _domestic_readiness_applied_report(now=now, hardware_confirmed=True),
@@ -721,6 +740,20 @@ def test_domestic_missing_preview_still_fails_closed_on_stale_or_invalid_evidenc
         assert view.get("plan_unavailable") is not True, (label, view)
         html = render_car_charging_preview(report, _native_diag("ok"), now=now)
         assert "execution blocked" in html.lower(), (label, html)
+
+
+def test_domestic_missing_preview_accepts_maximum_supported_horizon():
+    """A complete 96-hour paired replay is accepted at the explicit display bound."""
+    now = _wall_now()
+    report = _domestic_readiness_applied_report(
+        now=now,
+        forecast_plan_hours=96,
+        native_checks={name: {"passed": True, "checked_minutes": 5760} for name in ("nominal", "pv10")},
+    )
+    view = build_car_charging_plan_view(_native_plan(), report, now=now)
+    assert view["rows"] == [], view
+    assert view["plan_execution"] is True and view["plan_simulation"] is False, view
+    assert view["plan_unavailable"] is True and "execution_blocked" not in view, view
 
 
 def test_html_plan_keeps_healthy_applied_explanation_out_of_the_default_page():
@@ -843,6 +876,7 @@ def run_car_planning_applied_view_tests(base):
         test_html_api_plan_data_emits_car_planning_execution_for_fresh_applied,
         test_html_api_plan_data_shows_domestic_readiness_without_preview_as_observed,
         test_domestic_missing_preview_still_fails_closed_on_stale_or_invalid_evidence,
+        test_domestic_missing_preview_accepts_maximum_supported_horizon,
         test_html_plan_keeps_healthy_applied_explanation_out_of_the_default_page,
         test_html_plan_emits_execution_blocked_banner_for_invalid_applied,
         test_js_renderer_forces_editable_false_for_car_planning_execution,

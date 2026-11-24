@@ -46,6 +46,10 @@ _NO_CANDIDATE_STATUSES = frozenset(
 _EXCEEDED_STATES = ("exceeded", "over", "true", "on", "yes", "1")
 _OK_STATES = ("ok", "within", "false", "off", "no", "0")
 _STALE_AGE_MINUTES = 15
+# Domestic no-preview receipts are only eligible within the view's explicit
+# 8–96 hour planning envelope. The public report omits ``forecast_hours``, so
+# bound the paired replay evidence to that same conservative display ceiling.
+_DOMESTIC_READINESS_MAX_HORIZON_HOURS = 96
 # Receipt coherence window: matches the executor's RECEIPT_TTL_SECONDS
 # default of 300 seconds. Both ends of the interval are strict so a
 # future-dated receipt or a now == observed timestamp is rejected.
@@ -418,9 +422,10 @@ def _domestic_readiness_without_preview_allowed(report, now):
     if not isinstance(checks, dict) or set(checks) != {"nominal", "pv10"}:
         return False
     plan_hours = report.get("forecast_plan_hours")
-    if not _is_finite(plan_hours) or not 8 <= plan_hours <= 96 or plan_hours % 1:
+    if not _is_finite(plan_hours) or not 8 <= plan_hours <= _DOMESTIC_READINESS_MAX_HORIZON_HOURS or plan_hours % 1:
         return False
     expected_minutes = int(plan_hours * 60)
+    max_checked_minutes = _DOMESTIC_READINESS_MAX_HORIZON_HOURS * 60
     checked_minutes = []
     for scenario in ("nominal", "pv10"):
         check = checks.get(scenario)
@@ -430,7 +435,7 @@ def _domestic_readiness_without_preview_allowed(report, now):
         if type(minutes) is not int or minutes <= 0:
             return False
         checked_minutes.append(minutes)
-    return checked_minutes[0] == checked_minutes[1] == expected_minutes
+    return checked_minutes[0] == checked_minutes[1] and expected_minutes <= checked_minutes[0] <= max_checked_minutes
 
 
 def _paired_preview(report, now):
@@ -1077,19 +1082,21 @@ def render_car_charging_preview(report, native_diagnostic, now=None):
     if isinstance(report, dict) and not compact and status:
         parts.append('<div class="car-charging-preview-status car-charging-preview-debug" style="display:none;">' "<span>Status: <strong>{}</strong></span></div>".format(escape(str(status))))
     if native_exceeded and not applied_fresh:
+        warning_scope = "This is a forecast diagnostic, not current measured load; the domestic command observation is shown separately." if domestic_without_preview else "This is a forecast diagnostic, not current measured load."
         parts.append(
             (
                 '<div class="car-charging-preview-warning car-charging-preview-debug" style="display:none;">'
                 if compact and not (is_applied or is_blocked)
                 else '<div class="car-charging-preview-warning" role="alert" style="padding:10px;background:#fee;color:#a00;border:1px solid #c00;">'
             )
-            + "<strong>Baseline native import forecast exceeds the configured limit (Native import limit exceeded):</strong> "
-            "Forecast peak {peak} W over a {limit} W configured import limit for {minutes} minute(s) in the baseline native plan; "
-            'this is a forecast diagnostic, not current measured load or the applied plan. <span class="car-charging-preview-debug" style="display:none;">This is not an enforcement '
+            + "<strong>Native import forecast exceeds the configured limit (Native import limit exceeded):</strong> "
+            "Forecast peak {peak} W over a {limit} W configured import limit for {minutes} minute(s) in the native forecast; "
+            '{scope} <span class="car-charging-preview-debug" style="display:none;">This is not an enforcement '
             "action and not a service outage claim.".format(
                 peak=_format_finite(peak_w, 3),
                 limit=_format_finite(limit_w, 0),
                 minutes=_format_finite(minutes_over, 0),
+                scope=warning_scope,
             )
             + "</span></div>"
         )

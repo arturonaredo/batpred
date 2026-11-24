@@ -555,6 +555,9 @@ def test_render_warning_without_report_still_shown():
     html = render_car_charging_preview(None, _native_diagnostic("exceeded", peak_w=8000, limit_w=6000))
     assert "car-charging-preview-warning" in html
     assert "8000" in html and "6000" in html
+    assert "Native import forecast" in html
+    assert "not current measured load" in html
+    assert "not the applied plan" not in html
     assert "<table" not in html
     assert "<details" not in html
 
