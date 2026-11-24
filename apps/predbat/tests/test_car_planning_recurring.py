@@ -258,7 +258,8 @@ def cache_sink():
     """Expose the real HA cache writer and bulk path without network or database writers."""
     from ha import HAInterface
 
-    sink = SimpleNamespace(state_data={}, db_enable=False, db_primary=False, ha_key="test", log=lambda *args: None)
+    sink = SimpleNamespace(state_data={}, db_enable=False, db_primary=False, ha_key="test", log=lambda *args: None, shared_attribute_lists={})
+    sink.share_long_lists = HAInterface.share_long_lists.__get__(sink)
     sink.update_state_item = HAInterface.update_state_item.__get__(sink)
     sink.update_states = HAInterface.update_states.__get__(sink)
     return sink
