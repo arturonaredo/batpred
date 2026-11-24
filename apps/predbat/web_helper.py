@@ -7237,9 +7237,9 @@ def get_plan_renderer_js():
 
             // Billing columns appear on a History view only once the supplier's half-hourly bill is attached
             const hasBilling = jsonData.rows.some(r => r.billed !== undefined);
-            // Hide an uninformative zero tariff, not unknown data or editable controls.
+            // Hide an uninformative zero tariff, not unknown data. Keep editing in debug.
             // Compute once for the header, every row and the totals spacer together.
-            const showExport = editable || jsonData.rows.length === 0 || jsonData.rows.some(
+            const showExport = (editable && showDebug) || jsonData.rows.length === 0 || jsonData.rows.some(
                 row => row.plan_rates_unavailable || !Number.isFinite(row.export_rate) || row.export_rate !== 0
             );
 
