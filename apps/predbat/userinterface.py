@@ -879,9 +879,9 @@ class UserInterface:
                         """UPDATE"""
                         summary = self.releases.get("latest_body", "")
                         latest = self.releases.get("latest", "check HACS")
-                        state = "off"
-                        if item["installed_version"] != latest:
-                            state = "on"
+                        # Discovery already handles stable, beta and unknown builds.
+                        # A different latest stable tag can be older than this build.
+                        state = "on" if value else "off"
                         self.set_state_wrapper(
                             entity_id=entity,
                             state=state,
@@ -889,7 +889,7 @@ class UserInterface:
                                 "friendly_name": item["friendly_name"],
                                 "title": item["title"],
                                 "in_progress": in_progress,
-                                "auto_update": True,
+                                "auto_update": bool(self.get_arg("auto_update", False)),
                                 "installed_version": item["installed_version"],
                                 "latest_version": latest,
                                 "entity_picture": item["entity_picture"],
