@@ -93,9 +93,15 @@ def test_recurring_absence_and_reconnection(base):
     """Every absent entry point avoids SOC/meter and a real return needs no operator edit."""
     recurring_inputs(base)
     settings = car_settings(base)
+    sink = cache_sink()
+    entity = settings["connection_entity"]
+    old = cache_event(sink, entity, "connected", base.now_utc - timedelta(hours=1))
+    base.ha_interface.dummy_items[entity] = deepcopy(sink.state_data[entity])
     first = resolve_recurring_session(base, now=base.now_utc)
     assert first["status"] == "ready"
-    _set_entity(base, settings["connection_entity"], "disconnected", attributes={"retrievalstatus": "VALID"})
+    later = base.now_utc + timedelta(minutes=1)
+    old = cache_event(sink, entity, "disconnected", later, old)
+    base.ha_interface.dummy_items[entity] = deepcopy(sink.state_data[entity])
     getter = base.get_state_wrapper
 
     def guard(*args, **kwargs):
@@ -106,8 +112,9 @@ def test_recurring_absence_and_reconnection(base):
 
     with patch.object(base, "get_state_wrapper", side_effect=guard):
         assert resolve_recurring_session(base, now=base.now_utc)["reason"] == "connection_not_confirmed"
-    later = base.now_utc + timedelta(minutes=1)
-    _set_entity(base, settings["connection_entity"], "connected", last_changed=later, last_updated=later, attributes={"retrievalstatus": "VALID"})
+    later = base.now_utc + timedelta(minutes=2)
+    cache_event(sink, entity, "connected", later, old)
+    base.ha_interface.dummy_items[entity] = deepcopy(sink.state_data[entity])
     second = resolve_recurring_session(base, now=later)
     assert second["status"] == "ready" and second["identity"] != first["identity"], second
     assert settings["recurring_session"]["policy_authorised_at"] == first["observation"]["policy_authorised_at"]
@@ -331,6 +338,137 @@ def test_recurring_observes_between_cycle_unplug_and_charging_states(base):
             value = resolve_recurring_session(base, now=now)
             assert value["status"] == "ready", value
             assert (value["identity"] == first["identity"]) is (index == 2), value
+
+
+def test_recurring_cold_connection_cache_recovers_proven_recorder_continuity(base):
+    """A cold cache keeps the same EV session only when Recorder proves eligible continuity."""
+    _, store = recurring_inputs(base)
+    settings = car_settings(base)
+    settings["connection_entity_states"] = ["8", "4"]
+    settings["soc_observed_at_entity"] = None
+    settings["connection_observed_at_entity"] = None
+    base.car_charging_plan_time = [(base.now_utc + timedelta(hours=8)).strftime("%H:%M:%S")]
+    entity = settings["connection_entity"]
+    checked = base.now_utc - timedelta(minutes=10)
+    _set_entity(base, entity, "8", last_changed=checked, last_updated=checked, attributes={"retrievalstatus": "VALID"})
+    first = resolve_recurring_session(base, now=base.now_utc)
+    assert first["status"] == "ready", first
+    before = deepcopy(store.records[("car_charging", "recurring_session")]["session"])
+
+    # A restarted HA cache contains only this later state; Recorder retains the
+    # earlier eligible 8 -> 4 transition and the latest state publication.
+    transition = base.now_utc + timedelta(minutes=45)
+    now = base.now_utc + timedelta(hours=1)
+    _set_entity(
+        base,
+        entity,
+        "4",
+        last_changed=transition,
+        last_updated=transition,
+        attributes={"retrievalstatus": "VALID", "value_history": [{"state": "4", "at": transition.isoformat()}], "value_last_changed": transition.isoformat()},
+    )
+    rows = [{"entity_id": entity, "state": state, "last_changed": stamp.isoformat(), "last_updated": stamp.isoformat()} for state, stamp in (("8", checked), ("4", checked + timedelta(milliseconds=141)), ("4", transition))]
+    restored = RecurringStorage()
+    restored.records = deepcopy(store.records)
+    base.components = SimpleNamespace(get_component=lambda name: restored if name == "storage" else None)
+    with patch.object(base.ha_interface, "get_history_window", return_value=[rows], create=True) as reader:
+        current = resolve_recurring_session(base, now=now)
+
+    assert current["status"] == "ready", current
+    assert current["identity"] == first["identity"]
+    retained = restored.records[("car_charging", "recurring_session")]["session"]
+    for name in ("started_at", "initial_kwh", "meter_baseline", "anchor_kwh", "anchor_energy", "anchor_soc_at", "last_vehicle_value"):
+        assert retained[name] == before[name], name
+    assert retained["connection_checked_at"] == transition.isoformat()
+    assert retained["identity"] == before["identity"]
+    assert reader.call_count == 1
+    assert reader.call_args.args == (entity, checked, now)
+
+
+def test_recurring_cold_connection_cache_fails_closed_without_complete_history(base):
+    """Missing, malformed, unknown or unavailable Recorder rows cannot mint a fresh EV baseline."""
+    for fault in ("missing", "truncated", "stale", "unknown", "unavailable", "future", "reversed", "wrong_entity", "cache_conflict", "exception", "unplug"):
+        _, store = recurring_inputs(base)
+        settings = car_settings(base)
+        settings["connection_entity_states"] = ["8", "4"]
+        settings["soc_observed_at_entity"] = None
+        settings["connection_observed_at_entity"] = None
+        base.car_charging_plan_time = [(base.now_utc + timedelta(hours=8)).strftime("%H:%M:%S")]
+        entity = settings["connection_entity"]
+        checked = base.now_utc - timedelta(minutes=10)
+        _set_entity(base, entity, "8", last_changed=checked, last_updated=checked, attributes={"retrievalstatus": "VALID"})
+        first = resolve_recurring_session(base, now=base.now_utc)
+        assert first["status"] == "ready", (fault, first)
+        before = deepcopy(store.records[("car_charging", "recurring_session")]["session"])
+
+        transition = base.now_utc + timedelta(minutes=45)
+        now = base.now_utc + timedelta(hours=1)
+        _set_entity(
+            base,
+            entity,
+            "4",
+            last_changed=transition,
+            last_updated=transition,
+            attributes={"retrievalstatus": "VALID", "value_history": [{"state": "4", "at": transition.isoformat()}], "value_last_changed": transition.isoformat()},
+        )
+        rows = [{"entity_id": entity, "state": state, "last_changed": stamp.isoformat(), "last_updated": stamp.isoformat()} for state, stamp in (("8", checked), ("4", checked + timedelta(milliseconds=141)), ("4", transition))]
+        result_rows = [deepcopy(row) for row in rows]
+        if fault == "missing":
+            history = None
+        elif fault == "truncated":
+            history = [result_rows[1:]]
+        elif fault == "stale":
+            history = [result_rows[:-1]]
+        elif fault in ("unknown", "unavailable"):
+            result_rows[1]["state"] = fault
+            history = [result_rows]
+        elif fault == "future":
+            result_rows[-1]["last_updated"] = (now + timedelta(seconds=1)).isoformat()
+            history = [result_rows]
+        elif fault == "reversed":
+            history = [list(reversed(result_rows))]
+        elif fault == "wrong_entity":
+            result_rows[1]["entity_id"] = "sensor.other"
+            history = [result_rows]
+        elif fault == "cache_conflict":
+            _set_entity(
+                base,
+                entity,
+                "4",
+                last_changed=transition,
+                last_updated=transition,
+                attributes={
+                    "retrievalstatus": "VALID",
+                    "value_history": [
+                        {"state": "3", "at": (base.now_utc + timedelta(minutes=30)).isoformat()},
+                        {"state": "4", "at": transition.isoformat()},
+                    ],
+                    "value_last_changed": transition.isoformat(),
+                },
+            )
+            history = [result_rows]
+        elif fault == "unplug":
+            result_rows[1]["state"] = "3"
+            _set_entity(base, settings["relay_entity"], "on", last_changed=now, last_updated=now)
+            history = [result_rows]
+        else:
+            history = [result_rows]
+
+        restored = RecurringStorage()
+        restored.records = deepcopy(store.records)
+        base.components = SimpleNamespace(get_component=lambda name: restored if name == "storage" else None)
+        with patch.object(
+            base.ha_interface,
+            "get_history_window",
+            return_value=history,
+            side_effect=RuntimeError("Recorder unavailable") if fault == "exception" else None,
+            create=True,
+        ):
+            result = resolve_recurring_session(base, now=now)
+
+        expected = "recurring_new_baseline_requires_off" if fault == "unplug" else "connection_not_confirmed"
+        assert result["status"] == "blocked" and result["reason"] == expected, (fault, result)
+        assert restored.records[("car_charging", "recurring_session")]["session"] == before, fault
 
 
 def test_recurring_baseline_is_not_reset_by_cache_heartbeat(base):
@@ -832,6 +970,10 @@ def test_recurring_connection_only_ignores_gps_and_preserves_meter(base):
     settings = car_settings(base)
     tracker = settings.pop("home_entity")
     _set_entity(base, tracker, "not_home")
+    sink = cache_sink()
+    entity = settings["connection_entity"]
+    old = cache_event(sink, entity, "connected", base.now_utc - timedelta(hours=1))
+    base.ha_interface.dummy_items[entity] = deepcopy(sink.state_data[entity])
     getter = base.get_state_wrapper
     tracker_reads = []
 
@@ -854,10 +996,12 @@ def test_recurring_connection_only_ignores_gps_and_preserves_meter(base):
         assert abs(value["observation"]["ev_metered_ac_kwh"] - 0.5) < 1e-9
     assert not tracker_reads
     assert store.records[("car_charging", "recurring_session")]["session"]["meter_baseline"] == 100
-    _set_entity(base, settings["connection_entity"], "disconnected", last_changed=later, last_updated=later, attributes={"retrievalstatus": "VALID"})
+    old = cache_event(sink, entity, "disconnected", later, old)
+    base.ha_interface.dummy_items[entity] = deepcopy(sink.state_data[entity])
     assert resolve_recurring_session(base, now=later)["reason"] == "connection_not_confirmed"
     later += timedelta(minutes=1)
-    _set_entity(base, settings["connection_entity"], "connected", last_changed=later, last_updated=later, attributes={"retrievalstatus": "VALID"})
+    cache_event(sink, entity, "connected", later, old)
+    base.ha_interface.dummy_items[entity] = deepcopy(sink.state_data[entity])
     reconnected = resolve_recurring_session(base, now=later)
     assert reconnected["status"] == "ready" and reconnected["identity"] != first["identity"], reconnected
     assert store.records[("car_charging", "recurring_session")]["session"]["meter_baseline"] == 100.5
@@ -1287,6 +1431,8 @@ def run_car_planning_recurring_tests(base):
         test_real_cache_force_update_and_gaps,
         test_real_bulk_preserves_only_identical_present_entities,
         test_recurring_observes_between_cycle_unplug_and_charging_states,
+        test_recurring_cold_connection_cache_recovers_proven_recorder_continuity,
+        test_recurring_cold_connection_cache_fails_closed_without_complete_history,
         test_recurring_baseline_is_not_reset_by_cache_heartbeat,
         test_recurring_meter_stall_ignores_attribute_freshness,
         test_recurring_changed_soc_anchor_persists_after_measurement_ages,
