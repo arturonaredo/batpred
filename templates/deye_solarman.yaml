@@ -52,6 +52,7 @@ pred_bat:
   battery_power: ["sensor.{deye_entity_prefix}_battery_power"]
   battery_voltage: ["sensor.{deye_entity_prefix}_battery_voltage"]
   battery_temperature: ["sensor.{deye_entity_prefix}_battery_temperature"]
+  battery_temperature_history: ["sensor.{deye_entity_prefix}_battery_temperature"]
   pv_power: ["sensor.{deye_entity_prefix}_pv_power"]
   load_power: ["sensor.{deye_entity_prefix}_load_power"]
   grid_power: ["sensor.{deye_entity_prefix}_grid_power"]
