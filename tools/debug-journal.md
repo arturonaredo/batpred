@@ -75,6 +75,8 @@ Read dumps locally and never quote a raw block publicly unchecked.
 
 ## Check configuration before code
 
+- **A mapped planning setting must also pass the configuration entry point.** Adding `battery_power_readiness` to `CAR_SETTING_KEYS` without adding its translated `power_readiness` key to `_options()`'s allowed set makes live EV planning reject it as `Unknown car planning input`. Direct candidate/replay tests and the no-EV household route bypass that admission check and can still pass. Test the enabled setting through `_options()` and `evaluate_car_charging()`, including an active policy overlay, not only `build_candidate()`. A successful source install and complete unit suite do not replace verifying a fresh live decision; on failed validation retain safe handback and preserve the current session ledger during recovery.
+
 Pull the non-default list first: `combine_export_slots`, `metric_min_improvement_export`/`_plan`, `best_soc_keep`, `metric_battery_value_scaling`, `metric_battery_value_export_scaling`, `metric_battery_cycle`, `metric_cloud_enable`, `load_scaling*`. "Configuration" is a legitimate outcome.
 
 - Replay one setting change at a time and compare decisions, not the metric (an emptier final battery always looks cheaper). `best_soc_keep: 0.0` and `metric_battery_value_export_scaling: 0.8` are defaults.
