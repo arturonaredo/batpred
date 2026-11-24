@@ -62,6 +62,7 @@ from utils import (
     round_out_to_period,
 )
 from config import INVERTER_DEF
+from evening_load_forecast import apply_evening_load_adjustment
 from prediction import Prediction
 from prediction_batch import export_end_soc_from_series, prediction_cache_key
 from prediction_kernel import kernel_status_summary, set_window_start
@@ -2413,6 +2414,41 @@ class Plan:
             load_adjust=self.manual_load_adjust,
             load_baseline=self.dynamic_load_baseline,
         )
+        # This experimental correction is separate from historical/ML/heat inputs and
+        # only touches the three prospective native load scenarios. Non-publishing
+        # tariff comparisons keep their supplied baseline forecast unchanged.
+        if publish and self.get_arg("load_evening_adjustment_enable", False):
+            adjustment_kwh = self.get_arg("load_evening_adjustment_kwh", 0.0)
+            load_minutes_step = apply_evening_load_adjustment(
+                load_minutes_step,
+                self.minutes_now,
+                self.rate_import,
+                self.rate_import_base,
+                self.rate_import_replicated,
+                getattr(self, "rate_import_base_replicated", None),
+                True,
+                adjustment_kwh,
+            )
+            load_minutes_step10 = apply_evening_load_adjustment(
+                load_minutes_step10,
+                self.minutes_now,
+                self.rate_import,
+                self.rate_import_base,
+                self.rate_import_replicated,
+                getattr(self, "rate_import_base_replicated", None),
+                True,
+                adjustment_kwh,
+            )
+            load_minutes_step90 = apply_evening_load_adjustment(
+                load_minutes_step90,
+                self.minutes_now,
+                self.rate_import,
+                self.rate_import_base,
+                self.rate_import_replicated,
+                getattr(self, "rate_import_base_replicated", None),
+                True,
+                adjustment_kwh,
+            )
         # The p90 refresh has to happen before the p50 series is stepped, not after it: the envelope
         # model modulates p50 toward p90, so a stale or missing p90 would silently pick the
         # amplitude for the central scenario.

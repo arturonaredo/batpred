@@ -726,4 +726,220 @@ def run_new_install_tests(my_predbat):
         my_predbat.get_holiday_minutes = original_get_holiday_minutes
         my_predbat.holiday_days_left = 0
 
+    failed |= test_evening_load_adjustment_candidate(my_predbat)
+    return failed
+
+
+def test_evening_load_adjustment_candidate(my_predbat):
+    """Test the bounded evening-only load correction and its fail-closed tariff gate."""
+    print("**** Running evening load adjustment candidate tests ****")
+    try:
+        from config import CONFIG_ITEMS
+        from evening_load_forecast import apply_evening_load_adjustment
+    except ImportError as error:
+        print("ERROR: evening load adjustment implementation is missing: {}".format(error))
+        return True
+
+    failed = False
+    config = {item["name"]: item for item in CONFIG_ITEMS}
+    enable_config = config.get("load_evening_adjustment_enable")
+    amount_config = config.get("load_evening_adjustment_kwh")
+    if enable_config is None or enable_config.get("default") is not False:
+        print("ERROR: evening adjustment must have a default-off CONFIG_ITEMS switch")
+        failed = True
+    if amount_config is None or amount_config.get("default") != 0.0 or amount_config.get("max") != 2.0:
+        print("ERROR: evening adjustment amount must default to zero and be bounded at 2.0 kWh")
+        failed = True
+
+    def apply(load_steps, now, rates, rate_tags=None, base_rate_tags=None, enabled=True, amount=1.0):
+        """Call the pure forecast helper with current and base tariff evidence."""
+        return apply_evening_load_adjustment(
+            load_steps,
+            now,
+            rates,
+            rates,
+            rate_tags or {},
+            base_rate_tags,
+            enabled,
+            amount,
+        )
+
+    # An omitted/defaulted switch is a strict no-op, even when qualifying rates are present.
+    disabled_steps = {0: 0.014, 5: 0.020}
+    disabled_rates = {minute: 5.0 for minute in range(19 * 60, 19 * 60 + 10)}
+    disabled = apply(disabled_steps, 19 * 60, disabled_rates, base_rate_tags={}, enabled=False, amount=0.0)
+    if disabled is not disabled_steps or disabled != disabled_steps:
+        print("ERROR: default-off evening adjustment changed the baseline forecast")
+        failed = True
+
+    # The same fixed total is added once to each native load scenario. Existing load can already include heat.
+    now = 19 * 60
+    source_load = {0: 0.014, 5: 0.020}  # includes an already-combined 0.004 kWh heat forecast in the first bucket
+    pv10_load = {0: 0.024, 5: 0.030}
+    pv90_load = {0: 0.010, 5: 0.015}
+    heat_forecast = {now: 0.004}
+    heat_before = dict(heat_forecast)
+    cheap_rates = {minute: 12.0 if minute < 1440 else 9.99 for minute in range(now, 1445)}
+    rate_tags = {}
+    base_rate_tags = {}
+    adjusted = [
+        apply(steps, now, cheap_rates, rate_tags, base_rate_tags)
+        for steps in (source_load, pv10_load, pv90_load)
+    ]
+    for label, original, result in zip(("nominal", "PV10", "PV90"), (source_load, pv10_load, pv90_load), adjusted):
+        if abs((result[0] - original[0]) - 0.0166) > 1e-9:
+            print("ERROR: {} scenario expected one bounded 0.0166 kWh candidate addition, got {}".format(label, result[0] - original[0]))
+            failed = True
+    if heat_forecast != heat_before or source_load[0] != 0.014:
+        print("ERROR: candidate mutated the existing heat forecast or baseline load")
+        failed = True
+    repeat = apply(source_load, now, cheap_rates, rate_tags, base_rate_tags)
+    if repeat != adjusted[0] or source_load[0] != 0.014:
+        print("ERROR: correction depends on prior predictions or mutates its input")
+        failed = True
+
+    # A short cheap window still ends the correction, even mid-bucket.
+    now = 18 * 60 + 55
+    rates = {minute: 10.0 if minute < 1152 else 9.0 for minute in range(now, now + 30)}
+    live_rates = dict(rates)
+    base_tags = {minute: "copy" for minute in range(1155, 1160)}
+    partial_steps = {offset: 0.1 for offset in range(0, 30, 5)}
+    partial = apply_evening_load_adjustment(
+        partial_steps,
+        now,
+        live_rates,
+        rates,
+        {},
+        base_tags,
+        True,
+        1.0,
+    )
+    expected_deltas = {0: 0.0, 5: 0.0166, 10: 0.0166, 15: 0.0066, 20: 0.0, 25: 0.0}
+    for offset, expected in expected_deltas.items():
+        if abs((partial[offset] - partial_steps[offset]) - expected) > 1e-9:
+            print("ERROR: partial tariff window at offset {} expected delta {}, got {}".format(offset, expected, partial[offset] - partial_steps[offset]))
+            failed = True
+
+    # Unknown base-rate provenance, missing live evidence, and out-of-range configuration all fail closed.
+    unverified = apply_evening_load_adjustment(partial_steps, now, live_rates, rates, {}, None, True, 1.0)
+    missing_live = apply_evening_load_adjustment(partial_steps, now, {}, rates, {}, {}, True, 1.0)
+    out_of_range = apply_evening_load_adjustment(partial_steps, now, live_rates, rates, {}, {}, True, 2.01)
+    if unverified != partial_steps or missing_live != partial_steps or out_of_range != partial_steps:
+        print("ERROR: missing or invalid tariff/config evidence must leave the forecast unchanged")
+        failed = True
+
+    for label, live, base, tags in (
+        ("gap", {m: v for m, v in rates.items() if m != 1149}, rates, {}),
+        ("replicated boundary", rates, rates, {1152: "copy"}),
+        ("already cheap", {m: 8.1 for m in rates}, {m: 8.1 for m in rates}, {}),
+        ("no known cheap start", {m: 12.0 for m in rates}, {m: 12.0 for m in rates}, {}),
+    ):
+        if apply_evening_load_adjustment(partial_steps, now, live, base, {}, tags, True, 1.0) is not partial_steps:
+            print("ERROR: {} must leave the baseline unchanged".format(label))
+            failed = True
+
+    # The last five minutes of the evening qualify; midnight is exclusive, even when its rate is cheap.
+    midnight_rates = {minute: 12.0 if minute < 1440 else 8.0 for minute in range(19 * 60, 24 * 60 + 5)}
+    midnight = apply_evening_load_adjustment(
+        {0: 0.01, 5: 0.01},
+        23 * 60 + 55,
+        midnight_rates,
+        midnight_rates,
+        {},
+        {},
+        True,
+        1.0,
+    )
+    if abs((midnight[0] - 0.01) - 0.0166) > 1e-9 or abs(midnight[5] - 0.01) > 1e-9:
+        print("ERROR: evening end boundary should include 23:55-23:59 only")
+        failed = True
+
+    steps = {0: 0.1, 5: 0.1}
+    two_windows = {minute: 8.1 if minute in (1140, 1160) else 12.0 for minute in range(19 * 60, 1161)}
+    if apply(steps, 1150, two_windows, base_rate_tags={}) is not steps:
+        print("ERROR: adjustment restarted after the first cheap window passed")
+        failed = True
+
+    failed |= test_evening_load_adjustment_plan_integration()
+    if not failed:
+        print("**** Evening load adjustment candidate tests passed ****")
+    return failed
+
+
+def test_evening_load_adjustment_plan_integration():
+    """Verify calculate_plan applies the opt-in correction after building all native load scenarios."""
+    from unit_test import create_predbat
+
+    predbat = create_predbat()
+    predbat.minutes_now = 18 * 60 + 55
+    predbat.now_utc = predbat.midnight_utc + timedelta(minutes=predbat.minutes_now)
+    predbat.rate_import = {minute: 12.0 if minute < 1440 else 8.1 for minute in range(0, 3 * 24 * 60)}
+    predbat.rate_import_base = dict(predbat.rate_import)
+    predbat.rate_import_replicated = {}
+    predbat.rate_import_base_replicated = {}
+
+    # Confirm the fetch seam records synthetic gaps so a copied rate cannot pass as verified.
+    predbat.rate_base_min_max({0: 5.0})
+    if predbat.rate_import_base_replicated is None or predbat.rate_import_base_replicated.get(1) != "copy":
+        print("ERROR: base tariff gap filling did not retain per-minute provenance")
+        return True
+    predbat.rate_import_base_replicated = {}
+
+    load_step_baselines = []
+
+    def step_data_history(item, minutes_now, forward, step=5, **kwargs):
+        """Return native load plus its already-combined heat component, before candidate correction."""
+        if kwargs.get("type_load"):
+            scale = kwargs.get("scale_fixed", 1.0)
+            # Model the existing forecast seam explicitly: heat is already included once in
+            # the native load step, so the candidate must only add its separate fixed amount.
+            value = (0.010 + 0.004) * scale
+            steps = {minute: value for minute in range(0, predbat.forecast_minutes, step)}
+            load_step_baselines.append(dict(steps))
+            return steps
+        return {minute: 0.0 for minute in range(0, predbat.forecast_minutes, step)}
+
+    predbat.step_data_history = step_data_history
+    original_get_arg = predbat.get_arg
+
+    def configured_get_arg(name, default=None, *args, **kwargs):
+        if name == "load_evening_adjustment_enable":
+            return True
+        if name == "load_evening_adjustment_kwh":
+            return 1.0
+        return original_get_arg(name, default, *args, **kwargs)
+
+    predbat.get_arg = configured_get_arg
+    predbat.calculate_plan(recompute=False, publish=True)
+
+    failed = False
+    if len(load_step_baselines) < 3:
+        print("ERROR: calculate_plan did not build all three native load scenarios")
+        return True
+    for label, steps, baseline in zip(
+        ("nominal", "PV10", "PV90"),
+        (predbat.load_minutes_step, predbat.load_minutes_step10, predbat.load_minutes_step90),
+        load_step_baselines[:3],
+    ):
+        if abs(steps[0] - baseline[0]) > 1e-9:
+            print("ERROR: calculate_plan changed the pre-evening {} load, including its single existing heat component".format(label))
+            failed = True
+        delta = steps[5] - baseline[5]
+        if abs(delta - 0.0166) > 1e-9:
+            print("ERROR: calculate_plan did not add one eligible-minute correction to {} load (delta {})".format(label, delta))
+            failed = True
+
+    predbat.calculate_plan(recompute=False, publish=False)
+    if len(load_step_baselines) < 6:
+        print("ERROR: non-publishing calculate_plan did not rebuild the native load scenarios")
+        failed = True
+    else:
+        for label, steps, baseline in zip(
+            ("nominal", "PV10", "PV90"),
+            (predbat.load_minutes_step, predbat.load_minutes_step10, predbat.load_minutes_step90),
+            load_step_baselines[3:6],
+        ):
+            if steps != baseline:
+                print("ERROR: non-publishing calculate_plan changed the {} baseline load".format(label))
+                failed = True
     return failed

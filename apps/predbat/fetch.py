@@ -3821,7 +3821,10 @@ class Fetch:
         the tariff's real off-peak price. Mirrors how rate_export_base is already built downstream of
         rate_replicate() on the export side.
         """
-        rate_base, _ = self.rate_replicate(rates.copy(), {}, is_import=True, use_future=True)
+        rate_base, rate_base_replicated = self.rate_replicate(rates.copy(), {}, is_import=True, use_future=True)
+        # Retain which base minutes came from gap filling so optional forecast
+        # adjustments can fail closed instead of treating copied prices as facts.
+        self.rate_import_base_replicated = rate_base_replicated
         rate_min_base, rate_max_base, _, _, _ = self.rate_minmax(rate_base)
         return rate_base, rate_min_base, rate_max_base
 
