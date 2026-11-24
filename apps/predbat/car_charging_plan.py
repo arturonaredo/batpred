@@ -627,6 +627,9 @@ def build_candidate(base, options):
     support_w = _number(options.get("grid_charge_support_w", 0), "grid_charge_support_w", 0, options["import_limit_w"])
     if support_w and (options.get("mode") not in ("shadow", "apply") or options["control_model"] != "deye_solarman"):
         raise ValueError("Grid charge support requires the shared control model")
+    initial_run = options.get("ev_initial_run_minutes", 0)
+    if initial_run and (not support_w or options.get("ev_charging_priority") != "now" or options.get("house_only")):
+        raise ValueError("An immediate EV prefix requires NOW shared grid support")
     block = options.get("ev_continuous_block")
     if block is not None:
         from dataclasses import replace
@@ -652,6 +655,7 @@ def build_candidate(base, options):
             battery_min_window_minutes=options.get("battery_min_window_minutes", 5),
             initial_window_mode=options.get("initial_window_mode"),
             initial_window_remaining_minutes=options.get("initial_window_remaining_minutes", 0),
+            ev_initial_run_minutes=initial_run,
         ),
     )
     if result.actions:
@@ -995,6 +999,48 @@ def _priority_block_starts(base, options, first, last, duration):
     return [(start, "coupled_cost") for _, start in sorted(selected)]
 
 
+def _now_initial_run_shadow(base, options, duration):
+    """Prefer a bounded long NOW prefix while retaining full-target delivery and every guard.
+
+    A full-target single block may fail although a long initial run followed by
+    a safe pause/restart is valid. Sample at most 24 descending whole-step
+    prefixes; this is not a maximum-reachability or global optimality claim.
+    Both native forecasts must validate the complete, unchanged EV target.
+    """
+    prefixes = list(range(duration - PREDICT_STEP, PREDICT_STEP, -PREDICT_STEP))
+    if len(prefixes) > 24:
+        prefixes = [prefixes[round(index * (len(prefixes) - 1) / 23)] for index in range(24)]
+    attempts = []
+    for minutes in prefixes:
+        for initial_demand in (True, False) if options.get("self_consumption_first") else (False,):
+            trial = {**options, "forecast_basis": "envelope", "ev_initial_run_minutes": minutes, "initial_demand_only": initial_demand}
+            result, slots = build_candidate(base, trial)
+            passed = False
+            reasons = {"nominal": ["solver_no_plan"], "pv10": ["solver_no_plan"]}
+            if result.actions:
+                _validate_candidate_modes(options, result)
+                windows, checks = _replay_candidate(base, trial, result, slots)
+                passed = all(check["passed"] and check["final_ev_kwh"] >= base.car_charging_limit[0] - 0.002 for check in checks.values())
+                reasons = _check_reasons(checks)
+            attempt = {
+                "start_offset": 0,
+                "end_offset": minutes,
+                "initial_run_minutes": minutes,
+                "beam_width": trial["beam"],
+                "solver_status": result.status,
+                "solver_objective": result.total_cost,
+                "native_passed": passed,
+                "native_reasons": reasons,
+                "initial_demand_only": initial_demand,
+                "priority_reason": "immediate_prefix_full_target",
+            }
+            attempts.append(attempt)
+            if passed:
+                attempt["selected"] = True
+                return (result, slots, windows, checks), attempts
+    return None, attempts
+
+
 def _continuous_grid_support_shadow(base, options):
     """Prefer one paired-safe fixed-rate block within the finite departure horizon.
 
@@ -1089,6 +1135,9 @@ def _continuous_grid_support_shadow(base, options):
         attempts.append({"beam_width": configured_beam, "solver_status": result.status, "solver_objective": result.total_cost, "native_passed": passed, "priority_reason": "coupled_cost_flexible_schedule"})
     if selected is not None:
         attempts[selected]["selected"] = True
+    if best is None and priority == "now" and first == 0 and ranked:
+        best, prefix_attempts = _now_initial_run_shadow(base, options, duration)
+        attempts.extend(prefix_attempts)
     return best, attempts
 
 
@@ -1698,6 +1747,8 @@ def evaluate_car_charging(base, publish=True):
                 report["ev_run_strategy"] = "next_solar_or_cheaper_opportunity" if continuous is not None else "asap_deadline_fallback_bounded_search"
             elif options["ev_charging_priority"] == "now":
                 report["ev_run_strategy"] = "immediate_paired_continuous_block" if continuous is not None else "immediate_start_required_bounded_search"
+                if any(attempt.get("selected") and attempt.get("initial_run_minutes") for attempt in continuous_attempts):
+                    report["ev_run_strategy"] = "immediate_paired_prefix_with_safe_restarts"
             elif options["ev_charging_priority"] == "solar":
                 report["ev_run_strategy"] = "solar_surplus_only"
             elif continuous is not None:
