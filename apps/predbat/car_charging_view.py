@@ -269,6 +269,20 @@ def build_replay_preview(base, pred, result, slots, scenario):
         row["battery_end_percent"] = end_soc
         row["battery_min_percent"] = min(row["battery_min_percent"], start_soc, end_soc)
         row["grid_peak_w"] = max(row["grid_peak_w"], peak)
+        # Additive display evidence only: keep the validated replay bins and
+        # every safety/authority input unchanged. Battery power is positive
+        # for discharge, negative for charge, as in the native prediction.
+        battery_kw = getattr(pred, "predict_battery_power", {}).get(_format_iso(base, absolute))
+        row.setdefault("display_steps", []).append(
+            {
+                "start": _format_iso(base, absolute),
+                "end": _format_iso(base, absolute + 5),
+                "battery_kw": battery_kw if _is_finite(battery_kw) else None,
+                "grid_kw": pred.predict_grid_power[_format_iso(base, absolute)],
+                "soc_start": start_soc,
+                "soc_end": end_soc,
+            }
+        )
         # Prices and cumulative cost must belong to this replay too. Never
         # borrow the native plan's costs when displaying a different schedule.
         if _is_finite(getattr(slot, "import_price", None)) and _is_finite(getattr(slot, "export_price", None)):
@@ -502,7 +516,7 @@ def build_car_charging_plan_view(native_plan, report, now=None):
         return native_plan
     now = now if now is not None else datetime.now(timezone.utc)
     native = native_plan if isinstance(native_plan, dict) else {}
-    view = {key: native[key] for key in ("time", "currency_symbols", "reason_templates", "import_cost_threshold", "export_cost_threshold") if key in native}
+    view = {key: native[key] for key in ("time", "currency_symbols", "reason_templates", "import_cost_threshold", "export_cost_threshold", "recorded_cost") if key in native}
     view.update({"timestamp": report.get("generated_at"), "num_cars": 1, "iboost_enable": False, "carbon_enable": False, "rows": []})
     view.setdefault("currency_symbols", ["", ""])
     status = report.get("status")
@@ -568,6 +582,11 @@ def build_car_charging_plan_view(native_plan, report, now=None):
             state_text = "Chrg&nearr;" if state == "Chrg" else ("HoldChrg&rarr;" if state == "HoldChrg" else soc_sym)
             reasons = []
             show_limit = str(round(row.get("charge_target_percent", 100))) if "charge" in names else ""
+        steps = _display_steps(row)
+        action = _display_action(row, steps)
+        reason = _display_reason(action, names)
+        if not steps or any(step.get("battery_kw") is None for step in steps):
+            reason += " (net SoC; power trace unavailable)"
         rate = row.get("import_rate")
         threshold = native.get("import_cost_threshold")
         rate_color = "#FFFFFF"
@@ -595,6 +614,10 @@ def build_car_charging_plan_view(native_plan, report, now=None):
                 "cost_color": cost_color,
                 "state": state,
                 "state_text": state_text,
+                "plan_action": action,
+                "plan_reason": reason,
+                "plan_phase": "current" if start <= now < _parse_iso(row["end"]) else "forecast",
+                "plan_steps": steps,
                 "state_color": "#3AEE85" if state == "Chrg" else ("#34DBEB" if state == "HoldChrg" else "#FFFFFF"),
                 "show_limit": show_limit,
                 "reasons": reasons,
@@ -634,6 +657,55 @@ def build_car_charging_plan_view(native_plan, report, now=None):
             "clipped": 0,
         }
     return view
+
+
+def _display_steps(row):
+    """Accept optional bounded flow detail, never as authority for the plan."""
+    steps = row.get("display_steps")
+    if not isinstance(steps, list) or len(steps) != row["minutes"] / 5:
+        return []
+    previous = _parse_iso(row["start"])
+    for step in steps:
+        if not isinstance(step, dict) or not all(_is_finite(step.get(key)) for key in ("grid_kw", "soc_start", "soc_end")):
+            return []
+        start, end = _parse_iso(step.get("start")), _parse_iso(step.get("end"))
+        if start != previous or end is None or (end - start).total_seconds() != 300:
+            return []
+        if step.get("battery_kw") is not None and not _is_finite(step["battery_kw"]):
+            return []
+        previous = end
+    return steps if previous == _parse_iso(row["end"]) else []
+
+
+def _display_action(row, steps):
+    """Describe forecast flow, not an enabled charge window or rounded SoC."""
+    powers = [step.get("battery_kw") for step in steps]
+    if powers and all(_is_finite(power) for power in powers):
+        charging = any(power < -0.03 for power in powers)
+        discharging = any(power > 0.03 for power in powers)
+    else:
+        change = row["battery_end_percent"] - row["battery_start_percent"]
+        charging, discharging = change > 0.01, change < -0.01
+    if charging and discharging:
+        return "Mixed"
+    if charging:
+        return "Charge"
+    if discharging:
+        return "Discharge"
+    return "Hold" if "charge" in row["battery_modes"] or "hold" in row["battery_modes"] else "Idle"
+
+
+def _display_reason(action, modes):
+    """Explain observable display semantics without inventing optimiser motives."""
+    if action == "Hold":
+        return "Charge window; no battery gain forecast" if "charge" in modes else "Battery held by plan"
+    if action == "Charge":
+        return "Charge towards target" if "charge" in modes else "Solar surplus stored"
+    if action == "Discharge":
+        return "Battery supplies demand / export"
+    if action == "Mixed":
+        return "Flow changes within interval; see detail"
+    return "No material battery flow forecast"
 
 
 def _format_finite(value, decimals=2):
@@ -859,7 +931,6 @@ def render_car_charging_preview(report, native_diagnostic, now=None):
     if paired is not None:
         if applied_fresh:
             compact.append("Active plan")
-            compact.append("current command only — future forecast under revalidation")
             if report.get("partial_target_authorised") is True:
                 compact.append("EV {}% / {}% requested".format(_format_finite(report.get("planned_ev_percent_by_departure"), 1), _format_finite(report.get("requested_ev_target_percent"), 1)))
         elif is_applied or is_blocked:
@@ -868,6 +939,7 @@ def render_car_charging_preview(report, native_diagnostic, now=None):
             compact.append("Simulation only — not executed")
             if status in ("partial_candidate", "conditional_partial_candidate"):
                 compact.append("EV {}% / {}% requested".format(_format_finite(report["planned_ev_percent_by_departure"], 1), _format_finite(report["requested_ev_target_percent"], 1)))
+                compact.append("requested target NOT validated")
             if report.get("uses_stale_soc_assumption") or str(status).startswith("conditional_"):
                 compact.append("EV SOC unconfirmed")
             if _is_exceeded(*_parse_native_diag(native_diagnostic)):
@@ -877,8 +949,7 @@ def render_car_charging_preview(report, native_diagnostic, now=None):
         compact.append("execution blocked: {}".format(_applied_block_reason(report, now)))
     if applied_fresh:
         banner = (
-            '<div class="car-charging-preview-banner"><strong>Active plan:</strong> '
-            '<span class="car-charging-preview-debug" style="display:none;">'
+            '<details class="car-charging-preview-banner"><summary>Command observed · future rows are forecasts</summary>'
             "the existing Plan table shows the currently observed command. "
             "Only the inverter/EV response just received is authoritative; "
             "every later row is a future forecast that will be revalidated "
@@ -886,11 +957,11 @@ def render_car_charging_preview(report, native_diagnostic, now=None):
             "claimed from HA observations alone. Native-plan counterfactual "
             "diagnostics (e.g. native grid-limit exceeded) are obsolete — "
             "see Show Debug to distinguish them from the applied receipt."
-            "</span></div>"
+            "</details>"
         )
     elif (is_applied or is_blocked) and active:
         banner = (
-            '<div class="car-charging-preview-banner"><strong>Execution blocked:</strong> '
+            '<div class="car-charging-preview-banner" role="alert"><strong>Execution blocked:</strong> '
             '<span class="car-charging-preview-debug" style="display:none;">'
             "the most recent applied receipt is not a valid display "
             "(expired, missing, future, false authority, blocked, missing "
@@ -912,7 +983,6 @@ def render_car_charging_preview(report, native_diagnostic, now=None):
     parts = ['<section class="car-charging-preview" style="margin-bottom:16px;">']
     if compact:
         parts.append('<div class="car-charging-preview-summary">' + escape(" · ".join(compact)) + "</div>")
-        parts.append('<div class="car-charging-preview-debug" style="display:none;">')
         if applied_fresh:
             debug_parts.append("Observed: {}".format(_safe_iso(report.get("execution_observed_at"))))
             debug_parts.append("Valid until: {}".format(_safe_iso(report.get("execution_valid_until"))))
@@ -925,14 +995,22 @@ def render_car_charging_preview(report, native_diagnostic, now=None):
         reference_at = _safe_iso(report.get("planning_reference_at"))
         if reference_at:
             debug_parts.append("Planning reference: {}".format(reference_at))
-    parts.append(banner)
+    if compact and not (applied_fresh or is_applied or is_blocked):
+        parts.append('<div class="car-charging-preview-debug" style="display:none;">' + banner + "</div>")
+    else:
+        parts.append(banner)
     # For shadow / partial / unavailable candidates without a compact line
     # the XSS-sensitive status field still belongs under Show Debug.
     if isinstance(report, dict) and not compact and status:
         parts.append('<div class="car-charging-preview-status car-charging-preview-debug" style="display:none;">' "<span>Status: <strong>{}</strong></span></div>".format(escape(str(status))))
     if native_exceeded and not applied_fresh:
         parts.append(
-            '<div class="car-charging-preview-warning" role="alert" style="padding:10px;background:#fee;color:#a00;border:1px solid #c00;"><strong>Native import '
+            (
+                '<div class="car-charging-preview-warning car-charging-preview-debug" style="display:none;">'
+                if compact and not (is_applied or is_blocked)
+                else '<div class="car-charging-preview-warning" role="alert" style="padding:10px;background:#fee;color:#a00;border:1px solid #c00;">'
+            )
+            + "<strong>Native import "
             'limit exceeded:</strong> native control plan, not the displayed simulation. <span class="car-charging-preview-debug" style="display:none;">Peak {peak} W over a {limit} W limit '
             "for {minutes} minute(s) in the native control plan (not the displayed combined candidate). This is "
             "a diagnostic indicator of the native plan, not an enforcement "
@@ -967,12 +1045,10 @@ def render_car_charging_preview(report, native_diagnostic, now=None):
         if debug_parts:
             parts.append('<div class="car-charging-preview-debug" style="display:none;">' + "<br>".join(debug_parts) + "</div>")
             debug_parts = []
-        if compact:
-            parts.append("</div>")
         parts.append("</section>")
         return "".join(parts)
     if not applied_fresh and (bool(report.get("uses_stale_soc_assumption")) or (isinstance(status, str) and status.startswith("conditional_"))):
-        parts.append('<div class="car-charging-preview-stale">EV SOC is old: stale SoC assumption, conditional simulation, never valid for execution.</div>')
+        parts.append(('<div class="car-charging-preview-debug" style="display:none;">' if compact else '<div class="car-charging-preview-stale">') + "EV SOC is old: stale SoC assumption, conditional simulation, never valid for execution.</div>")
     age = _age_minutes(report.get("generated_at"), now)
     if age is not None and (age > _STALE_AGE_MINUTES or age < -1):
         parts.append('<div class="car-charging-preview-stale">' "Report is older than 15 minutes; treating as stale and showing " "no earlier schedule (future timestamps are also invalid).</div></section>")
@@ -984,8 +1060,8 @@ def render_car_charging_preview(report, native_diagnostic, now=None):
         parts.append("<p>" + escape(_unavailable_reason(report)) + "</p>")
     elif status in ("partial_candidate", "conditional_partial_candidate") and not applied_fresh:
         parts.append(
-            '<div class="car-charging-preview-warning" role="alert">'
-            "Partial charging plan: EV forecast at least {planned}% by {departure}; requested target {requested}% remains unchanged and is NOT validated by this plan. "
+            ('<div class="car-charging-preview-debug" style="display:none;">' if compact else '<div class="car-charging-preview-warning" role="alert">')
+            + "Partial charging plan: EV forecast at least {planned}% by {departure}; requested target {requested}% remains unchanged and is NOT validated by this plan. "
             "This fresh plan passes both native power/reserve checks; it is the best validated alternative found, not proof of a maximum or of physical delivery.</div>".format(
                 planned=_format_finite(report["planned_ev_percent_by_departure"], 1),
                 requested=_format_finite(report["requested_ev_target_percent"], 1),
@@ -994,8 +1070,6 @@ def render_car_charging_preview(report, native_diagnostic, now=None):
         )
     if debug_parts:
         parts.append('<div class="car-charging-preview-debug" style="display:none;">' + "<br>".join(debug_parts) + "</div>")
-    if compact:
-        parts.append("</div>")
     parts.append("</section>")
     return "".join(parts)
 

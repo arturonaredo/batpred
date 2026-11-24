@@ -7178,6 +7178,57 @@ def get_plan_renderer_js():
         return null;
     }
 
+    function escapePlanText(value) {
+        return String(value ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }
+
+    // Group copies only. No edit/control state or input row is ever modified.
+    function groupPlanRows(rows) {
+        const result = [];
+        const keys = ['plan_action', 'plan_reason', 'show_limit', 'import_rate', 'export_rate',
+            'plan_phase', 'state', 'plan_rates_unavailable'];
+        for (const row of rows) {
+            const last = result[result.length - 1];
+            const sameDay = last && last.time.slice(0,10) === row.time.slice(0,10);
+            const matches = last && row.plan_action && sameDay && last.plan_interval_end === row.time &&
+                keys.every(key => last[key] === row[key]) && last.plan_ev_on_minutes === row.plan_ev_on_minutes;
+            if (!matches) {
+                result.push({...row, plan_members:[row]});
+                continue;
+            }
+            last.plan_members.push(row);
+            last.plan_interval_end = row.plan_interval_end;
+            last.soc_end_percent = row.soc_end_percent;
+            last.soc_change += row.soc_change;
+            for (const key of ['pv_forecast','pv_forecast10','load_forecast','load_forecast10','car_charging','cost_change']) {
+                last[key] = Number.isFinite(last[key]) && Number.isFinite(row[key]) ? last[key] + row[key] : null;
+            }
+            last.plan_grid_peak_w = Math.max(last.plan_grid_peak_w || 0, row.plan_grid_peak_w || 0);
+        }
+        for (const row of result) {
+            for (const key of ['pv_forecast','pv_forecast10','load_forecast','load_forecast10','car_charging']) {
+                if (Number.isFinite(row[key])) row[key] = Number(row[key].toFixed(3));
+            }
+        }
+        return result;
+    }
+
+    function planFlowDetail(row) {
+        const power = (value, positive, negative) => Number.isFinite(value) ?
+            `${Math.abs(value).toFixed(2)} kW ${value > 0.03 ? positive : value < -0.03 ? negative : '(idle)'}` : '—';
+        let html = '<details><summary>Flows / interval detail</summary><table><tr><th>Time</th><th>Battery forecast</th><th>Grid forecast</th><th>SoC %</th></tr>';
+        for (const member of row.plan_members || [row]) {
+            const steps = member.plan_steps?.length ? member.plan_steps : [{start:member.time,
+                end:member.plan_interval_end,soc_start:member.soc_percent,soc_end:member.soc_end_percent}];
+            for (const step of steps) {
+                html += `<tr><td>${escapePlanText(formatTimeDisplay(step.start))}–${escapePlanText(formatTimeDisplay(step.end || step.start))}</td>`;
+                html += `<td>${power(step.battery_kw,'discharge','charge')}</td><td>${power(step.grid_kw,'import','export')}</td>`;
+                html += `<td>${Number.isFinite(step.soc_start) ? step.soc_start.toFixed(1) : '—'} → ${Number.isFinite(step.soc_end) ? step.soc_end.toFixed(1) : '—'}</td></tr>`;
+            }
+        }
+        return html + '</table></details>';
+    }
+
     function renderPlanTable(jsonData, overrides, showDebug, editable, showHistoryLinks) {
         try {
             if (!jsonData || !jsonData.rows) {
@@ -7195,12 +7246,30 @@ def get_plan_renderer_js():
             // must not be editable in case it is the actual applied schedule.
             if (combined || applied) editable = false;
             if ((combined || applied) && (jsonData.plan_unavailable || jsonData.execution_blocked)) return '<p>No fresh validated combined candidate is available. Previous simulation hidden.</p>';
+            const clarity = (combined || applied) && jsonData.rows.length > 0 && jsonData.rows.every(row => row.plan_action);
+            if (clarity) {
+                const rows = showDebug ? jsonData.rows : groupPlanRows(jsonData.rows);
+                jsonData = {...jsonData, rows: rows.map(row => ({...row, state_text: row.plan_action,
+                    state_color: row.plan_action === 'Charge' ? '#3AEE85' : row.plan_action === 'Hold' ? '#34DBEB' : '#FFFFFF'}))};
+            }
 
             // Reason templates come from the dataset being rendered, not from window.planData -
             // the History/Yesterday views publish their own copy alongside their own rows.
             const reasonTemplates = jsonData.reason_templates;
 
-            let html = '<table>';
+            let html = '';
+            if (clarity) {
+                const stamp = jsonData.rows[0].time;
+                const offset = stamp.match(/([+-])([0-9]{2}):?([0-9]{2})$/);
+                const zone = offset ? `UTC${offset[1]}${offset[2]}:${offset[3]}` : 'UTC';
+                const future = jsonData.rows.map(row => row.cost_change);
+                const money = value => Number.isFinite(value) ? `${escapePlanText(jsonData.currency_symbols?.[0] || '')}${value.toFixed(2)}` : '—';
+                const estimated = future.every(Number.isFinite) ? future.reduce((a,b) => a+b,0) : null;
+                html += `<p class="plan-cost-summary">Recorded so far: <b>${money(jsonData.recorded_cost)}</b> · Forecast cost (shown horizon): <b>${money(estimated)}</b></p>`;
+                html += `<p style="font-size:0.9em">Future forecast · Predbat local time (${zone}; each timestamp keeps its own offset). Targets are ceilings, not discharge orders. Flows are predictions, not hardware confirmation.</p>`;
+                html += '<style>.plan-table-scroll{max-width:100%;overflow-x:auto}.plan-table-scroll th{position:sticky;top:0;background:var(--bg-color,#fff);z-index:1}.plan-table-scroll td{vertical-align:top}.plan-table-scroll details table{font-size:0.85em;white-space:nowrap}.plan-table-scroll summary{cursor:pointer}.plan-table-scroll .plan-reason{min-width:10em;max-width:16em}</style>';
+            }
+            html += '<div class="plan-table-scroll"><table>';
             const cellStyle = 'style="padding: 4px;"';
 
             // Short explanations for each plan-table column header, condensed from the full
@@ -7248,8 +7317,9 @@ def get_plan_renderer_js():
             html += th('time', 'Time');
             html += showDebug ? th('import', `Import ${currencyMinor} (w/loss)`) : th('import', `Import ${currencyMinor}`);
             if (showExport) html += showDebug ? th('export', `Export ${currencyMinor} (w/loss)`) : th('export', `Export ${currencyMinor}`);
-            html += th('state', 'State', ' colspan="2"');
-            html += th('limit', 'Limit %');
+            html += th('state', clarity ? 'Action' : 'State', ' colspan="2"');
+            html += th('limit', clarity ? 'Target %' : 'Limit %');
+            if (clarity) html += '<th>Reason</th>';
             html += showDebug ? th('pv', 'PV kWh (10%)') : th('pv', 'PV kWh');
             html += showDebug ? th('load', 'Load kWh (10%)') : th('load', 'Load kWh');
             if (showDebug) {
@@ -7265,12 +7335,12 @@ def get_plan_renderer_js():
                 html += th('iboost', 'iBoost kWh');
             }
             html += th('soc', 'SoC %');
-            html += th('cost', 'Cost');
+            html += th('cost', clarity ? 'Forecast cost' : 'Cost');
             if (hasBilling) {
                 html += th('billed', 'Billed');
                 html += th('billing_diff', 'Diff');
             }
-            html += th('total', 'Total');
+            html += th('total', clarity ? 'Projected total' : 'Total');
             if (jsonData.carbon_enable) {
                 html += th('co2_rate', 'CO2 g/kWh');
                 html += th('co2_total', 'CO2 kg');
@@ -7290,7 +7360,9 @@ def get_plan_renderer_js():
                 if (editable) {
                     html += renderTimeCell(row.time, timeDisplay, overrides, row.slot_minute);
                 } else {
-                    html += `<td id=time bgcolor=#FFFFFF>${timeDisplay}</td>`;
+                    const end = clarity ? `–${formatTimeDisplay(row.plan_interval_end)}` : '';
+                    const phase = clarity ? `<small style="display:block">${row.plan_phase === 'current' ? 'Current interval · forecast' : 'Future forecast'}</small>` : '';
+                    html += `<td id=time bgcolor=#FFFFFF>${timeDisplay}${end}${phase}${clarity ? planFlowDetail(row) : ''}</td>`;
                 }
 
                 // Import rate - formatted bold if in charge window, italic with symbol if estimated.
@@ -7303,7 +7375,7 @@ def get_plan_renderer_js():
                 // aren't part of that clickable-override mechanism, so they keep their marker as-is.
                 const importBold = row.state && (row.state === 'Chrg' || row.state === 'HoldChrg' || row.state === 'FrzChrg');
                 let importText = row.import_rate.toFixed(2);
-                if (combined && row.plan_rates_unavailable) importText = '—';
+                if ((combined || applied) && row.plan_rates_unavailable) importText = '—';
                 if (showDebug && row.import_rate_adjusted !== undefined) {
                     importText += ` (${row.import_rate_adjusted.toFixed(2)})`;
                 }
@@ -7336,7 +7408,7 @@ def get_plan_renderer_js():
                 // why 'manual' is excluded in editable mode)
                 if (showExport) {
                     let exportText = row.export_rate.toFixed(2);
-                    if (combined && row.plan_rates_unavailable) exportText = '—';
+                    if ((combined || applied) && row.plan_rates_unavailable) exportText = '—';
                     if (showDebug && row.export_rate_adjusted !== undefined) {
                         exportText += ` (${row.export_rate_adjusted.toFixed(2)})`;
                     }
@@ -7374,6 +7446,7 @@ def get_plan_renderer_js():
                     const rowspanAttr = row.rowspan_limit > 0 ? ` rowspan="${row.rowspan_limit}"` : '';
                     html += `<td${rowspanAttr} bgcolor=#FFFFFF> ${row.show_limit || ''}</td>`;
                 }
+                if (clarity) html += `<td class="plan-reason" bgcolor="#FFFFFF">${escapePlanText(row.plan_reason)}</td>`;
 
                 // PV forecast (with 10% value in brackets if debug mode)
                 let pvText = row.pv_forecast == 0 ? '&#9866;' : row.pv_forecast;
@@ -7431,7 +7504,8 @@ def get_plan_renderer_js():
                     // combined solver can emit fractional battery_start_percent values
                     // (e.g. 29.999377993406732) that must not appear in the rendered table.
                     // Raw planning SOC/math is unchanged upstream — only this cell rounds.
-                    html += `<td id=soc bgcolor=${row.soc_color || '#FFFFFF'}${scenarioTitle(jsonData, row, 'soc_percent', row.soc_percent)}>${Math.round(row.soc_percent)}${socSym}</td>`;
+                    const endpoint = clarity && Number.isFinite(row.soc_end_percent) ? `<small style="display:block">→ ${Math.round(row.soc_end_percent)}% end</small>` : '';
+                    html += `<td id=soc bgcolor=${row.soc_color || '#FFFFFF'}${scenarioTitle(jsonData, row, 'soc_percent', row.soc_percent)}>${Math.round(row.soc_percent)}${socSym}${endpoint}</td>`;
                 }
 
                 // Cost change
@@ -7444,7 +7518,7 @@ def get_plan_renderer_js():
                 } else {
                     costStr = '&rarr;';
                 }
-                html += `<td id=cost bgcolor=${row.cost_color || '#FFFFFF'}${scenarioTitle(jsonData, row, 'cost_change', costChange)}>${combined && !Number.isFinite(row.cost_change) ? '—' : costStr}</td>`;
+                html += `<td id=cost bgcolor=${row.cost_color || '#FFFFFF'}${scenarioTitle(jsonData, row, 'cost_change', costChange)}>${(combined || applied) && !Number.isFinite(row.cost_change) ? '—' : costStr}</td>`;
 
                 // What the supplier billed, and how far it is from Predbat's own cost
                 if (hasBilling) {
@@ -7493,7 +7567,7 @@ def get_plan_renderer_js():
                 }
 
                 // Total cost
-                const totalCost = row.total_cost ? `${jsonData.currency_symbols[0]}${row.total_cost.toFixed(2)}` : '';
+                const totalCost = Number.isFinite(row.total_cost) ? `${jsonData.currency_symbols[0]}${row.total_cost.toFixed(2)}` : '—';
                 html += `<td id=total_cost bgcolor=#FFFFFF${scenarioTitle(jsonData, row, 'total_cost', row.total_cost || 0)}>${totalCost}</td>`;
 
                 // Carbon (conditional)
@@ -7523,7 +7597,8 @@ def get_plan_renderer_js():
                 html += '<tr style="color:black">';
 
                 // Empty cells for Time, Import, Export, State (colspan 2), Limit %
-                html += '<td></td>'.repeat(showExport ? 6 : 5);
+                html += clarity ? '<td bgcolor="#FFFFFF"><b>Forecast totals</b></td>' : '<td></td>';
+                html += '<td></td>'.repeat((showExport ? 5 : 4) + (clarity ? 1 : 0));
 
                 // PV forecast total
                 html += `<td bgcolor=#FFFFFF><b>${totals.pv_forecast || ''}</b></td>`;
@@ -7588,7 +7663,7 @@ def get_plan_renderer_js():
                 html += '</tr>';
             }
 
-            html += '</table>';
+            html += '</table></div>';
             return html;
         } catch (error) {
             console.error('Error rendering plan:', error);
