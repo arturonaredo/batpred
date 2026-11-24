@@ -7,6 +7,8 @@ import re
 from types import SimpleNamespace
 
 HOUSEHOLD_COST_TOLERANCE = 0.002
+JOINT_COST_IMPROVEMENT_FLOOR = 1.0
+JOINT_COST_EXTRA_SWITCH_FLOOR = 1.0
 
 
 class HouseholdFallbackBlocked(ValueError):
@@ -206,6 +208,23 @@ def _componentwise_improvement(candidate, reference):
         return False
 
 
+def _joint_cost_improvement(candidate, reference, candidate_switches, reference_switches):
+    """Require raw per-scenario non-regression and material savings net of extra mode changes."""
+    from car_charging_plan import _number
+
+    scenarios = ("nominal", "pv10")
+    if not isinstance(candidate, dict) or not isinstance(reference, dict) or set(candidate) != set(scenarios) or set(reference) != set(scenarios):
+        return False
+    if type(candidate_switches) is not int or type(reference_switches) is not int or min(candidate_switches, reference_switches) < 0:
+        return False
+    try:
+        values = {name: (_number(candidate[name], "joint_candidate_cost", -math.inf), _number(reference[name], "joint_reference_cost", -math.inf)) for name in scenarios}
+    except (ValueError, TypeError):
+        return False
+    threshold = JOINT_COST_IMPROVEMENT_FLOOR + max(0, candidate_switches - reference_switches) * JOINT_COST_EXTRA_SWITCH_FLOOR
+    return all(candidate_cost <= reference_cost + HOUSEHOLD_COST_TOLERANCE for candidate_cost, reference_cost in values.values()) and any(candidate_cost < reference_cost - threshold for candidate_cost, reference_cost in values.values())
+
+
 def _native_adjusted_cost(base, checks):
     """Return separate nominal/PV10 costs with cycle wear and shared terminal-SOC value."""
     if not _paired_complete(checks, base.forecast_minutes):
@@ -326,6 +345,54 @@ def _replay_native_plan(base, options, snapshot, slots=None):
         raise ValueError("Native plan charge windows are outside the replay horizon")
     result = SimpleNamespace(status="ordinary_native_household_plan", total_cost=None, actions=tuple(actions))
     windows = ([], deepcopy(snapshot["charge_windows"]), deepcopy(snapshot["charge_limits"]))
+    checks = {name: _replay(base, options, result, slots, windows, scenario) for name, scenario in (("nominal", 0), ("pv10", 1))}
+    for check in checks.values():
+        check.pop("_charge_peak_kwh", None)
+    return result, windows, checks
+
+
+def _replay_native_joint_plan(base, options, snapshot, candidate, slots, ev_windows):
+    """Pair the ordinary native battery schedule with this exact candidate EV reservation."""
+    from car_charging_plan import _native_windows, _replay
+
+    if not isinstance(snapshot, dict) or snapshot.get("plan_valid") is not True:
+        raise ValueError("Current-cycle native battery reference is unavailable")
+    actions = getattr(candidate, "actions", None)
+    if not isinstance(actions, (tuple, list)) or not actions or len(actions) != len(slots):
+        raise ValueError("Joint native reference requires a complete candidate action horizon")
+    expected_ev_windows = _native_windows(base, candidate, slots)[0]
+    if expected_ev_windows != ev_windows:
+        raise ValueError("Native reference EV reservation differs from the selected candidate")
+
+    native_actions = []
+    covered = [False] * len(snapshot["charge_windows"])
+    for slot, ev_action in zip(slots, actions):
+        if ev_action.slot_index != slot.index or ev_action.ev_action not in ("on", "off"):
+            raise ValueError("Native reference EV action timeline is invalid")
+        start = base.minutes_now + slot.start_min
+        end = start + slot.duration_min
+        active = []
+        for index, window in enumerate(snapshot["charge_windows"]):
+            overlaps = window["start"] < end and window["end"] > start
+            if overlaps and not (window["start"] <= start and end <= window["end"]):
+                raise ValueError("Native reference window is not aligned to the replay")
+            if overlaps:
+                active.append(index)
+                covered[index] = True
+        if len(active) > 1:
+            raise ValueError("Native reference has overlapping charge windows")
+        native_actions.append(
+            SimpleNamespace(
+                slot_index=slot.index,
+                battery_mode="charge" if active else "demand",
+                ev_action=ev_action.ev_action,
+                discharge_limit_kw=None,
+            )
+        )
+    if not all(covered):
+        raise ValueError("Native reference charge window is outside the replay horizon")
+    result = SimpleNamespace(status="ordinary_native_joint_reference", total_cost=None, actions=tuple(native_actions))
+    windows = (deepcopy(ev_windows), deepcopy(snapshot["charge_windows"]), deepcopy(snapshot["charge_limits"]))
     checks = {name: _replay(base, options, result, slots, windows, scenario) for name, scenario in (("nominal", 0), ("pv10", 1))}
     for check in checks.values():
         check.pop("_charge_peak_kwh", None)

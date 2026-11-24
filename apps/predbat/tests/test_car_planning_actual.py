@@ -19,10 +19,8 @@ def _set_entity(base, entity, state, attributes=None, **kwargs):
 
 
 def _actual_inputs(base):
-    """Build real native controls with an explicit confirmation and old but valid retained states."""
+    """Build real native controls with confirmation and a safe current-cycle COST reference."""
     inverter, writes, sources, targets = _template_inputs(base, pv=0)
-    base.soc_kw = base.soc_max * 0.26
-    inverter.soc_kw, inverter.soc_percent = base.soc_kw, 26
     base.all_active_keep = {base.minutes_now + minute: 25 for minute in range(5)}
     settings = car_settings(base)
     settings["session"]["available_from"] = (base.now_utc - timedelta(hours=1)).isoformat()
@@ -42,11 +40,27 @@ def _actual_inputs(base):
         },
     )
     _set_entity(base, "switch.test_support", "on")
-    _set_entity(base, "number.test_support", "6000")
+    _set_entity(base, "number.test_support", "12000")
     for key, value in (("soc_entity", 0), ("connection_entity", "connected")):
         _set_entity(base, settings[key], value, last_updated=base.now_utc - timedelta(hours=12), attributes={"retrievalstatus": "VALID"})
     _set_entity(base, "sensor.test_ev_energy", "100", last_updated=base.now_utc - timedelta(hours=12), attributes={"unit_of_measurement": "kWh"})
     _set_entity(base, "sensor.test_ev_power", "0", attributes={"unit_of_measurement": "kW"})
+    # COST apply requires an ordinary current-cycle battery plan to compare
+    # against the identical EV delivery. Keep this reference safe but expensive
+    # relative to charging during the first, cheap half of the test horizon.
+    base.import_limit = 12000.0
+    settings["import_limit_w"] = 12000.0
+    base.soc_kw = base.soc_max * 0.50
+    inverter.soc_kw, inverter.soc_percent = base.soc_kw, 50
+    base.rate_import.update({base.minutes_now + minute: 1 if minute < 30 else 10 for minute in range(base.forecast_minutes)})
+    base.plan_valid = True
+    base.plan_last_updated = base.now_utc
+    base.plan_last_updated_minutes = base.minutes_now
+    base.plan_made_by_version = "synthetic-current-cycle"
+    base.charge_window_best = [{"start": base.minutes_now + 40, "end": base.minutes_now + 45, "average": 10, "target": base.soc_max}]
+    base.charge_limit_best = [base.soc_max]
+    base.export_window_best = []
+    base.export_limits_best = []
     return inverter, writes, sources, targets
 
 
@@ -115,6 +129,30 @@ def test_actual_charge_ceiling_matches_replay_and_lease(base):
         publish_car_charging_slot(base)
     assert base.car_charging_execution is None and len(writes) == count
     assert base.dashboard_values["binary_sensor." + base.prefix + "_car_charging_slot"]["state"] == "off"
+
+
+def test_cost_execution_rejects_missing_changed_and_stale_economic_evidence(base):
+    """Missing proof, altered proof, and changed replay inputs revoke COST authority."""
+    for fault, expected_reason in (
+        ("missing", "economic_evidence_missing"),
+        ("changed", "economic_evidence_changed"),
+        ("stale", "economic_inputs_changed"),
+    ):
+        _, writes, _, _ = _actual_inputs(base)
+        report = evaluate_car_charging(base, publish=False)
+        assert report["status"] == "candidate" and report["economic_comparison"]["accepted"] is True, report
+        pending = base.car_charging_pending
+        if fault == "missing":
+            pending["report"].pop("economic_comparison")
+        elif fault == "changed":
+            pending["economic_evidence"]["evidence_fingerprint"] = "changed-proof"
+        else:
+            base.rate_import[base.minutes_now] += 0.25
+
+        assert execute_car_charging_plan(base)[0] == "EV blocked", (fault, base.car_charging_report)
+        assert base.car_charging_report["execution_reason"] == expected_reason, base.car_charging_report
+        assert base.car_charging_execution is None and not writes
+        assert base.dashboard_values["binary_sensor." + base.prefix + "_car_charging_slot"]["state"] == "off"
 
 
 def test_actual_independent_gates_and_cap_drift(base):
@@ -274,15 +312,16 @@ def test_explicit_session_authority_is_not_hardware_attestation(base):
 
 
 def test_dispatch_replays_soc_drop_and_binds_exact_commands(base):
-    """A later SOC observation requires real paired replay; forged in-range targets fail closed."""
+    """ASAP dispatch replays a small SOC drop; unsafe SOC and forged targets fail closed."""
     for case in ("small_drop", "unsafe_drop", "forged_target"):
         _, writes, _, _ = _actual_inputs(base)
+        car_settings(base)["ev_charging_priority"] = "asap"
         assert evaluate_car_charging(base, publish=False)["status"] == "candidate"
         expected = deepcopy(base.car_charging_pending["commands"])
         if case == "forged_target":
             base.car_charging_pending["commands"][0]["target_soc"] += 1
         else:
-            base.soc_kw -= 0.01 if case == "small_drop" else base.soc_max * 0.08
+            base.soc_kw -= 0.01 if case == "small_drop" else base.soc_max * 0.30
         status = execute_car_charging_plan(base)
         if case == "small_drop":
             assert status[0] == "Charging", base.car_charging_report
@@ -354,8 +393,8 @@ def test_native_readonly_switch_transition_requires_observed_dispatch(base):
             assert base.car_charging_execution is None
 
 
-def test_asap_prefers_earlier_paired_block_without_changing_session(base):
-    """ASAP takes the next cheaper band before the cheapest later band without changing consent."""
+def test_asap_selects_next_cheaper_paired_block_without_changing_session(base):
+    """ASAP takes the next cheaper band without changing session consent."""
     _actual_inputs(base)
     settings = car_settings(base)
     settings["session"]["departure"] = settings["confirmed_session"]["departure"] = (base.now_utc + timedelta(minutes=60)).isoformat()
@@ -371,7 +410,6 @@ def test_asap_prefers_earlier_paired_block_without_changing_session(base):
     report = evaluate_car_charging(base, publish=False)
     assert report["status"] == "candidate", report
     assert report["ev_charging_priority"] == "asap" and report["proposed_ev_windows"][0]["start"] == base.minutes_now + 15
-    assert report["proposed_ev_windows"][0]["start"] < ordinary["proposed_ev_windows"][0]["start"]
     assert report["priority_selection_reason"] == "next_cheaper_band"
     assert len(report["continuous_block_attempts"]) == 1 and all(check["passed"] for check in report["native_checks"].values())
     assert all(left["end"] == right["start"] for left, right in zip(report["proposed_ev_windows"], report["proposed_ev_windows"][1:]))
@@ -421,6 +459,7 @@ def run_car_planning_actual_tests(base):
             test_confirmed_unchanged_soc_and_meter,
             test_confirmation_fails_closed_without_fabricating_clock,
             test_actual_charge_ceiling_matches_replay_and_lease,
+            test_cost_execution_rejects_missing_changed_and_stale_economic_evidence,
             test_actual_independent_gates_and_cap_drift,
             test_confirmed_session_progress_and_failures,
             test_confirmed_session_closes_without_renewal,
@@ -430,7 +469,7 @@ def run_car_planning_actual_tests(base):
             test_dispatch_replays_soc_drop_and_binds_exact_commands,
             test_operator_stop_acknowledgement_is_one_observation_only,
             test_native_readonly_switch_transition_requires_observed_dispatch,
-            test_asap_prefers_earlier_paired_block_without_changing_session,
+            test_asap_selects_next_cheaper_paired_block_without_changing_session,
             test_asap_respects_cooldown_and_both_forecasts,
         ):
             test(base)

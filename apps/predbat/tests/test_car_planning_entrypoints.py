@@ -45,6 +45,19 @@ def _apply_inputs(base):
     _set_entity(base, "switch.test_permission", "on")
     _set_entity(base, "sensor.test_connection_observed_at", base.now_utc.isoformat())
     _set_entity(base, "sensor.test_soc_observed_at", base.now_utc.isoformat())
+    # COST apply requires a current-cycle native plan for the paired reference.
+    # Equal tariffs keep that safe native plan as the accepted alternative.
+    base.import_limit = 12000.0
+    car_settings(base)["import_limit_w"] = 12000.0
+    base.rate_import.update({base.minutes_now + minute: 10 for minute in range(base.forecast_minutes)})
+    base.plan_valid = True
+    base.plan_last_updated = base.now_utc
+    base.plan_last_updated_minutes = base.minutes_now
+    base.plan_made_by_version = "synthetic-current-cycle"
+    base.charge_window_best = [{"start": base.minutes_now + 40, "end": base.minutes_now + 45, "average": 10, "target": base.soc_max}]
+    base.charge_limit_best = [base.soc_max]
+    base.export_window_best = []
+    base.export_limits_best = []
 
 
 def test_apply_staging_is_not_execution(base):
@@ -146,13 +159,15 @@ def test_apply_stable_soc_requires_actual_observation(base):
 def test_ev_off_is_observed_before_battery_support_changes(base):
     """An EV OFF plan cannot remove domestic battery support while the relay remains ON."""
     from car_charging_execute import execute_car_charging_plan
-    from tests.test_car_planning_apply import _evaluate, _make_adapter, _make_inverter
+    from tests.test_car_planning_apply import _make_adapter, _make_inverter, _stage_apply
 
-    _evaluate(base)
+    _stage_apply(base)
+    _set_entity(base, "binary_sensor.test_relay", "on", last_changed=base.now_utc - timedelta(minutes=10))
+    base.car_charging_limit[0] = 0
+    report = evaluate_car_charging(base, publish=False)
+    assert report["status"] == "candidate", report
     adapter, _ = _make_adapter()
     _, spy = _make_inverter(base, adapter)
-    _set_entity(base, "binary_sensor.test_relay", "on", last_changed=base.now_utc - timedelta(minutes=10))
-    base.car_charging_pending["commands"][0].update(ev_on=False, freeze=True, target_soc=0)
     result = execute_car_charging_plan(base)
     assert result == ("EV blocked", "waiting_for_ev_relay_off"), result
     assert not spy["args"]
@@ -203,17 +218,17 @@ def _expired_apply_inputs(base, relay="off"):
     session = car_settings(base)["session"]
     session["available_from"] = (base.now_utc - timedelta(hours=2)).isoformat()
     session["departure"] = (base.now_utc - timedelta(minutes=5)).isoformat()
-    base.soc_kw = base.reserve + 0.05
+    base.soc_kw = base.soc_max * 0.5
+    base.all_active_keep = {}
     car_settings(base)["terminal_min_percent"] = 15
-    base.all_active_keep[base.minutes_now + 5] = base.soc_kw / base.soc_max * 100 + 0.25
     for name in ("pv_forecast_minute_step", "pv_forecast_minute10_step"):
         setattr(base, name, {minute: 0.0 for minute in getattr(base, name)})
     _set_entity(base, "binary_sensor.test_relay", relay, last_changed=base.now_utc - timedelta(minutes=10))
     _set_entity(base, "sensor.test_ev_soc", "1")
 
 
-def test_expired_apply_replenishes_home_without_renewing_ev(base):
-    """The real solver, both replays and Execute continue domestic charging with EV OFF."""
+def test_expired_apply_executes_safe_domestic_plan_without_renewing_ev(base):
+    """The real solver, both replays and Execute preserve a safe EV-OFF domestic plan."""
     from tests.test_car_planning_apply import _make_adapter, _make_inverter
 
     _expired_apply_inputs(base)
@@ -227,10 +242,10 @@ def test_expired_apply_replenishes_home_without_renewing_ev(base):
     assert all(check["passed"] and check["checked_minutes"] == base.forecast_minutes for check in report["native_checks"].values())
     assert not report["proposed_ev_windows"]
     assert all(not step["ev_on"] for step in base.car_charging_pending["commands"])
-    assert base.car_charging_pending["commands"][0]["target_soc"] == 100
+    assert base.car_charging_pending["commands"][0]["target_soc"] == 0
     adapter, _ = _make_adapter()
     _, spy = _make_inverter(base, adapter)
-    assert base.execute_plan()[0] == "Charging", base.car_charging_report
+    assert base.execute_plan()[0] == "Demand", base.car_charging_report
     assert spy["args"]
     assert datetime.fromisoformat(base.car_charging_execution["expires_at"]) > base.now_utc
     base.publish_car_plan()
@@ -260,7 +275,7 @@ def test_expired_apply_rejects_any_future_ev_command(base):
     base.car_charging_pending["commands"][-1]["ev_on"] = True
     adapter, _ = _make_adapter()
     _, spy = _make_inverter(base, adapter)
-    assert base.execute_plan() == ("EV blocked", "closed_session_ev_command")
+    assert base.execute_plan() == ("EV blocked", "candidate_commands_changed")
     assert not spy["args"]
 
 
@@ -361,7 +376,7 @@ def run_car_planning_entrypoint_tests(base):
         test_ev_off_is_observed_before_battery_support_changes,
         test_apply_requires_separate_ev_executor_lease_commissioning,
         test_apply_blocks_competing_plan_consumers,
-        test_expired_apply_replenishes_home_without_renewing_ev,
+        test_expired_apply_executes_safe_domestic_plan_without_renewing_ev,
         test_expired_apply_waits_for_observed_ev_off,
         test_expired_apply_rejects_any_future_ev_command,
         test_expired_apply_retains_all_evidence_and_ownership_gates,

@@ -195,6 +195,126 @@ def command_fingerprint(commands):
     return hashlib.sha256(json.dumps(commands, sort_keys=True, allow_nan=False).encode()).hexdigest()
 
 
+def economic_input_fingerprint(base, options, native_snapshot):
+    """Bind paired cost proof to this plan cycle, native reference and all material replay inputs."""
+    start = base.minutes_now
+    end = start + base.forecast_minutes
+    steps = range(0, base.forecast_minutes, PREDICT_STEP)
+    option_names = (
+        "ev_soc",
+        "ev_charging_priority",
+        "arrival",
+        "deadline",
+        "pause",
+        "restart",
+        "off_minutes",
+        "initially_on",
+        "initial_off_minutes",
+        "import_limit_w",
+        "grid_charge_support_w",
+        "terminal_min",
+        "battery_min_window_minutes",
+        "planning_reference_at",
+    )
+    payload = {
+        "generation": {
+            "plan_last_updated": getattr(base, "plan_last_updated", None),
+            "plan_last_updated_minutes": getattr(base, "plan_last_updated_minutes", None),
+            "plan_made_by_version": getattr(base, "plan_made_by_version", None),
+            "minutes_now": start,
+            "forecast_minutes": base.forecast_minutes,
+            "planning_reference_at": options.get("planning_reference_at"),
+        },
+        "native_snapshot": native_snapshot,
+        "options": {name: options.get(name) for name in option_names},
+        "physical": {
+            name: getattr(base, name, None)
+            for name in (
+                "soc_max",
+                "soc_kw",
+                "reserve",
+                "import_limit",
+                "export_limit",
+                "inverter_limit",
+                "battery_rate_max_charge",
+                "battery_rate_max_charge_dc",
+                "battery_rate_max_discharge",
+                "battery_rate_max_scaling",
+                "battery_rate_max_scaling_discharge",
+                "battery_loss",
+                "battery_loss_discharge",
+                "inverter_loss",
+                "car_charging_rate",
+                "car_charging_limit",
+                "car_charging_battery_size",
+                "car_charging_loss",
+                "metric_battery_cycle",
+                "metric_battery_value_scaling",
+            )
+        },
+        "rates": {
+            "import": [base.rate_import.get(minute) for minute in range(start, end)],
+            "export": [base.rate_export.get(minute) for minute in range(start, end)],
+        },
+        "step_forecasts": {
+            "pv": [base.pv_forecast_minute_step[offset] for offset in steps],
+            "pv10": [base.pv_forecast_minute10_step[offset] for offset in steps],
+            "load": [base.load_minutes_step[offset] for offset in steps],
+            "load10": [base.load_minutes_step10[offset] for offset in steps],
+            "manual_floor": [max(base.all_active_keep.get(minute, 0) for minute in range(start + offset, start + offset + PREDICT_STEP)) for offset in steps],
+        },
+        "terminal_value": base.battery_value_rate(end),
+        "execution_configuration": execution_fingerprint(base),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False, default=str).encode()).hexdigest()
+
+
+def economic_generation_id(base, options, native_snapshot, reference_fingerprint):
+    """Identify the completed ordinary-plan calculation cycle used by the economic comparison."""
+    input_fingerprint = economic_input_fingerprint(base, options, native_snapshot)
+    payload = {
+        "plan_last_updated": getattr(base, "plan_last_updated", None),
+        "plan_last_updated_minutes": getattr(base, "plan_last_updated_minutes", None),
+        "plan_made_by_version": getattr(base, "plan_made_by_version", None),
+        "planning_reference_at": options.get("planning_reference_at"),
+        "minutes_now": base.minutes_now,
+        "forecast_minutes": base.forecast_minutes,
+        "native_reference_fingerprint": reference_fingerprint,
+        "input_fingerprint": input_fingerprint,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False, default=str).encode()).hexdigest()
+
+
+def economic_evidence_fingerprint(generation_id, command_hash, plan_fingerprint, reference_fingerprint, candidate_costs, reference_costs, input_fingerprint):
+    """Cryptographically bind a fresh accepted plan, command, reference and raw paired costs."""
+    payload = {
+        "generation_id": generation_id,
+        "command_fingerprint": command_hash,
+        "plan_fingerprint": plan_fingerprint,
+        "native_reference_fingerprint": reference_fingerprint,
+        "candidate_costs": candidate_costs,
+        "reference_costs": reference_costs,
+        "input_fingerprint": input_fingerprint,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False, default=str).encode()).hexdigest()
+
+
+def economic_plan_fingerprint(commands, windows, checks, actions):
+    """Bind replay windows and per-slot EV/battery decisions to the staged commands."""
+    action_plan = [
+        {
+            "slot_index": getattr(action, "slot_index", None),
+            "battery_mode": getattr(action, "battery_mode", None),
+            "ev_action": getattr(action, "ev_action", None),
+            "discharge_limit_kw": getattr(action, "discharge_limit_kw", None),
+        }
+        for action in actions
+    ]
+    replay_checks = {name: {key: check.get(key) for key in ("passed", "checked_minutes", "reasons", "horizon_energy_cost", "battery_cycle_kwh", "final_battery_kwh", "final_ev_kwh")} for name, check in checks.items()}
+    payload = {"commands": commands, "windows": windows, "actions": action_plan, "native_checks": replay_checks}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False, default=str).encode()).hexdigest()
+
+
 def _control_fingerprint(inverter):
     """Detect observed control drift without claiming read-back proves hardware state."""
     if getattr(inverter, "inverter_type", None) == "DeyeSolarman":
@@ -389,7 +509,7 @@ def _intent(command, inverter, charge_ceiling=False):
     return command["target_soc"], command["freeze"], power
 
 
-def _candidate(base, pending, inverter, now, minute):
+def _candidate(base, pending, inverter, now, minute, current_options=None):
     """Validate complete replay and select only the current first planned command."""
     from car_charging_plan import _ev_charging_priority
 
@@ -419,9 +539,12 @@ def _candidate(base, pending, inverter, now, minute):
     _require(_finite(pending.get("initial_battery_soc_kwh"), base.reserve, base.soc_max), "initial_domestic_soc_missing")
     soc_fell = base.soc_kw < pending["initial_battery_soc_kwh"] - 0.002
     shared_support = bool(report.get("grid_charge_support_w"))
+    economic = report.get("economic_comparison")
+    cost_apply = pending["options"].get("mode") == "apply" and pending["options"].get("ev_charging_priority") == "cost"
+    _require(not cost_apply or isinstance(economic, dict), "economic_evidence_missing")
     _require(not soc_fell or shared_support, "domestic_soc_fell_since_planning")
     commands = pending["commands"]
-    if shared_support:
+    if shared_support or economic is not None:
         _require(pending.get("command_fingerprint") == command_fingerprint(commands), "candidate_commands_changed")
     _require(isinstance(commands, list) and len(commands) == base.forecast_minutes // PREDICT_STEP, "incomplete_command_horizon")
     for index, command in enumerate(commands):
@@ -429,6 +552,43 @@ def _candidate(base, pending, inverter, now, minute):
         _require(not closed or not command["ev_on"], "closed_session_ev_command")
         _require(type(command.get("start")) is int and type(command.get("end")) is int, "invalid_command_time")
         _require(command.get("start") == base.minutes_now + index * PREDICT_STEP and command.get("end") == command["start"] + PREDICT_STEP, "command_timeline_mismatch")
+    if economic is not None:
+        _require(isinstance(economic, dict) and economic.get("accepted") is True, "economic_evidence_missing")
+        _require(pending["options"].get("ev_charging_priority") == "cost" and _ev_charging_priority(base) == "cost", "economic_priority_changed")
+        _require(current_options is not None and current_options.get("ev_charging_priority") == "cost", "economic_inputs_unavailable")
+        _require(type(current_options.get("ev_soc")) in (int, float) and abs(current_options["ev_soc"] - pending["options"].get("ev_soc", 0)) <= 0.002, "economic_ev_state_changed")
+        from car_charging_household import _snapshot_native_plan
+
+        current_native_snapshot = _snapshot_native_plan(base)
+        _require(current_native_snapshot is not None and current_native_snapshot == pending.get("native_reference_snapshot"), "economic_native_reference_changed")
+        evidence = pending.get("economic_evidence")
+        _require(isinstance(evidence, dict) and evidence == economic.get("evidence"), "economic_evidence_changed")
+        result, replay_slots, replay_windows = pending.get("replay_inputs", (None, None, None))
+        _require(result is not None and replay_slots is not None and replay_windows is not None, "economic_replay_inputs_missing")
+        input_fingerprint = economic_input_fingerprint(base, current_options, current_native_snapshot)
+        _require(input_fingerprint == evidence.get("input_fingerprint"), "economic_inputs_changed")
+        generation_id = economic_generation_id(base, current_options, current_native_snapshot, economic.get("reference_fingerprint"))
+        _require(generation_id == evidence.get("generation_id"), "economic_generation_changed")
+        plan_fingerprint = economic_plan_fingerprint(commands, replay_windows, checks, result.actions)
+        _require(plan_fingerprint == evidence.get("plan_fingerprint"), "economic_plan_changed")
+        command_hash = command_fingerprint(commands)
+        _require(command_hash == evidence.get("command_fingerprint"), "economic_command_changed")
+        _require(economic.get("reference_fingerprint") == evidence.get("reference_fingerprint"), "economic_reference_changed")
+        _require(economic.get("candidate_costs") == evidence.get("candidate_costs") and economic.get("reference_costs") == evidence.get("reference_costs"), "economic_costs_changed")
+        proof = economic_evidence_fingerprint(
+            generation_id,
+            command_hash,
+            plan_fingerprint,
+            evidence.get("reference_fingerprint"),
+            evidence.get("candidate_costs"),
+            evidence.get("reference_costs"),
+            input_fingerprint,
+        )
+        _require(proof == evidence.get("evidence_fingerprint"), "economic_proof_invalid")
+        if economic.get("status") == "componentwise_improvement":
+            _require(economic.get("battery_plan_improvement") is True and economic.get("positive_improvement") is True, "economic_improvement_invalid")
+        else:
+            _require(economic.get("status") == "native_reference_alternative" and economic.get("battery_plan_improvement") is False, "economic_alternative_invalid")
     command = commands[0]
     # Recheck live continuity, not the staging copy. Drift releases the old
     # commitment: the candidate must then satisfy a fresh full minimum window.
@@ -674,7 +834,7 @@ def execute_car_charging_plan(base):
         options, inverter, relay, now, minute = _evidence(base, allow_read_only_transition=True)
         read_only_transition = bool(getattr(base, "inverter_needs_reset", False))
         pending = getattr(base, "car_charging_pending", None)
-        command, run = _candidate(base, pending, inverter, now, minute)
+        command, run = _candidate(base, pending, inverter, now, minute, current_options=options)
         if options.get("grid_charge_support_w"):
             _require(abs(options["ev_soc"] - pending["options"]["ev_soc"]) <= 0.002, "dispatch_ev_soc_changed")
         _ev_permitted(base, options, relay, now, command["ev_on"])
