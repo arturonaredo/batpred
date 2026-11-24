@@ -868,6 +868,14 @@ def test_plan_execute_split(my_predbat):
         failed += _scenario_fused_fresh_plan(my_predbat)
         failed += _scenario_fused_recompute(my_predbat)
         failed += _scenario_fused_aged_plan(my_predbat)
+        my_predbat.plan_valid = True
+        my_predbat.plan_last_updated = my_predbat.now_utc - timedelta(minutes=9)
+        with ExitStack() as stack:
+            stack.enter_context(patch.dict(my_predbat.args, {"car_charging_plan_mode": "apply"}))
+            mocks = _patch_pipeline(my_predbat, stack)
+            my_predbat.update_pred(scheduled=True)
+        failed = _check(failed, [call.kwargs for call in mocks["calculate_plan"].call_args_list] == [{"recompute": True}], "joint apply: refresh the ageing reference before the only calculation")
+        failed = _check(failed, mocks["execute_plan"].call_count == 1, "joint apply: execute once with the refreshed reference")
         failed += _scenario_fused_aged_plan_unchanged(my_predbat)
         failed += _scenario_head_window_dropped(my_predbat)
         failed += _scenario_fused_inverter_failure(my_predbat)

@@ -1531,6 +1531,12 @@ class PredBat(hass.Hass, Octopus, Energidataservice, Stromligning, Fetch, Plan, 
             plan_age = self.now_utc - self.plan_last_updated
             plan_age_minutes = plan_age.total_seconds() / 60.0
             self.log("Plan was last updated on {} and is now {} minutes old".format(self.plan_last_updated, dp1(plan_age_minutes)))
+            # A joint apply calculation stages the current five-minute command,
+            # even when reusing the domestic plan. Refresh the reference before
+            # doing that expensive work, not in a second pass after execution.
+            if self.args.get("car_charging_plan_mode") == "apply" and (plan_age_minutes + RUN_EVERY) > self.calculate_plan_every:
+                self.log("Will recompute the plan as it is invalid for the next joint apply cycle")
+                recompute = True
 
         # Calculate the new plan (or re-use existing)
         recompute = self.calculate_plan(recompute=recompute)
