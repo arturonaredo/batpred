@@ -485,6 +485,7 @@ libyaml
 LIFEPO
 linebreak
 linecap
+linejoin
 linestyle
 Liskov
 lmt
