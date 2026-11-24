@@ -85,6 +85,7 @@ boostable
 Bottlecap
 brickatius
 britkat1980
+bunx
 bwignore
 byok
 cada
@@ -133,6 +134,7 @@ combinados
 compareform
 componentwise
 configform
+configprops
 confirma
 connack
 Consolas
