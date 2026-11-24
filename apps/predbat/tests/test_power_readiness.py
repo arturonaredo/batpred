@@ -27,6 +27,22 @@ def _inputs(base, minutes=720):
     return options, slots, result
 
 
+def test_cheap_band_excludes_the_ten_cent_boundary(base):
+    """A strict ten-cent ceiling excludes equality, dearer tails and dear prior history."""
+    from power_readiness import cheap_readiness_periods, readiness_settings
+
+    local = SimpleNamespace(args={"battery_power_readiness": {"enabled": True, "cheap_price_ceiling": 10.0}}, minutes_now=360, rate_import={})
+    assert readiness_settings(SimpleNamespace(args={"battery_power_readiness": {"enabled": True}}))["cheap_price_ceiling"] == 10.0
+    slots = [SimpleNamespace(start_min=minute, duration_min=5) for minute in range(0, 480, 5)]
+    for price in (-1.0, 0.0, 8.1, 9.999999, 10.0, 11.2):
+        local.rate_import = {minute: price if 360 <= minute < 720 else 11.2 for minute in range(0, 840)}
+        periods = cheap_readiness_periods(local, slots)
+        assert periods == ([{"first": 0, "stop": 72, "start": 360, "end": 720}] if price < 10 else []), (price, periods)
+    short_slots = slots[:24]
+    local.rate_import = {minute: 8.1 if minute >= 360 else 10.0 for minute in range(0, 840)}
+    assert cheap_readiness_periods(local, short_slots) == [], "Exactly ten cents cannot extend a short cheap band through prior history"
+
+
 def test_readiness_does_not_enable_economic_continuation_for_late_peak(base):
     """A failed cheap buffer must not silently authorise a full household economic continuation."""
     from car_charging_plan import _replay_candidate
