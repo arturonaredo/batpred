@@ -731,7 +731,16 @@ def test_invalid_plan_forecast_hours_never_fabricates_a_visible_day():
 
 def run_car_planning_preview_tests(unused_base):
     """Run all bounded preview regressions with isolated synthetic fixtures."""
+    from tests.test_car_planning_reference_display import ReferenceDisplayTests
+
+    reference = ReferenceDisplayTests()
     tests = [
+        reference.test_reference_statuses_keep_complete_native_trajectories,
+        reference.test_selected_reference_survives_publication_and_receipt_projection,
+        reference.test_reference_status_does_not_waive_incomplete_prediction,
+        reference.test_unknown_reference_status_stays_closed,
+        reference.test_missing_preview_is_not_a_hardware_confirmation_failure,
+        reference.test_expired_observation_receipt_still_reports_expiry,
         test_partial_bins_and_absolute_clock_alignment,
         test_partial_first_bin_when_now_unaligned,
         test_soc_start_differs_from_end_on_slope,

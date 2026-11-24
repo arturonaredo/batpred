@@ -48,10 +48,9 @@ _STALE_AGE_MINUTES = 15
 # default of 300 seconds. Both ends of the interval are strict so a
 # future-dated receipt or a now == observed timestamp is rejected.
 _RECEIPT_COHERENCE_WINDOW_SECONDS = 300
-# Bounded labels — the only ``execution_reason`` strings the parent executor
-# writes that we are willing to echo verbatim. Anything outside this set is
-# surfaced as a generic "execution blocked" tag rather than echoed.
-_ALLOWED_APPLIED_REASONS = frozenset({"inverter_observed_not_hardware_confirmed"})
+# Known replay provenance, not evidence of safety or execution authority.
+_REPLAY_DISPLAY_STATUSES = frozenset({"feasible", "ordinary_native_joint_reference", "generated_low_rates_native_reference", "ordinary_native_household_plan"})
+# Bounded executor-failure labels; do not echo arbitrary internal strings.
 _ALLOWED_BLOCKED_REASONS = frozenset(
     {
         "apply_commissioning_required",
@@ -182,7 +181,11 @@ def build_replay_preview(base, pred, result, slots, scenario):
     """
     if not isinstance(slots, (list, tuple)) or not slots:
         return []
-    if result is None or getattr(result, "status", None) != "feasible":
+    # Reference alternatives use provenance labels rather than the solver's
+    # "feasible" label. They still need the exact same complete native trace;
+    # paired safety checks and execution authority remain separate view gates.
+    status = getattr(result, "status", None)
+    if not isinstance(status, str) or status not in _REPLAY_DISPLAY_STATUSES:
         return []
     actions = tuple(getattr(result, "actions", ()) or ())
     if len(actions) != len(slots):
@@ -756,16 +759,10 @@ def _applied_block_reason(report, now=None):
     """
     if not isinstance(report, dict):
         return "no execution receipt"
-    now = now if isinstance(now, datetime) else None
+    now = now if isinstance(now, datetime) and now.tzinfo is not None else None
     reason = report.get("execution_reason")
     if isinstance(reason, str) and reason in _ALLOWED_BLOCKED_REASONS:
         return reason
-    if isinstance(reason, str) and reason in _ALLOWED_APPLIED_REASONS:
-        # "inverter_observed_not_hardware_confirmed" is the parent's
-        # observation-only label. Surface it generically so the user sees
-        # the practical consequence (still waiting on hardware
-        # confirmation) without echoing the parent's internal wording.
-        return "awaiting hardware confirmation"
     blockers = report.get("execution_blockers")
     if "execution_blockers" in report and not (isinstance(blockers, list) and not blockers):
         return "execution blocked: declared blockers"
@@ -787,6 +784,19 @@ def _applied_block_reason(report, now=None):
             return "execution_observed_at is in the future"
         if now >= valid_until:
             return "execution receipt expired"
+    if report.get("uses_stale_soc_assumption") is True:
+        return "unconfirmed EV SOC assumption"
+    if report.get("counterfactual_controls") is True:
+        return "counterfactual controls are not applied authority"
+    generated = _parse_iso(report.get("generated_at"))
+    if generated is None:
+        return "missing generated_at"
+    if generated > observed or (now is not None and generated > now):
+        return "generated_at is in the future"
+    if now is not None and now - generated >= timedelta(minutes=10):
+        return "generated_at is stale"
+    if _paired_preview(report, now) is None:
+        return "paired replay preview missing or invalid"
     return "execution receipt not coherent"
 
 
