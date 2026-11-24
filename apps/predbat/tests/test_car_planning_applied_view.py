@@ -220,14 +220,15 @@ def test_shadow_candidate_keeps_car_planning_simulation_true():
 # ----------------------------------------------------------------------
 
 
-def test_render_fresh_applied_uses_active_plan_label():
-    """Name the active plan without claiming the whole forecast was executed."""
+def test_render_fresh_applied_keeps_healthy_explanation_out_of_the_preview():
+    """Keep healthy applied-plan explanation in the initially closed graph drawer."""
     html = render_car_charging_preview(
         _applied_report(now=_wall_now()),
         _native_diag("ok", peak_w=5400, limit_w=6000),
         now=_wall_now(),
     )
-    assert "Active plan" in html, html
+    assert "Active plan" not in html, html
+    assert "Command observed" not in html, html
     assert "Applied plan (executed)" not in html, html
 
 
@@ -254,6 +255,20 @@ def test_render_fresh_applied_suppresses_simulation_only_banner():
     )
     for forbidden in ("Simulation only — not executed", "EV SOC unconfirmed", "native grid limit exceeded", "Details: Show Debug"):
         assert forbidden not in html, (forbidden, html)
+
+
+def test_render_fresh_applied_keeps_authorised_partial_target_visible():
+    """Suppress only the healthy headline; keep an authorized partial target visible."""
+    now = _wall_now()
+    report = _applied_report(now=now)
+    report.update(
+        partial_target_authorised=True,
+        planned_ev_percent_by_departure=54.5,
+        requested_ev_target_percent=80.0,
+    )
+    html = render_car_charging_preview(report, _native_diag("ok"), now=now)
+    assert "Active plan" not in html, html
+    assert "EV 54.5% / 80.0% requested" in html, html
 
 
 def test_render_fresh_applied_suppresses_visible_native_grid_warning():
@@ -611,11 +626,14 @@ def test_html_api_plan_data_emits_car_planning_execution_for_fresh_applied():
     assert "execution_blocked" not in data["plan"], data
 
 
-def test_html_plan_emits_active_plan_banner_for_fresh_applied():
-    """The actual HTML route must render a fresh active-plan report."""
+def test_html_plan_keeps_healthy_applied_explanation_out_of_the_default_page():
+    """The default /plan page keeps the preview root but omits healthy boilerplate."""
     page = _build_page(_applied_report(now=_wall_now()))
     html = asyncio.run(page.html_plan(SimpleNamespace(rel_url=SimpleNamespace(query={})))).text
-    assert "Active plan" in html, html
+    visible = re.sub(r"<script[^>]*>.*?</script>|<style[^>]*>.*?</style>", "", html, flags=re.DOTALL)
+    assert 'id="carChargingPreview"' in visible, visible
+    assert "Active plan" not in visible, visible
+    assert "Command observed" not in visible, visible
     assert "Applied plan (executed)" not in html, html
 
 
@@ -693,7 +711,7 @@ def run_car_planning_applied_view_tests(base):
         test_valid_applied_view_sets_car_planning_simulation_false,
         test_valid_applied_view_preserves_execution_dates,
         test_shadow_candidate_keeps_car_planning_simulation_true,
-        test_render_fresh_applied_uses_active_plan_label,
+        test_render_fresh_applied_keeps_healthy_explanation_out_of_the_preview,
         test_render_fresh_applied_mainline_has_no_iso_dates,
         test_render_fresh_applied_suppresses_simulation_only_banner,
         test_render_fresh_applied_suppresses_visible_native_grid_warning,
@@ -726,7 +744,7 @@ def run_car_planning_applied_view_tests(base):
         test_invalid_applied_clears_rows_and_no_native_fallback,
         test_original_table_columns_styles_totals_preserved_for_valid_applied,
         test_html_api_plan_data_emits_car_planning_execution_for_fresh_applied,
-        test_html_plan_emits_active_plan_banner_for_fresh_applied,
+        test_html_plan_keeps_healthy_applied_explanation_out_of_the_default_page,
         test_html_plan_emits_execution_blocked_banner_for_invalid_applied,
         test_js_renderer_forces_editable_false_for_car_planning_execution,
         test_js_renderer_does_not_advertise_simulation_only_for_applied,

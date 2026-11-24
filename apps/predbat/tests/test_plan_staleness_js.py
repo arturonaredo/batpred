@@ -46,7 +46,7 @@ def test_plan_staleness_js(my_predbat):
         print("  ERROR: expected default limits of 15 minutes for the plan and 60 for the history views, got {!r}".format(defaults))
         failed = True
 
-    if "checkStaleness(currentViewData());" not in renderer_js:
+    if "const cachedView = currentViewData();" not in renderer_js or "checkStaleness(cachedView);" not in renderer_js:
         print("  ERROR: the unchanged-data poll should check the current view's data, not always the plan's")
         failed = True
     # An older History day carries its own daily refresh_minutes, so the render judges it by its own data as the 5-second poll does;

@@ -916,8 +916,10 @@ def render_car_charging_preview(report, native_diagnostic, now=None):
     table as a read-only simulation and the compact "Simulation only — not
     executed" line is preserved. For a valid applied display (paired rows +
     fresh receipt + no stale-SoC/counterfactual hypothesis + coherent
-    ``generated_at``) the banner switches to "Active plan" and the
-    simulated-only line is suppressed. For an applied-but-invalid receipt
+    ``generated_at``) the healthy explanatory copy stays out of this preview
+    block; the graph's initially closed details drawer carries it. An
+    explicitly authorized partial target remains visible. For an
+    applied-but-invalid receipt
     (expired / missing / future / false authority / blocked / missing
     preview / stale ``generated_at``) the compact carries a bounded
     execution-blocked reason. Parent ``status='apply_blocked'`` reports
@@ -958,17 +960,10 @@ def render_car_charging_preview(report, native_diagnostic, now=None):
     elif (is_applied or is_blocked) and active:
         compact.append("execution blocked: {}".format(_applied_block_reason(report, now)))
     if applied_fresh:
-        banner = (
-            '<details class="car-charging-preview-banner"><summary>Command observed · future rows are forecasts</summary>'
-            "the existing Plan table shows the currently observed command. "
-            "Only the inverter/EV response just received is authoritative; "
-            "every later row is a future forecast that will be revalidated "
-            "by the next executor cycle. Hardware confirmation is never "
-            "claimed from HA observations alone. Native-plan counterfactual "
-            "diagnostics (e.g. native grid-limit exceeded) are obsolete — "
-            "see Show Debug to distinguish them from the applied receipt."
-            "</details>"
-        )
+        # The chart's initially closed detail drawer carries the healthy
+        # applied-plan context. Keep the preview root and its debug evidence,
+        # but do not put a second explanatory headline above the graph.
+        banner = ""
     elif (is_applied or is_blocked) and active:
         banner = (
             '<div class="car-charging-preview-banner" role="alert"><strong>Execution blocked:</strong> '
@@ -992,7 +987,9 @@ def render_car_charging_preview(report, native_diagnostic, now=None):
     native_exceeded = _is_exceeded(state, peak_w, minutes_over, limit_w)
     parts = ['<section class="car-charging-preview" style="margin-bottom:16px;">']
     if compact:
-        parts.append('<div class="car-charging-preview-summary">' + escape(" · ".join(compact)) + "</div>")
+        visible_compact = compact[1:] if applied_fresh and compact[:1] == ["Active plan"] else compact
+        if visible_compact:
+            parts.append('<div class="car-charging-preview-summary">' + escape(" · ".join(visible_compact)) + "</div>")
         if applied_fresh:
             debug_parts.append("Observed: {}".format(_safe_iso(report.get("execution_observed_at"))))
             debug_parts.append("Valid until: {}".format(_safe_iso(report.get("execution_valid_until"))))
@@ -1007,7 +1004,7 @@ def render_car_charging_preview(report, native_diagnostic, now=None):
             debug_parts.append("Planning reference: {}".format(reference_at))
     if compact and not (applied_fresh or is_applied or is_blocked):
         parts.append('<div class="car-charging-preview-debug" style="display:none;">' + banner + "</div>")
-    else:
+    elif not applied_fresh:
         parts.append(banner)
     # For shadow / partial / unavailable candidates without a compact line
     # the XSS-sensitive status field still belongs under Show Debug.

@@ -106,13 +106,13 @@ def test_plan_flow_labels():
         assert report == before
 
 
-def test_compact_banner_keeps_warnings_visible():
-    """Details must not wrap and hide current warnings or repeat the heading."""
+def test_healthy_applied_preview_is_quiet_and_invalid_warning_stays_visible():
+    """Healthy copy stays out of the preview block while invalid execution alerts remain."""
     report = _applied_report(now=_now())
     html = render_car_charging_preview(report, None, _now())
     assert "current command only — future forecast under revalidation" not in html
-    assert html.count("Active plan") == 1
-    assert "<details" in html
+    assert "Active plan" not in html
+    assert "<details" not in html
     report["execution_valid_until"] = report["execution_observed_at"]
     html = render_car_charging_preview(report, None, _now())
     assert 'role="alert"' in html
@@ -174,7 +174,7 @@ def run_plan_table_clarity_tests():
         test_limited_replay_detail,
         test_replay_display_steps,
         test_plan_flow_labels,
-        test_compact_banner_keeps_warnings_visible,
+        test_healthy_applied_preview_is_quiet_and_invalid_warning_stays_visible,
         test_plan_table_javascript,
         CompactStrategyTests().test_compact_strategy_contract,
     ):
