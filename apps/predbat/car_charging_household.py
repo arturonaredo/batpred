@@ -64,7 +64,9 @@ def household_options(base, settings):
     """Build solver-only OFF-EV inputs from household, battery and support evidence."""
     from car_charging_plan import _aware, _number, _observation_clock
 
-    if not isinstance(settings, dict) or settings.get("mode") != "apply" or settings.get("household_fallback") is not True or settings.get("household_economic_fallback") is not True:
+    from power_readiness import readiness_enabled
+
+    if not isinstance(settings, dict) or settings.get("mode") != "apply" or settings.get("household_fallback") is not True or not (settings.get("household_economic_fallback") is True or readiness_enabled(base)):
         raise HouseholdFallbackBlocked("household_fallback_not_authorised")
     if settings.get("control_model") != "deye_solarman":
         raise HouseholdFallbackBlocked("shared_template_required")
@@ -368,6 +370,10 @@ def _replay_native_plan(base, options, snapshot, slots=None):
         raise ValueError("Native plan charge windows are outside the replay horizon")
     result = SimpleNamespace(status="ordinary_native_household_plan", total_cost=None, actions=tuple(actions))
     windows = ([], deepcopy(snapshot["charge_windows"]), deepcopy(snapshot["charge_limits"]))
+    from power_readiness import prepare_candidate
+
+    result = prepare_candidate(base, options, result, slots, windows)
+    windows = getattr(result, "native_policy_windows", windows)
     checks = {name: _replay(base, options, result, slots, windows, scenario) for name, scenario in (("nominal", 0), ("pv10", 1))}
     for check in checks.values():
         check.pop("_charge_peak_kwh", None)
@@ -416,6 +422,10 @@ def _replay_native_joint_plan(base, options, snapshot, candidate, slots, ev_wind
         raise ValueError("Native reference charge window is outside the replay horizon")
     result = SimpleNamespace(status="ordinary_native_joint_reference", total_cost=None, actions=tuple(native_actions))
     windows = (deepcopy(ev_windows), deepcopy(snapshot["charge_windows"]), deepcopy(snapshot["charge_limits"]))
+    from power_readiness import prepare_candidate
+
+    result = prepare_candidate(base, options, result, slots, windows)
+    windows = getattr(result, "native_policy_windows", windows)
     checks = {name: _replay(base, options, result, slots, windows, scenario) for name, scenario in (("nominal", 0), ("pv10", 1))}
     for check in checks.values():
         check.pop("_charge_peak_kwh", None)
@@ -644,6 +654,15 @@ def _generate_low_rates_native_reference(base, options, fixed_ev_schedule, candi
             return None
         result = SimpleNamespace(status="generated_low_rates_native_reference", total_cost=None, actions=tuple(actions))
         windows = (deepcopy(ev_windows), charge_windows, charge_limits)
+        from power_readiness import prepare_candidate
+
+        try:
+            result = prepare_candidate(base, options, result, native_slots, windows)
+            windows = getattr(result, "native_policy_windows", windows)
+        except ValueError:
+            failure_reasons.add("power_readiness_controls_invalid")
+            evaluated[levels] = None
+            return None
         checks = {}
         try:
             for name, scenario in (("nominal", 0), ("pv10", 1)):
@@ -734,6 +753,8 @@ def _generate_low_rates_native_reference(base, options, fixed_ev_schedule, candi
         "source_windows": [{"start": window["start"], "end": window["end"]} for window in geometry],
         "selected_source_window_indexes": [window["source_index"] for window in selected_geometry],
         "selected_target_levels_percent": list(selected["levels"]),
+        "power_readiness": deepcopy(getattr(selected["result"], "power_readiness", {"active": False})),
+        "selected_effective_charge_limits_kwh": deepcopy(selected["windows"][2]),
         "eligible_target_levels_percent": coarse_levels,
         "fixed_ev_schedule_fingerprint": schedule_fingerprint,
         "paired_evaluations": paired_evaluations,
@@ -824,6 +845,14 @@ def evaluate_household_fallback(base, settings, unavailable_reason):
         if blockers:
             return _plan_report(base, "household_plan_inputs_blocked", domestic_plan_blockers=blockers)
         _forecast_inputs(base, options)
+        from power_readiness import readiness_enabled, stage_household_readiness
+
+        if readiness_enabled(base):
+            service = stage_household_readiness(base, options, build_native_slots(base, options), unavailable_reason)
+            if service is not None:
+                return service
+            if settings.get("household_economic_fallback") is not True:
+                return _plan_report(base, unavailable_reason, domestic_only=False, power_readiness={"active": False})
         if native_snapshot is None:
             return _plan_report(
                 base,
@@ -1004,6 +1033,11 @@ def execution_evidence(base, settings, pending):
     if not math.isfinite(base.soc_kw) or base.soc_kw < floor - 0.002:
         raise HouseholdFallbackBlocked("domestic_soc_invalid")
     _forecast_inputs(base, options)
+    if pending.get("readiness_service") is True:
+        from power_readiness import readiness_input_fingerprint
+
+        if pending.get("readiness_input_fingerprint") != readiness_input_fingerprint(base):
+            raise HouseholdFallbackBlocked("power_readiness_inputs_changed")
     from car_charging_plan import _parse_entity_timestamp
 
     now = _parse_entity_timestamp(options["observations_checked_at"], "household_observation_clock")

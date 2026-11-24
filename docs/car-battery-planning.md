@@ -246,6 +246,55 @@ or prevent a validated full target; bounded failure is not proof of infeasibilit
 
 ## Optional grid-charge sharing model
 
+### Optional cheap-period power readiness
+
+An opt-in power service can retain energy for peaks during long cheap periods,
+including weekends and holidays, without treating 35% as a new safety reserve.
+It uses actual import tariffs rather than a weekday or holiday calendar.
+For example, 10 kW of house/EV demand with a 6 kW import setting requires 4 kW of
+battery support (less any available solar); one hour needs 4 kWh plus losses.
+
+```yaml
+battery_power_readiness:
+  enabled: true
+  target_soc_percent: 35
+  maximum_soc_percent: 60
+  minimum_cheap_minutes: 360
+  cheap_price_ceiling: 12.0
+```
+
+The example ceiling is 12 minor currency units/kWh, or EUR 0.12/kWh for euro
+tariffs. These are the defaults when enabled. Missing configuration disables
+the feature. Targets are whole percentages below 100%; malformed settings fail
+closed. A continuous six-hour band below the ceiling qualifies even if a short
+cheaper interval exists later. Known earlier cheap tariffs keep the remaining
+hours eligible as a long band ends; missing prior tariffs are not invented.
+
+The 35% target is ordinary bounded shared charge intent, **not** a change to the
+physical minimum SOC. During an eligible period the grid/PV can refill it when
+headroom permits, while the battery remains usable for deficits down to the
+existing safety reserve. Conservative load/PV10 forecasts and the fixed EV
+schedule can increase the target, allowing conversion losses and a 10% energy
+margin, up to the configured maximum. Capping is reported and does not waive
+import, reserve, inverter power or EV pause/restart failures. Starting at the
+minimum does not mean the buffer is instantly available.
+
+This service requires the existing explicitly authorised shared Deye/Solarman
+apply installation and grid-support observations. It does not enable control
+when car planning is off. With household handback enabled it can prepare the
+house battery while the EV is unavailable, without enabling the separate
+household economic optimiser; dispatch first requires an observed EV relay OFF.
+No vehicle SOC or permission is needed to justify domestic-only energy storage.
+Both complete native scenarios must pass, the existing minimum mode duration
+and manual protections remain in force, and solar-only EV-on slots do not
+acquire grid-charge mode.
+
+Candidate and native/generated reference receive the same power obligation
+before economic replay. Domestic-only service costs are disclosed, not labelled
+as savings against an unprepared battery. Changing the policy, tariff or forecast
+withdraws stale authority. No new relay writer, BMS/current/ToU/peak-shaving
+setting change, physical import clamp or hardware commissioning is implied.
+
 With the Deye/Solarman adapter, `inverter_grid_support` can name the existing local
 peak-shaving enable and limit observations. Missing, disabled, excessive or invalid
 cached settings block the candidate. A grid-charge request can leave available

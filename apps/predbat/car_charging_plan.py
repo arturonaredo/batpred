@@ -646,6 +646,10 @@ def build_candidate(base, options):
             initial_window_remaining_minutes=options.get("initial_window_remaining_minutes", 0),
         ),
     )
+    if result.actions:
+        from power_readiness import prepare_candidate
+
+        result = prepare_candidate(base, options, result, slots)
     return result, slots
 
 
@@ -855,8 +859,8 @@ def _replay(base, options, result, slots, windows, scenario):
 
 def _replay_candidate(base, options, result, slots):
     """Replay commands capped by solver-derived charge-run trajectories in both scenarios."""
-    windows = _native_windows(base, result, slots)
-    charge_limits = _solver_charge_run_limits(base, result, slots)
+    windows = getattr(result, "native_policy_windows", None) or _native_windows(base, result, slots)
+    charge_limits = [] if getattr(result, "native_policy_windows", None) else _solver_charge_run_limits(base, result, slots)
     if charge_limits:
         if len(charge_limits) != len(windows[1]):
             raise ValueError("Solver charge SOC runs do not match native charge windows")
@@ -1552,7 +1556,9 @@ def evaluate_car_charging(base, publish=True):
 
         reason = household_reason(base)
         if reason:
-            if settings.get("household_fallback") is True and settings.get("household_economic_fallback") is True:
+            from power_readiness import readiness_enabled
+
+            if settings.get("household_fallback") is True and (settings.get("household_economic_fallback") is True or readiness_enabled(base)):
                 from car_charging_household import evaluate_household_fallback
 
                 report = evaluate_household_fallback(base, settings, reason)
@@ -1860,9 +1866,13 @@ def evaluate_car_charging(base, publish=True):
                 cost_convention="solver_objective_includes_cycle_cost_and_terminal_credit; native_horizon_energy_cost_excludes_both_and_standing_charge",
                 ev_window_convention="full_step_power_reservation_not_partial_target_energy",
                 charge_limit_convention=(
-                    "generated_low_rates_window_targets_at_or_above_reserve_paired_native_replay"
-                    if economic_selected is not None and economic_selected["source"] == "native_reference_alternative" and economic_selected["economic_comparison"]["reference_kind"] == "generated_fixed_ev_low_rates_native_window_reference"
-                    else "solver_charge_run_peak_guarded_ceil_plus_one_percentage_point_then_paired_native_replay" if windows[1] else "no_charge_windows"
+                    "power_readiness_overlaid_targets_paired_native_replay"
+                    if getattr(result, "power_readiness", {}).get("active")
+                    else (
+                        "generated_low_rates_window_targets_at_or_above_reserve_paired_native_replay"
+                        if economic_selected is not None and economic_selected["source"] == "native_reference_alternative" and economic_selected["economic_comparison"]["reference_kind"] == "generated_fixed_ev_low_rates_native_window_reference"
+                        else "solver_charge_run_peak_guarded_ceil_plus_one_percentage_point_then_paired_native_replay" if windows[1] else "no_charge_windows"
+                    )
                 ),
                 initial_execution_state_assumption="relay_value_and_elapsed_off_time" if options["entity_config"]["relay_entity"] else "assumed_off_for_minimum_cooldown_no_relay",
                 ev_initial_state={
@@ -1878,6 +1888,7 @@ def evaluate_car_charging(base, publish=True):
                 bounded_search=True,
                 execution_blockers=list(blockers),
             )
+            report["power_readiness"] = deepcopy(getattr(result, "power_readiness", {"active": False}))
             if economic_selected is not None:
                 report["cost_convention"] = "paired_raw_nominal_pv10_horizon_energy_plus_battery_cycle_cost_minus_terminal_soc_value; positive_floor_and_per_scenario_non_regression"
             if options["grid_charge_support_w"] and all(check["passed"] for check in checks.values()):

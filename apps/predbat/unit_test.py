@@ -24,6 +24,7 @@ if hasattr(sys.stderr, "reconfigure"):
 
 from predbat import PredBat
 from tests.test_infra import FIXTURE_MINUTES_NOW, TestHAInterface, set_plot_enabled
+from tests.test_power_readiness import run_power_readiness_tests
 from tests.test_compute_metric import run_compute_metric_tests
 from tests.test_pv90 import run_pv90_tests
 from tests.test_performance_tweaks import run_performance_tweaks_tests
@@ -634,6 +635,11 @@ def run_car_planning_grid_support_tests_isolated(my_predbat):
     return run_car_planning_grid_support_tests(create_predbat())
 
 
+def run_power_readiness_tests_isolated(my_predbat):
+    """Keep explicit readiness settings and synthetic service states out of unrelated tests."""
+    return run_power_readiness_tests(create_predbat())
+
+
 def run_car_planning_battery_windows_core_tests(my_predbat):
     """Run the pure minimum-window state-machine tests without a Home Assistant backend."""
     suite = unittest.defaultTestLoader.loadTestsFromName("tests.test_car_planning_battery_windows_core")
@@ -733,6 +739,7 @@ def main():
         ("car_planning_partial", run_car_planning_partial_tests, "Truthful paired-safe partial EV shadow plan with unchanged requested target", False),
         ("car_planning_grid_support", run_car_planning_grid_support_tests_isolated, "Opt-in grid charge support without actuator authority", False),
         ("prediction_grid_support", run_prediction_grid_support_tests_isolated, "Independent charge-request grid support replay", False),
+        ("power_readiness", run_power_readiness_tests_isolated, "Cheap-period spendable battery power buffer and native dispatch", False),
         ("car_planning_actual", run_car_planning_actual_tests_isolated, "Confirmed sessions and exact native charge ceilings", False),
         ("car_planning_session", run_car_planning_session_tests, "Native domestic handback and durable session evidence", False),
         ("car_planning_recurring", run_car_planning_recurring_tests, "Standing EV policy and durable sensor-derived sessions", False),

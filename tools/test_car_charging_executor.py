@@ -67,11 +67,13 @@ def expected_power_decision(case, limits):
         return False
     if case.grid_w > limits["load_cap_w"] or case.load_w > limits["load_cap_w"]:
         return False
+    available_w = min(limits["load_cap_w"], limits["grid_cap_w"] + min(limits["load_cap_w"], limits["battery_discharge_w"] + max(0, case.pv_w)))
     if case.powered:
-        return True
+        # The load meter already includes an active EV. Continuation avoids
+        # start hysteresis, never the site's available power constraint.
+        return case.load_w <= available_w
     if case.battery_percent < limits["restart_percent"] or case.off_seconds < limits["cooldown_seconds"]:
         return False
-    available_w = min(limits["load_cap_w"], limits["grid_cap_w"] + min(limits["load_cap_w"], limits["battery_discharge_w"] + max(0, case.pv_w)))
     return case.load_w + limits["ev_rate_w"] <= available_w
 
 
