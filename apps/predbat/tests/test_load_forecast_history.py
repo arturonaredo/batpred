@@ -782,10 +782,7 @@ def test_evening_load_adjustment_candidate(my_predbat):
     cheap_rates = {minute: 12.0 if minute < 1440 else 9.99 for minute in range(now, 1445)}
     rate_tags = {}
     base_rate_tags = {}
-    adjusted = [
-        apply(steps, now, cheap_rates, rate_tags, base_rate_tags)
-        for steps in (source_load, pv10_load, pv90_load)
-    ]
+    adjusted = [apply(steps, now, cheap_rates, rate_tags, base_rate_tags) for steps in (source_load, pv10_load, pv90_load)]
     for label, original, result in zip(("nominal", "PV10", "PV90"), (source_load, pv10_load, pv90_load), adjusted):
         if abs((result[0] - original[0]) - 0.0166) > 1e-9:
             print("ERROR: {} scenario expected one bounded 0.0166 kWh candidate addition, got {}".format(label, result[0] - original[0]))
