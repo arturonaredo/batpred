@@ -881,6 +881,24 @@ def _replay_candidate(base, options, result, slots):
     checks = {name: _replay(base, options, result, slots, windows, scenario) for name, scenario in (("nominal", 0), ("pv10", 1))}
     for check in checks.values():
         check.pop("_charge_peak_kwh", None)
+    if options.get("ev_charging_priority") != "cost" and getattr(result, "power_readiness", {}).get("active"):
+        from car_charging_household import _native_adjusted_cost
+
+        costs = _native_adjusted_cost(base, checks)
+        selected = {
+            "result": result,
+            "slots": slots,
+            "windows": windows,
+            "checks": checks,
+            "options": options,
+            "sort_costs": costs,
+            "economic_comparison": {"status": "native_reference_alternative", "reference_costs": costs, "battery_plan_improvement": False},
+        }
+        chosen, proof = _continuous_charge_alternative(base, selected)
+        if proof["accepted"]:
+            windows, checks = chosen["windows"], chosen["checks"]
+            for check in checks.values():
+                check["charge_continuity"] = proof
     return windows, checks
 
 

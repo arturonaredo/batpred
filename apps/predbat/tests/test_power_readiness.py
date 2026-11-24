@@ -623,8 +623,8 @@ def test_continuous_targets_keep_ev_prices_and_policy_boundaries(base):
     assert evidence["target_changes_after"] < evidence["target_changes_before"]
     assert prepared.native_policy_windows == original
     for priority in ("now", "solar", "asap"):
-        unchanged, proof = continuous_charge_windows(base, {**options, "ev_charging_priority": priority}, prepared, slots, windows)
-        assert unchanged == windows and proof["changed"] is False
+        joined, proof = continuous_charge_windows(base, {**options, "ev_charging_priority": priority}, prepared, slots, windows)
+        assert joined[0] == windows[0] and joined[2] == [base.soc_max * 0.56] and proof["changed"] is True
     # A missing interval, tariff boundary or explicit non-charge mode is not bridged.
     gap_slots = list(slots)
     gap_slots.pop(5)
@@ -682,6 +682,11 @@ def test_continuous_targets_require_real_paired_non_regression(base):
     assert alternative["windows"][0] == windows[0]
     assert all(alternative["sort_costs"][name] <= costs[name] + 0.002 for name in ("nominal", "pv10"))
     assert chosen["windows"] == windows and chosen["checks"] == checks
+    for priority in ("now", "asap", "solar"):
+        stable, certified = _replay_candidate(base, {**options, "ev_charging_priority": priority}, prepared, slots)
+        assert len(stable[1]) < len(windows[1]), priority
+        assert stable[0] == windows[0] and prepared.actions == chosen["result"].actions
+        assert all(check["passed"] for check in certified.values())
     from car_charging_plan import _replay
 
     for fault in ("unsafe", "incomplete", "ev_delivery", "expensive"):
