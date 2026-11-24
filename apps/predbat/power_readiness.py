@@ -147,11 +147,20 @@ def readiness_profile(base, options, result, slots):
     }
 
 
-def prepare_candidate(base, options, result, slots, windows=None):
+def prepare_candidate(base, options, result, slots, windows=None, service_target_percent=None):
     """Overlay the same independent readiness targets on candidate or reference controls."""
     profile = readiness_profile(base, options, result, slots)
     if not profile["active"]:
         return result
+    if service_target_percent is not None:
+        settings = readiness_settings(base)
+        if type(service_target_percent) is not int or not settings["target_soc_percent"] <= service_target_percent <= settings["maximum_soc_percent"]:
+            raise ValueError("Readiness replay target exceeds authorised bounds")
+        if options.get("house_only") is not True or any(action.ev_action != "off" for action in result.actions):
+            raise ValueError("Readiness replay target requires an OFF-EV household service")
+        for period in profile["periods"]:
+            period["target_soc_percent"] = max(period["target_soc_percent"], service_target_percent)
+        profile["target_soc_percent"] = max(period["target_soc_percent"] for period in profile["periods"])
     from car_charging_plan import _native_windows, _solver_charge_run_limits
     from battery_window import commands_respect_windows
 
@@ -222,8 +231,22 @@ def stage_household_readiness(base, options, slots, unavailable_reason):
     if not getattr(result, "power_readiness", {}).get("active"):
         return None
     windows, checks = _replay_candidate(base, options, result, slots)
+    attempts = [{"target_soc_percent": result.power_readiness["target_soc_percent"], "paired_safe": _paired_passed(checks, base.forecast_minutes)}]
+    if not attempts[-1]["paired_safe"] and options.get("house_only") is True:
+        initial_target = result.power_readiness["target_soc_percent"]
+        maximum = readiness_settings(base)["maximum_soc_percent"]
+        # Search only more stored energy inside the same eligible cheap bands.
+        # Every trial keeps EV OFF and Demand outside those bands: no tariff
+        # optimiser, new expensive charge window or reduced replay horizon.
+        targets = list(range(initial_target + 5, maximum, 5)) + ([maximum] if maximum > initial_target else [])
+        for target in targets:
+            result = prepare_candidate(base, options, seed, slots, ([], [], []), service_target_percent=target)
+            windows, checks = _replay_candidate(base, options, result, slots)
+            attempts.append({"target_soc_percent": target, "paired_safe": _paired_passed(checks, base.forecast_minutes)})
+            if attempts[-1]["paired_safe"]:
+                break
     if not _paired_passed(checks, base.forecast_minutes):
-        return _plan_report(base, "power_readiness_native_replay_failed", native_checks=_public_checks(checks), power_readiness=result.power_readiness)
+        return _plan_report(base, "power_readiness_native_replay_failed", native_checks=_public_checks(checks), power_readiness=result.power_readiness, power_readiness_target_attempts=attempts)
     costs = _native_adjusted_cost(base, checks)
     if costs is None:
         return _plan_report(base, "power_readiness_costs_unavailable")
@@ -234,6 +257,7 @@ def stage_household_readiness(base, options, slots, unavailable_reason):
         status="candidate",
         household_executor="grid_charge_support",
         power_readiness_service=True,
+        power_readiness_target_attempts=attempts,
         power_readiness=deepcopy(result.power_readiness),
         battery_plan_improvement=False,
         service_costs=costs,
