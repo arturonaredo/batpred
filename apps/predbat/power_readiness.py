@@ -16,13 +16,13 @@ def readiness_settings(base):
     raw = getattr(base, "args", {}).get("battery_power_readiness")
     if raw is None:
         return {"enabled": False}
-    defaults = {"enabled": False, "auto_ev_now": False, "target_soc_percent": 35, "maximum_soc_percent": 60, "minimum_cheap_minutes": 360, "cheap_price_ceiling": 10.0}
+    defaults = {"enabled": False, "auto_ev_now": False, "target_soc_percent": 35, "maximum_soc_percent": 60, "minimum_cheap_minutes": 360, "cheap_price_ceiling": 10.0, "daily_energy_margin_kwh": 0.0}
     if not isinstance(raw, dict) or set(raw) - set(defaults):
         raise ValueError("Invalid power readiness settings")
     settings = {**defaults, **raw}
     if type(settings["enabled"]) is not bool or type(settings["auto_ev_now"]) is not bool:
         raise ValueError("Invalid power readiness enable flag")
-    for name, low, high in (("target_soc_percent", 1, 95), ("maximum_soc_percent", 1, 95), ("minimum_cheap_minutes", 30, 2880), ("cheap_price_ceiling", -1000, 1000)):
+    for name, low, high in (("target_soc_percent", 1, 95), ("maximum_soc_percent", 1, 95), ("minimum_cheap_minutes", 30, 2880), ("cheap_price_ceiling", -1000, 1000), ("daily_energy_margin_kwh", 0, 10)):
         value = settings[name]
         if type(value) not in (int, float) or not math.isfinite(value) or not low <= value <= high:
             raise ValueError("Invalid power readiness " + name)
@@ -87,6 +87,58 @@ def current_readiness_period(base, observed_now, minimum=None):
     return next((period for period in periods if period["start"] <= minute < period["end"]), None)
 
 
+def _published_rate(base, minute):
+    """Return a base-tariff value only when its published provenance is complete."""
+    rates = getattr(base, "rate_import_base", None)
+    replicated = getattr(base, "rate_import_replicated", None)
+    if not isinstance(rates, dict) or not isinstance(replicated, dict):
+        return None
+    value = rates.get(minute)
+    if type(value) not in (int, float) or not math.isfinite(value) or minute in replicated:
+        return None
+    return value
+
+
+def _published_cheap_start(base, slots, after, settings):
+    """Find the next complete qualifying base-tariff band without extrapolation."""
+    expected = after
+    run_start = None
+    run_minutes = 0
+    for slot in slots:
+        start = base.minutes_now + slot.start_min
+        end = start + slot.duration_min
+        if end <= after:
+            continue
+        if start < after or start != expected or slot.duration_min != 5:
+            return None, "published_coverage_gap"
+        prices = [_published_rate(base, minute) for minute in range(start, end)]
+        if any(price is None for price in prices):
+            return None, "published_coverage_gap"
+        if sum(prices) / len(prices) < settings["cheap_price_ceiling"]:
+            if run_start is None:
+                run_start = start
+                run_minutes = 0
+            run_minutes += slot.duration_min
+            if run_minutes >= settings["minimum_cheap_minutes"]:
+                return run_start, "published"
+        else:
+            run_start = None
+            run_minutes = 0
+        expected = end
+    return None, "next_cheap_not_in_horizon"
+
+
+def _published_cheap_span(base, start, end, settings):
+    """Require the active readiness interval itself to be a published cheap base-tariff band."""
+    for step_start in range(start, end, 5):
+        prices = [_published_rate(base, minute) for minute in range(step_start, step_start + 5)]
+        if any(price is None for price in prices):
+            return False, "published_coverage_gap"
+        if sum(prices) / len(prices) >= settings["cheap_price_ceiling"]:
+            return False, "current_cheap_not_published"
+    return True, "published"
+
+
 def readiness_ev_priority(base, requested, mode, observed_now):
     """Temporarily prefer an immediate safe start without writing or losing the requested selector."""
     settings = readiness_settings(base)
@@ -99,7 +151,7 @@ def readiness_ev_priority(base, requested, mode, observed_now):
 
 
 def readiness_profile(base, options, result, slots):
-    """Derive calendar-independent cheap intervals and energy needed for forecast peak bursts."""
+    """Derive cheap intervals, peak support targets, and next-window daily energy need."""
     settings = readiness_settings(base)
     inactive = {"active": False, "periods": []}
     if not settings["enabled"]:
@@ -127,11 +179,119 @@ def readiness_profile(base, options, result, slots):
             draw = -headroom / discharge_efficiency if headroom < 0 else -min(headroom * charge_efficiency, base.battery_rate_max_charge * duration)
             debt = max(0.0, debt + draw)
             maximum_debt = max(maximum_debt, debt)
-        required_percent = math.ceil((base.reserve + maximum_debt * 1.1) * 100 / base.soc_max - 1e-9)
-        target = min(settings["maximum_soc_percent"], max(settings["target_soc_percent"], required_percent, math.ceil(base.reserve * 100 / base.soc_max) + 1))
+        peak_required_kwh = base.reserve + maximum_debt * 1.1
+        peak_required_percent = math.ceil(peak_required_kwh * 100 / base.soc_max - 1e-9)
+        safety_target_percent = math.ceil(base.reserve * 100 / base.soc_max) + 1
+        configured_target_kwh = base.soc_max * settings["target_soc_percent"] / 100
+        peak_policy_requirement_kwh = max(
+            configured_target_kwh,
+            min(peak_required_kwh, base.soc_max * settings["maximum_soc_percent"] / 100),
+        )
+        peak_target = min(
+            settings["maximum_soc_percent"],
+            max(
+                settings["target_soc_percent"],
+                math.ceil(peak_policy_requirement_kwh * 100 / base.soc_max - 1e-9),
+                safety_target_percent,
+            ),
+        )
+        peak_target_kwh = base.soc_max * peak_target / 100
+        required_kwh = peak_required_kwh
+        daily_margin = settings["daily_energy_margin_kwh"]
+        margin_status = "disabled" if daily_margin == 0 else "not_evaluated"
+        next_cheap_start = None
+        margin_stored = 0.0
+        margin_applied = 0.0
+        margin_shortfall = 0.0
+        forecast_energy = 0.0
+        daily_requirement_kwh = None
+        margin_target_eligible = False
+        if daily_margin > 0:
+            published_current, current_status = _published_cheap_span(base, start, end, settings)
+            if not published_current:
+                margin_status = current_status
+                margin_shortfall = daily_margin
+            else:
+                next_cheap_start, margin_status = _published_cheap_start(base, slots, end, settings)
+                if next_cheap_start is None:
+                    margin_shortfall = daily_margin
+                else:
+                    margin_stored = daily_margin / discharge_efficiency
+                    future_debt = future_peak_debt = 0.0
+                    expected_future_start = end
+                    for slot, action in zip(slots[index:], result.actions[index:]):
+                        slot_start = base.minutes_now + slot.start_min
+                        slot_end = slot_start + slot.duration_min
+                        if slot_start >= next_cheap_start:
+                            break
+                        if slot_start != expected_future_start or slot_end > next_cheap_start:
+                            margin_status = "forecast_coverage_gap"
+                            next_cheap_start = None
+                            break
+                        minute = slot.start_min
+                        duration = slot.duration_min
+                        house = max(base.load_minutes_step[minute], base.load_minutes_step10[minute])
+                        pv = min(base.pv_forecast_minute_step[minute], base.pv_forecast_minute10_step[minute]) * base.inverter_loss
+                        pv = min(pv, base.inverter_limit * duration)
+                        ev = base.car_charging_rate[0] * duration / 60 if action.ev_action == "on" else 0
+                        net_load = house + ev - pv
+                        if net_load > 0:
+                            future_debt += net_load / discharge_efficiency
+                        elif net_load < 0:
+                            solar_charge = min(-net_load * charge_efficiency, base.battery_rate_max_charge * duration)
+                            future_debt = max(0.0, future_debt - solar_charge)
+                        future_peak_debt = max(future_peak_debt, future_debt)
+                        expected_future_start = slot_end
+                    if next_cheap_start is not None and expected_future_start != next_cheap_start:
+                        margin_status = "forecast_coverage_gap"
+                        next_cheap_start = None
+                    if next_cheap_start is not None:
+                        forecast_energy = future_peak_debt
+                        daily_requirement_kwh = base.reserve + future_peak_debt * 1.1
+                        required_without_margin_kwh = max(peak_policy_requirement_kwh, daily_requirement_kwh)
+                        required_kwh = required_without_margin_kwh + margin_stored
+                        available_margin = max(0.0, base.soc_max - required_without_margin_kwh) * discharge_efficiency
+                        margin_applied = min(daily_margin, available_margin)
+                        margin_shortfall = max(0.0, daily_margin - margin_applied)
+                        margin_target_eligible = True
+                    else:
+                        forecast_energy = 0.0
+                        margin_stored = 0.0
+                        margin_shortfall = daily_margin
+        else:
+            forecast_energy = 0.0
+        if margin_target_eligible:
+            target = min(100, max(peak_target, math.ceil(required_kwh * 100 / base.soc_max - 1e-9)))
+        else:
+            target = peak_target
         if target <= math.ceil(base.reserve * 100 / base.soc_max):
             raise ValueError("Readiness target cannot be represented above safety reserve")
-        periods.append({"start": start, "end": end, "target_soc_percent": math.ceil(target), "forecast_peak_energy_kwh": maximum_debt, "target_capped": required_percent > settings["maximum_soc_percent"]})
+        target_soc_kwh = base.soc_max * target / 100
+        peak_target_capped = peak_required_percent > settings["maximum_soc_percent"]
+        target_capped = required_kwh > base.soc_max if margin_target_eligible else peak_target_capped
+        periods.append(
+            {
+                "start": start,
+                "end": end,
+                "target_soc_percent": math.ceil(target),
+                "forecast_peak_energy_kwh": maximum_debt,
+                "peak_required_soc_kwh": peak_required_kwh,
+                "peak_target_soc_percent": peak_target,
+                "peak_target_capped": peak_target_capped,
+                "peak_target_shortfall_kwh": max(0.0, peak_required_kwh - peak_target_kwh),
+                "target_capped": target_capped,
+                "required_soc_kwh": required_kwh,
+                "next_cheap_start_minute": next_cheap_start,
+                "daily_energy_margin_status": margin_status,
+                "daily_energy_margin_requested_kwh": daily_margin,
+                "daily_energy_margin_applied_kwh": margin_applied,
+                "daily_energy_margin_stored_kwh": margin_stored,
+                "daily_energy_margin_shortfall_kwh": margin_shortfall,
+                "forecast_energy_to_next_cheap_kwh": forecast_energy,
+                "daily_energy_requirement_kwh": daily_requirement_kwh,
+                "target_shortfall_kwh": max(0.0, required_kwh - target_soc_kwh),
+            }
+        )
     if not periods:
         return inactive
     return {
@@ -140,6 +300,7 @@ def readiness_profile(base, options, result, slots):
         "periods": periods,
         "cheap_threshold": settings["cheap_price_ceiling"],
         "minimum_cheap_minutes": settings["minimum_cheap_minutes"],
+        "daily_energy_margin_kwh": settings["daily_energy_margin_kwh"],
         "physical_reserve_unchanged_kwh": base.reserve,
         "buffer_usable_for_peak_support": True,
         "cost_basis": "explicit_power_availability_service_not_measured_energy_savings",
@@ -154,7 +315,9 @@ def prepare_candidate(base, options, result, slots, windows=None, service_target
         return result
     if service_target_percent is not None:
         settings = readiness_settings(base)
-        if type(service_target_percent) is not int or not settings["target_soc_percent"] <= service_target_percent <= settings["maximum_soc_percent"]:
+        daily_target_authorized = settings["daily_energy_margin_kwh"] > 0 and any(period.get("daily_energy_margin_status") == "published" for period in profile["periods"])
+        maximum_target = 100 if daily_target_authorized else settings["maximum_soc_percent"]
+        if type(service_target_percent) is not int or not settings["target_soc_percent"] <= service_target_percent <= maximum_target:
             raise ValueError("Readiness replay target exceeds authorised bounds")
         if options.get("house_only") is not True or any(action.ev_action != "off" for action in result.actions):
             raise ValueError("Readiness replay target requires an OFF-EV household service")
@@ -307,10 +470,19 @@ def stage_household_readiness(base, options, slots, unavailable_reason):
     if not getattr(result, "power_readiness", {}).get("active"):
         return None
     windows, checks = _replay_candidate(base, options, result, slots)
-    attempts = [{"target_soc_percent": result.power_readiness["target_soc_percent"], "paired_safe": _paired_passed(checks, base.forecast_minutes)}]
+    attempts = [
+        {
+            "target_soc_percent": result.power_readiness["target_soc_percent"],
+            "paired_safe": _paired_passed(checks, base.forecast_minutes),
+            "target_achieved": all(check.get("readiness_target_achieved", True) for check in checks.values()),
+            "target_shortfall_kwh": max((check.get("readiness_target_shortfall_kwh", 0.0) for check in checks.values()), default=0.0),
+        }
+    ]
     if not attempts[-1]["paired_safe"] and options.get("house_only") is True:
         initial_target = result.power_readiness["target_soc_percent"]
-        maximum = readiness_settings(base)["maximum_soc_percent"]
+        settings = readiness_settings(base)
+        daily_target_authorized = settings["daily_energy_margin_kwh"] > 0 and any(period.get("daily_energy_margin_status") == "published" for period in result.power_readiness["periods"])
+        maximum = 100 if daily_target_authorized else settings["maximum_soc_percent"]
         # Search only more stored energy inside the same eligible cheap bands.
         # Every trial keeps EV OFF and Demand outside those bands: no tariff
         # optimiser, new expensive charge window or reduced replay horizon.
@@ -318,7 +490,14 @@ def stage_household_readiness(base, options, slots, unavailable_reason):
         for target in targets:
             result = prepare_candidate(base, options, seed, slots, ([], [], []), service_target_percent=target)
             windows, checks = _replay_candidate(base, options, result, slots)
-            attempts.append({"target_soc_percent": target, "paired_safe": _paired_passed(checks, base.forecast_minutes)})
+            attempts.append(
+                {
+                    "target_soc_percent": target,
+                    "paired_safe": _paired_passed(checks, base.forecast_minutes),
+                    "target_achieved": all(check.get("readiness_target_achieved", True) for check in checks.values()),
+                    "target_shortfall_kwh": max((check.get("readiness_target_shortfall_kwh", 0.0) for check in checks.values()), default=0.0),
+                }
+            )
             if attempts[-1]["paired_safe"]:
                 break
     if not _paired_passed(checks, base.forecast_minutes):

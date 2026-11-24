@@ -262,6 +262,7 @@ battery_power_readiness:
   maximum_soc_percent: 60
   minimum_cheap_minutes: 360
   cheap_price_ceiling: 10.0
+  daily_energy_margin_kwh: 0.0
 ```
 
 The example ceiling is 10 minor currency units/kWh, or EUR 0.10/kWh for euro
@@ -276,10 +277,35 @@ The 35% target is ordinary bounded shared charge intent, **not** a change to the
 physical minimum SOC. During an eligible period the grid/PV can refill it when
 headroom permits, while the battery remains usable for deficits down to the
 existing safety reserve. Conservative load/PV10 forecasts and the fixed EV
-schedule can increase the target, allowing conversion losses and a 10% energy
-margin, up to the configured maximum. Capping is reported and does not waive
-import, reserve, inverter power or EV pause/restart failures. Starting at the
-minimum does not mean the buffer is instantly available.
+schedule can increase the peak-support target, allowing conversion losses and a
+10% energy margin, up to `maximum_soc_percent`. Peak capping is reported and
+does not waive import, reserve, inverter power or EV pause/restart failures.
+Starting at the minimum does not mean the buffer is instantly available.
+
+`daily_energy_margin_kwh` optionally adds 0–10 kWh of useful AC-side energy
+(default `0`, so existing behaviour is unchanged). For example, `2.0` requests
+two useful kWh above the larger of the configured base target, peak-policy
+target and forecast daily-energy requirement. The daily requirement is computed
+independently from the end of the current cheap band to the next verified cheap
+start: it accumulates conservative net household/EV load from zero, credits
+lower-forecast solar subject to charge-rate limits, and accounts for conversion
+losses. It does not subtract the shared grid-import allowance from daytime load
+or carry support debt from the preceding cheap band into this daily calculation.
+The existing load forecast is counted once (including PredHeat where already
+present).
+
+The next start must have continuous published base-tariff coverage for the full
+configured minimum cheap duration; midnight, copied, forecast, adjusted and
+gap-filled rates do not qualify. The requested daily target may exceed
+`maximum_soc_percent` (which caps peak readiness only), but cannot exceed
+physical battery capacity. Native higher charge targets are preserved. Reports
+separately show the uncapped requirement, peak-cap result, physically capped
+target and remaining shortfall. Incomplete tariff or forecast coverage leaves
+the daily addition unapplied and reports the deficit. A target that cannot be
+reached does not by itself reject a paired-safe best-effort plan or block an
+otherwise safe EV schedule; only complete native import, reserve, battery-power
+and EV checks decide safety. The 10% physical reserve and EV protections are
+unchanged.
 
 This service requires the existing explicitly authorised shared Deye/Solarman
 apply installation and grid-support observations. It does not enable control
@@ -311,14 +337,16 @@ OFF instead of blocking its own recovery. This does not enable the household
 economic optimiser, relax EV pause/restart or cooldown, or grant EV permission.
 
 Domestic readiness first replays the normal buffer target. If that would be
-exhausted before a later household peak, it can try higher targets in five-point
-steps up to `maximum_soc_percent`, including that exact cap. Every trial keeps
-the EV OFF, charges only in the same eligible cheap bands and uses Demand
-outside them. It does not invoke the household economic optimiser or add
-expensive charging. Both complete native scenarios must pass before dispatch;
-otherwise the service remains blocked. `power_readiness_target_attempts` records
-the trials. The maximum is an explicit preparation allowance, not a rigid
-reserve or an instruction to keep the battery permanently at that percentage.
+unsafe before a later household peak, it can try higher targets in five-point
+steps, up to `maximum_soc_percent` for peak-only readiness or physical capacity
+for a tariff-verified daily target. Every trial keeps the EV OFF, charges only
+in the same eligible cheap bands and uses Demand outside them. It does not invoke
+the household economic optimiser or add expensive charging. Both complete native
+scenarios must pass electrical and EV safety checks before dispatch; a reported
+service-target shortfall alone does not block a safe best-effort candidate.
+`power_readiness_target_attempts` records the trials and shortfalls. These are
+preparation limits, not a rigid reserve or an instruction to keep the battery
+permanently at that percentage.
 
 With the Deye/Solarman adapter, `inverter_grid_support` can name the existing local
 peak-shaving enable and limit observations. Missing, disabled, excessive or invalid

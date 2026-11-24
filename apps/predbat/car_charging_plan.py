@@ -804,6 +804,32 @@ def _replay(base, options, result, slots, windows, scenario):
     terminal_rounding = rounding if options["terminal_min"] > base.reserve + 0.002 else 0
     if pred.final_soc - terminal_rounding < max(options["terminal_min"], base.reserve) - 0.002:
         reasons.append("terminal_reserve")
+    readiness_target_shortfall = 0.0
+    readiness_target_checked = False
+    readiness_target_achieved = True
+    readiness = getattr(result, "power_readiness", {})
+    if readiness.get("daily_energy_margin_kwh", 0) > 0:
+        for period in readiness.get("periods", []):
+            if period.get("daily_energy_margin_status") != "published":
+                continue
+            readiness_target_checked = True
+            end_offset = period["end"] - base.minutes_now
+            end_soc = pred.final_soc if end_offset == base.forecast_minutes else trace.get(end_offset)
+            if end_soc is None:
+                reasons.append("readiness_target_replay_incomplete")
+                readiness_target_shortfall = max(readiness_target_shortfall, base.soc_max)
+                readiness_target_achieved = False
+                continue
+            # Service shortfall is diagnostic: only the independent electrical,
+            # reserve, and EV checks below decide whether a replay is safe.
+            target_kwh = max(
+                period.get("required_soc_kwh", base.soc_max * period["target_soc_percent"] / 100),
+                base.soc_max * period["target_soc_percent"] / 100,
+            )
+            shortfall = max(0.0, target_kwh - end_soc)
+            readiness_target_shortfall = max(readiness_target_shortfall, shortfall)
+            if shortfall > max(0.02, rounding):
+                readiness_target_achieved = False
     previous_on = options["initially_on"]
     previous_off_minutes = options["initial_off_minutes"]
     off_minutes = previous_off_minutes
@@ -848,6 +874,8 @@ def _replay(base, options, result, slots, windows, scenario):
         "final_ev_kwh": pred.final_car_soc[0],
         "validated_ev_target_kwh": ev_target,
         "minimum_battery_kwh": reserve_min,
+        "readiness_target_achieved": not readiness_target_checked or readiness_target_achieved,
+        "readiness_target_shortfall_kwh": readiness_target_shortfall,
         "horizon_energy_cost": pred.final_metric - base.cost_today_sofar,
         "model": "native_python_grid_charge_support" if support_w else "native_python_segmented_rate_replay" if limited else "native_python_full_power_ev_envelope",
         "soc_rounding_bound_kwh": rounding,

@@ -27,6 +27,295 @@ def _inputs(base, minutes=720):
     return options, slots, result
 
 
+def _daily_margin_inputs(base, margin=2.0):
+    """Build two tariff-published cheap bands around a six-hour expensive interval."""
+    from car_charging_plan import build_native_slots
+
+    options, _slots, _result = _inputs(base, minutes=1200)
+    settings = base.args["battery_power_readiness"]
+    settings.update(target_soc_percent=35, maximum_soc_percent=80, daily_energy_margin_kwh=margin)
+    for minute in range(base.minutes_now - 360, base.minutes_now + 1200):
+        offset = minute - base.minutes_now
+        price = 8.1 if offset < 480 or 840 <= offset < 1200 else 20.0
+        base.rate_import[minute] = price
+        base.rate_import_base[minute] = price
+    base.rate_import_replicated = {}
+    for offset in range(0, 1200, 5):
+        if offset < 480:
+            load, load10, pv, pv10 = 0.5, 0.5, 0.0, 0.0
+        elif offset < 840:
+            load, load10, pv, pv10 = 2.0, 2.5, 0.5, 0.25
+        else:
+            load, load10, pv, pv10 = 0.5, 0.5, 0.0, 0.0
+        base.load_minutes_step[offset] = load * 5 / 60
+        base.load_minutes_step10[offset] = load10 * 5 / 60
+        base.pv_forecast_minute_step[offset] = pv * 5 / 60
+        base.pv_forecast_minute10_step[offset] = pv10 * 5 / 60
+    slots = build_native_slots(base, options)
+    actions = tuple(SimpleNamespace(slot_index=slot.index, battery_mode="demand", ev_action="off", discharge_limit_kw=None) for slot in slots)
+    result = SimpleNamespace(status="feasible", total_cost=0, actions=actions)
+    return options, slots, result
+
+
+def test_daily_energy_margin_uses_next_published_cheap_start_and_conservative_net_load(base):
+    """Useful AC margins lift the target by tariff-derived net demand, PV10, and conversion losses."""
+    from power_readiness import prepare_candidate
+    from car_charging_plan import _replay_candidate
+
+    targets = []
+    expected_forecast_draw = 6 * (2.5 - 0.25 * 0.95) / (0.95 * 0.96)
+    for margin in (2.0, 3.0, 4.0):
+        options, slots, seed = _daily_margin_inputs(base, margin)
+        prepared = prepare_candidate(base, options, seed, slots, ([], [], []))
+        period = prepared.power_readiness["periods"][0]
+        targets.append(period["target_soc_percent"])
+        assert period["daily_energy_margin_status"] == "published"
+        assert period["next_cheap_start_minute"] == base.minutes_now + 840
+        assert abs(period["forecast_energy_to_next_cheap_kwh"] - expected_forecast_draw) < 1e-6
+        assert abs(period["daily_energy_margin_stored_kwh"] - margin / (0.95 * 0.96)) < 1e-6
+        expected_required = max(base.reserve + expected_forecast_draw * 1.1, base.soc_max * 0.35) + margin / (0.95 * 0.96)
+        assert abs(period["required_soc_kwh"] - expected_required) < 1e-6
+        assert abs(period["daily_energy_margin_shortfall_kwh"]) < 1e-9
+        assert abs(period["daily_energy_margin_applied_kwh"] + period["daily_energy_margin_shortfall_kwh"] - margin) < 1e-6
+        assert all(action.battery_mode == "charge" for action in prepared.actions[:96])
+        assert all(action.battery_mode == "demand" for action in prepared.actions[96:168])
+        assert all(action.battery_mode == "charge" for action in prepared.actions[168:])
+        assert abs(base.reserve - base.soc_max * 0.1) < 1e-9
+        _windows, checks = _replay_candidate(base, options, prepared, slots)
+        assert all(check["passed"] for check in checks.values()), checks
+        assert all(check["readiness_target_shortfall_kwh"] >= 0 for check in checks.values()), checks
+    assert targets == sorted(set(targets)), targets
+
+
+def test_daily_energy_margin_preserves_peak_debt_before_later_solar_recharge(base):
+    """Later PV10 recovery cannot erase a larger earlier battery draw before the next cheap band."""
+    from power_readiness import prepare_candidate
+
+    options, slots, seed = _daily_margin_inputs(base, 2.0)
+    for offset in range(480, 660, 5):
+        base.load_minutes_step[offset] = base.load_minutes_step10[offset] = 10.0 * 5 / 60
+        base.pv_forecast_minute_step[offset] = base.pv_forecast_minute10_step[offset] = 0
+    for offset in range(660, 840, 5):
+        base.load_minutes_step[offset] = base.load_minutes_step10[offset] = 1.0 * 5 / 60
+        base.pv_forecast_minute_step[offset] = base.pv_forecast_minute10_step[offset] = 5.0 * 5 / 60
+    prepared = prepare_candidate(base, options, seed, slots, ([], [], []))
+    period = prepared.power_readiness["periods"][0]
+    expected_peak = 3 * 10.0 / (0.95 * 0.96)
+    expected_required = max(base.reserve + expected_peak * 1.1, base.soc_max * 0.35) + 2.0 / (0.95 * 0.96)
+    assert period["daily_energy_margin_status"] == "published"
+    assert abs(period["forecast_energy_to_next_cheap_kwh"] - expected_peak) < 1e-6
+    assert abs(period["required_soc_kwh"] - expected_required) < 1e-6, period
+    assert period["target_soc_percent"] > 35
+
+
+def test_daily_energy_margin_never_invents_a_next_cheap_start_from_gaps_or_copied_rates(base):
+    """Missing or replicated tariff minutes leave the requested margin unserved, not scheduled."""
+    from power_readiness import prepare_candidate
+
+    for fault in ("missing", "copied", "overridden_copy"):
+        options, slots, seed = _daily_margin_inputs(base, 3.0)
+        minute = base.minutes_now + (850 if fault == "copied" else 600)
+        if fault == "missing":
+            base.rate_import_base.pop(minute)
+        elif fault == "copied":
+            base.rate_import_replicated[minute] = "copy"
+        else:
+            base.rate_import_replicated[minute] = "user"
+        prepared = prepare_candidate(base, options, seed, slots, ([], [], []))
+        period = prepared.power_readiness["periods"][0]
+        assert period["daily_energy_margin_status"] == "published_coverage_gap", (fault, period)
+        assert period["next_cheap_start_minute"] is None
+        assert period["daily_energy_margin_applied_kwh"] == 0
+        assert abs(period["daily_energy_margin_shortfall_kwh"] - 3.0) < 1e-9
+        assert period["target_soc_percent"] == 35
+
+
+def test_daily_margin_native_replay_reports_shared_power_target_shortfall(base):
+    """An infeasible daily-energy request reports its deficit without rejecting a paired-safe plan."""
+    from power_readiness import stage_household_readiness
+
+    options, slots, _seed = _daily_margin_inputs(base, 2.0)
+    base.soc_kw = base.soc_max * 0.55
+    for offset in range(0, 480, 5):
+        base.load_minutes_step[offset] = base.load_minutes_step10[offset] = 7.0 * 5 / 60
+    for offset in range(480, 840, 5):
+        base.load_minutes_step[offset] = base.load_minutes_step10[offset] = 5.0 * 5 / 60
+        base.pv_forecast_minute_step[offset] = base.pv_forecast_minute10_step[offset] = 0
+    report = stage_household_readiness(base, options, slots, "test_unreachable_daily_margin")
+    assert report["status"] == "candidate", report
+    attempt = report["power_readiness_target_attempts"][0]
+    assert attempt["paired_safe"] is True, attempt
+    assert attempt["target_achieved"] is False, attempt
+    assert attempt["target_shortfall_kwh"] > 0.1, attempt
+    assert all(check["passed"] for check in report["native_checks"].values()), report
+    assert all("readiness_target_unmet" not in check["reasons"] for check in report["native_checks"].values()), report
+    assert base.car_charging_pending["commands"], report
+    assert all(not command["ev_on"] for command in base.car_charging_pending["commands"])
+
+
+def test_daily_margin_replay_reports_shortfall_against_a_raised_service_target(base):
+    """A safe-target search reports its raised SOC target as unmet when replay cannot reach it."""
+    from car_charging_plan import _replay_candidate
+    from power_readiness import prepare_candidate
+
+    options, slots, seed = _daily_margin_inputs(base, 2.0)
+    options["grid_charge_support_w"] = 3500
+    base.soc_kw = 6.0
+    prepared = prepare_candidate(base, options, seed, slots, ([], [], []), service_target_percent=95)
+    _windows, checks = _replay_candidate(base, options, prepared, slots)
+    assert all(check["passed"] for check in checks.values()), checks
+    assert all(check["readiness_target_achieved"] is False for check in checks.values()), checks
+    assert all(check["readiness_target_shortfall_kwh"] > 0 for check in checks.values()), checks
+
+
+def test_daily_margin_capacity_cap_is_not_mistaken_for_achieved_energy(base):
+    """A target beyond physical capacity is capped at full SOC and remains an honest shortfall."""
+    from car_charging_plan import _replay_candidate
+    from power_readiness import prepare_candidate
+
+    options, slots, seed = _daily_margin_inputs(base, 4.0)
+    base.args["battery_power_readiness"]["maximum_soc_percent"] = 35
+    for offset in range(480, 840, 5):
+        base.load_minutes_step[offset] = base.load_minutes_step10[offset] = 4.0 * 5 / 60
+        base.pv_forecast_minute_step[offset] = base.pv_forecast_minute10_step[offset] = 0.0
+    prepared = prepare_candidate(base, options, seed, slots, ([], [], []))
+    period = prepared.power_readiness["periods"][0]
+    assert period["target_capped"] is True
+    assert period["target_soc_percent"] == 100
+    assert period["daily_energy_margin_shortfall_kwh"] > 0
+    assert period["target_shortfall_kwh"] > 0
+    assert period["daily_energy_margin_applied_kwh"] == 0
+    _windows, checks = _replay_candidate(base, options, prepared, slots)
+    assert all(check["passed"] for check in checks.values()), checks
+    assert all(check["readiness_target_achieved"] is False for check in checks.values()), checks
+    assert all(check["readiness_target_shortfall_kwh"] > 0.1 for check in checks.values()), checks
+
+
+def test_daily_energy_demand_counts_load_below_shared_import_limit(base):
+    """Daily energy coverage includes modest household consumption, not only import-cap excess."""
+    from power_readiness import prepare_candidate
+
+    options, slots, seed = _daily_margin_inputs(base, 2.0)
+    for offset in range(480, 840, 5):
+        base.load_minutes_step[offset] = base.load_minutes_step10[offset] = 2.0 * 5 / 60
+        base.pv_forecast_minute_step[offset] = base.pv_forecast_minute10_step[offset] = 0.0
+    prepared = prepare_candidate(base, options, seed, slots, ([], [], []))
+    period = prepared.power_readiness["periods"][0]
+    expected_daily_draw = 6 * 2.0 / (0.95 * 0.96)
+    expected_daily_requirement = base.reserve + expected_daily_draw * 1.1
+    expected_required = max(base.soc_max * 0.35, expected_daily_requirement) + 2.0 / (0.95 * 0.96)
+    assert 2.0 < options["grid_charge_support_w"] / 1000
+    assert period["daily_energy_margin_status"] == "published"
+    assert abs(period["forecast_energy_to_next_cheap_kwh"] - expected_daily_draw) < 1e-6
+    assert abs(period["daily_energy_requirement_kwh"] - expected_daily_requirement) < 1e-6
+    assert abs(period["required_soc_kwh"] - expected_required) < 1e-6
+
+
+def test_daily_margin_target_can_exceed_peak_readiness_cap(base):
+    """The peak percentage cap does not cap a verified daily-energy target below battery capacity."""
+    from power_readiness import prepare_candidate
+
+    options, slots, seed = _daily_margin_inputs(base, 2.0)
+    base.args["battery_power_readiness"]["maximum_soc_percent"] = 70
+    for offset in range(480, 840, 5):
+        base.load_minutes_step[offset] = base.load_minutes_step10[offset] = 2.5 * 5 / 60
+        base.pv_forecast_minute_step[offset] = base.pv_forecast_minute10_step[offset] = 0.0
+    prepared = prepare_candidate(base, options, seed, slots, ([], [], []))
+    period = prepared.power_readiness["periods"][0]
+    expected_daily_draw = 6 * 2.5 / (0.95 * 0.96)
+    expected_required = max(base.soc_max * 0.35, base.reserve + expected_daily_draw * 1.1) + 2.0 / (0.95 * 0.96)
+    assert period["peak_target_soc_percent"] == 35
+    assert period["target_soc_percent"] > 70, period
+    assert period["target_soc_percent"] < 100, period
+    assert period["target_capped"] is False
+    assert abs(period["required_soc_kwh"] - expected_required) < 1e-6
+
+
+def test_daily_demand_is_independent_of_cheap_peak_support_debt(base):
+    """The next-window load debt starts at zero and is maxed with peak readiness, never added to it."""
+    from power_readiness import prepare_candidate
+
+    options, slots, seed = _daily_margin_inputs(base, 2.0)
+    for offset in range(0, 480, 5):
+        base.load_minutes_step[offset] = base.load_minutes_step10[offset] = 7.0 * 5 / 60
+        base.pv_forecast_minute_step[offset] = base.pv_forecast_minute10_step[offset] = 0.0
+    for offset in range(480, 840, 5):
+        base.load_minutes_step[offset] = base.load_minutes_step10[offset] = 1.0 * 5 / 60
+        base.pv_forecast_minute_step[offset] = base.pv_forecast_minute10_step[offset] = 0.0
+    prepared = prepare_candidate(base, options, seed, slots, ([], [], []))
+    period = prepared.power_readiness["periods"][0]
+    peak_debt = 8.0 / (0.95 * 0.96)
+    daily_debt = 6.0 / (0.95 * 0.96)
+    peak_requirement = base.reserve + peak_debt * 1.1
+    daily_requirement = base.reserve + daily_debt * 1.1
+    expected_required = max(base.soc_max * 0.35, peak_requirement, daily_requirement) + 2.0 / (0.95 * 0.96)
+    assert abs(period["forecast_peak_energy_kwh"] - peak_debt) < 1e-6
+    assert abs(period["forecast_energy_to_next_cheap_kwh"] - daily_debt) < 1e-6
+    assert abs(period["daily_energy_requirement_kwh"] - daily_requirement) < 1e-6
+    assert abs(period["required_soc_kwh"] - expected_required) < 1e-6, period
+
+
+def test_infeasible_daily_target_reports_shortfall_without_rejecting_safe_candidate(base):
+    """A safe EV plan remains eligible when daily load demand exceeds physical capacity."""
+    from car_charging_plan import _replay_candidate
+    from power_readiness import prepare_candidate
+    from car_charging_plan import _native_windows
+
+    options, slots, seed = _daily_margin_inputs(base, 4.0)
+    options["house_only"] = False
+    base.soc_kw = base.soc_max * 0.7
+    seed.actions[0].ev_action = "on"
+    for offset in range(480, 840, 5):
+        base.load_minutes_step[offset] = base.load_minutes_step10[offset] = 4.0 * 5 / 60
+        base.pv_forecast_minute_step[offset] = base.pv_forecast_minute10_step[offset] = 0.0
+    prepared = prepare_candidate(base, options, seed, slots, _native_windows(base, seed, slots))
+    period = prepared.power_readiness["periods"][0]
+    assert period["target_soc_percent"] == 100, period
+    assert period["target_capped"] is True
+    assert period["target_shortfall_kwh"] > 0.1
+    assert period["daily_energy_margin_shortfall_kwh"] > 0.1
+    assert prepared.actions[0].ev_action == "on"
+    _windows, checks = _replay_candidate(base, options, prepared, slots)
+    assert all(check["passed"] for check in checks.values()), checks
+    assert all(not check["readiness_target_achieved"] for check in checks.values()), checks
+    assert all(check["readiness_target_shortfall_kwh"] > 0.1 for check in checks.values()), checks
+    assert all(check["final_ev_kwh"] >= base.car_charging_limit[0] - 0.002 for check in checks.values()), checks
+
+
+def test_daily_margin_preserves_a_higher_native_charge_target(base):
+    """A daily service overlay can raise native targets but never lowers an existing higher charge target."""
+    from car_charging_plan import _native_windows
+    from power_readiness import prepare_candidate
+
+    options, slots, seed = _daily_margin_inputs(base, 2.0)
+    for offset in range(480, 840, 5):
+        base.load_minutes_step[offset] = base.load_minutes_step10[offset] = 1.5 * 5 / 60
+        base.pv_forecast_minute_step[offset] = base.pv_forecast_minute10_step[offset] = 0.0
+    native_windows = _native_windows(base, seed, slots)
+    native_windows = (native_windows[0], [{"start": base.minutes_now, "end": base.minutes_now + 480, "average": 8.1}], [base.soc_max * 0.9])
+    prepared = prepare_candidate(base, options, seed, slots, native_windows)
+    assert prepared.power_readiness["target_soc_percent"] < 90
+    assert prepared.native_policy_windows[2][0] >= base.soc_max * 0.9
+    first_charge = prepared.native_policy_windows[2][0]
+    assert first_charge >= base.soc_max * prepared.power_readiness["target_soc_percent"] / 100
+
+
+def test_next_published_cheap_start_requires_a_complete_minimum_window(base):
+    """The next interval is not labelled qualifying unless its full minimum duration is observed."""
+    from power_readiness import prepare_candidate
+
+    options, slots, seed = _daily_margin_inputs(base, 2.0)
+    for minute in range(base.minutes_now + 840, base.minutes_now + 1200):
+        price = 8.1 if minute < base.minutes_now + 1195 else 20.0
+        base.rate_import[minute] = price
+        base.rate_import_base[minute] = price
+    prepared = prepare_candidate(base, options, seed, slots, ([], [], []))
+    period = prepared.power_readiness["periods"][0]
+    assert period["daily_energy_margin_status"] == "next_cheap_not_in_horizon"
+    assert period["next_cheap_start_minute"] is None
+    assert period["daily_energy_margin_applied_kwh"] == 0
+
+
 def test_cheap_band_excludes_the_ten_cent_boundary(base):
     """A strict ten-cent ceiling excludes equality, dearer tails and dear prior history."""
     from power_readiness import cheap_readiness_periods, readiness_settings
@@ -138,6 +427,8 @@ def test_readiness_defaults_off_and_rejects_invalid_settings(base):
     options, slots, result = _inputs(base)
     base.args.pop("battery_power_readiness")
     assert power_readiness.prepare_candidate(base, options, result, slots) is result
+    base.args["battery_power_readiness"] = {"enabled": True}
+    assert power_readiness.readiness_settings(base)["daily_energy_margin_kwh"] == 0.0
     for invalid in (True, {"enabled": "true"}, {"enabled": True, "target_soc_percent": 100}, {"enabled": True, "minimum_cheap_minutes": 0}, {"enabled": True, "price_spread": float("nan")}):
         base.args["battery_power_readiness"] = invalid
         try:
@@ -145,6 +436,13 @@ def test_readiness_defaults_off_and_rejects_invalid_settings(base):
         except ValueError:
             continue
         raise AssertionError("Invalid readiness configuration accepted")
+    for invalid_margin in (-0.1, 10.1, True, float("nan")):
+        base.args["battery_power_readiness"] = {"enabled": True, "daily_energy_margin_kwh": invalid_margin}
+        try:
+            power_readiness.readiness_settings(base)
+        except ValueError:
+            continue
+        raise AssertionError("Invalid daily energy margin accepted")
 
 
 def test_flat_cheap_weekend_and_holiday_buffer_without_changing_reserve(base):
@@ -717,6 +1015,18 @@ def test_continuous_targets_require_real_paired_non_regression(base):
 
 def run_power_readiness_tests(base):
     """Run service-policy and complete native numerical regressions."""
+    test_daily_energy_margin_uses_next_published_cheap_start_and_conservative_net_load(base)
+    test_daily_energy_margin_preserves_peak_debt_before_later_solar_recharge(base)
+    test_daily_energy_margin_never_invents_a_next_cheap_start_from_gaps_or_copied_rates(base)
+    test_daily_margin_native_replay_reports_shared_power_target_shortfall(base)
+    test_daily_margin_replay_reports_shortfall_against_a_raised_service_target(base)
+    test_daily_margin_capacity_cap_is_not_mistaken_for_achieved_energy(base)
+    test_daily_energy_demand_counts_load_below_shared_import_limit(base)
+    test_daily_margin_target_can_exceed_peak_readiness_cap(base)
+    test_daily_demand_is_independent_of_cheap_peak_support_debt(base)
+    test_infeasible_daily_target_reports_shortfall_without_rejecting_safe_candidate(base)
+    test_daily_margin_preserves_a_higher_native_charge_target(base)
+    test_next_published_cheap_start_requires_a_complete_minimum_window(base)
     test_continuous_targets_keep_ev_prices_and_policy_boundaries(base)
     test_continuous_targets_require_real_paired_non_regression(base)
     test_cheap_peak_cover_rejects_unapproved_targets_and_ev_authority(base)
