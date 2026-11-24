@@ -16,11 +16,11 @@ def readiness_settings(base):
     raw = getattr(base, "args", {}).get("battery_power_readiness")
     if raw is None:
         return {"enabled": False}
-    defaults = {"enabled": False, "target_soc_percent": 35, "maximum_soc_percent": 60, "minimum_cheap_minutes": 360, "cheap_price_ceiling": 12.0}
+    defaults = {"enabled": False, "auto_ev_now": False, "target_soc_percent": 35, "maximum_soc_percent": 60, "minimum_cheap_minutes": 360, "cheap_price_ceiling": 12.0}
     if not isinstance(raw, dict) or set(raw) - set(defaults):
         raise ValueError("Invalid power readiness settings")
     settings = {**defaults, **raw}
-    if type(settings["enabled"]) is not bool:
+    if type(settings["enabled"]) is not bool or type(settings["auto_ev_now"]) is not bool:
         raise ValueError("Invalid power readiness enable flag")
     for name, low, high in (("target_soc_percent", 1, 95), ("maximum_soc_percent", 1, 95), ("minimum_cheap_minutes", 30, 2880), ("cheap_price_ceiling", -1000, 1000)):
         value = settings[name]
@@ -38,16 +38,12 @@ def readiness_enabled(base):
     return readiness_settings(base)["enabled"]
 
 
-def readiness_profile(base, options, result, slots):
-    """Derive calendar-independent cheap intervals and energy needed for forecast peak bursts."""
+def cheap_readiness_periods(base, slots, minimum=None):
+    """Share tariff eligibility between domestic targets and temporary EV scheduling priority."""
     settings = readiness_settings(base)
-    inactive = {"active": False, "periods": []}
     if not settings["enabled"]:
-        return inactive
-    if options.get("control_model") != "deye_solarman" or not options.get("grid_charge_support_w"):
-        raise ValueError("Power readiness requires shared grid support")
-    if not slots or len(result.actions) != len(slots):
-        raise ValueError("Incomplete power readiness action timeline")
+        return []
+    minimum = max(settings["minimum_cheap_minutes"], minimum or 0)
     prices = []
     for slot in slots:
         values = [base.rate_import.get(base.minutes_now + slot.start_min + offset) for offset in range(slot.duration_min)]
@@ -72,13 +68,49 @@ def readiness_profile(base, options, result, slots):
         end = base.minutes_now + slots[index - 1].start_min + slots[index - 1].duration_min
         observed_prior_minutes = 0
         if first == 0:
-            for minute in range(start - 5, start - int(settings["minimum_cheap_minutes"]) - 1, -5):
+            for minute in range(start - 5, start - int(minimum) - 1, -5):
                 price = base.rate_import.get(minute)
                 if type(price) not in (int, float) or not math.isfinite(price) or price > threshold:
                     break
                 observed_prior_minutes += 5
-        if end - start + observed_prior_minutes < settings["minimum_cheap_minutes"]:
+        if end - start + observed_prior_minutes < minimum:
             continue
+        periods.append({"first": first, "stop": index, "start": start, "end": end})
+    return periods
+
+
+def current_readiness_period(base, observed_now, minimum=None):
+    """Require a known qualifying cheap band covering the actual wall-clock observation."""
+    slots = [SimpleNamespace(start_min=minute, duration_min=5) for minute in range(0, base.forecast_minutes, 5)]
+    periods = cheap_readiness_periods(base, slots, minimum)
+    minute = (observed_now - base.midnight_utc).total_seconds() / 60
+    return next((period for period in periods if period["start"] <= minute < period["end"]), None)
+
+
+def readiness_ev_priority(base, requested, mode, observed_now):
+    """Temporarily prefer an immediate safe start without writing or losing the requested selector."""
+    settings = readiness_settings(base)
+    if mode != "apply" or requested not in ("cost", "asap") or not settings["enabled"] or not settings["auto_ev_now"]:
+        return requested
+    try:
+        return "now" if current_readiness_period(base, observed_now, minimum=360) else requested
+    except (ValueError, KeyError, AttributeError, TypeError):
+        return requested
+
+
+def readiness_profile(base, options, result, slots):
+    """Derive calendar-independent cheap intervals and energy needed for forecast peak bursts."""
+    settings = readiness_settings(base)
+    inactive = {"active": False, "periods": []}
+    if not settings["enabled"]:
+        return inactive
+    if options.get("control_model") != "deye_solarman" or not options.get("grid_charge_support_w"):
+        raise ValueError("Power readiness requires shared grid support")
+    if not slots or len(result.actions) != len(slots):
+        raise ValueError("Incomplete power readiness action timeline")
+    periods = []
+    for period in cheap_readiness_periods(base, slots):
+        first, index, start, end = (period[name] for name in ("first", "stop", "start", "end"))
         debt = maximum_debt = 0.0
         discharge_efficiency = base.inverter_loss * base.battery_loss_discharge
         charge_efficiency = base.inverter_loss * base.battery_loss
@@ -106,7 +138,7 @@ def readiness_profile(base, options, result, slots):
         "active": True,
         "target_soc_percent": max(period["target_soc_percent"] for period in periods),
         "periods": periods,
-        "cheap_threshold": threshold,
+        "cheap_threshold": settings["cheap_price_ceiling"],
         "minimum_cheap_minutes": settings["minimum_cheap_minutes"],
         "physical_reserve_unchanged_kwh": base.reserve,
         "buffer_usable_for_peak_support": True,

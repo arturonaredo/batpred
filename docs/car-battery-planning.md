@@ -257,6 +257,7 @@ battery support (less any available solar); one hour needs 4 kWh plus losses.
 ```yaml
 battery_power_readiness:
   enabled: true
+  auto_ev_now: false
   target_soc_percent: 35
   maximum_soc_percent: 60
   minimum_cheap_minutes: 360
@@ -294,6 +295,19 @@ before economic replay. Domestic-only service costs are disclosed, not labelled
 as savings against an unprepared battery. Changing the policy, tariff or forecast
 withdraws stale authority. No new relay writer, BMS/current/ToU/peak-shaving
 setting change, physical import clamp or hardware commissioning is implied.
+
+Optionally set `auto_ev_now: true` to use **effective NOW** instead of a selected
+COST or ASAP priority while the current cheap band lasts at least six hours
+(or the configured minimum, if longer). A band only in the future does not
+activate this preference. The selector itself is never written: when the band
+ends the selected priority applies again, including any intervening user change.
+SOLAR is never overridden. Reports retain the selected `ev_charging_priority`
+and disclose `effective_ev_charging_priority` and `readiness_now_override`.
+
+NOW still requires an independently safe immediate EV start. If the battery is
+too low, an eligible readiness service can prepare domestic energy with the EV
+OFF instead of blocking its own recovery. This does not enable the household
+economic optimiser, relax EV pause/restart or cooldown, or grant EV permission.
 
 With the Deye/Solarman adapter, `inverter_grid_support` can name the existing local
 peak-shaving enable and limit observations. Missing, disabled, excessive or invalid
