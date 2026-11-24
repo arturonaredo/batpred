@@ -41,6 +41,12 @@ def test_grid_support_headroom_and_exhaustion():
             assert abs(flow.grid_import_kw + pv + flow.battery_discharge_kw - load - flow.battery_charge_kw - flow.curtailed_kw) < 1e-10
     assert _segment(5, 7.5, 0, 0, 5, "charge", replace(battery, max_discharge_kw=0.5), ev, site) is None
     assert _segment(5, 7.5, 0, 0, 1.01, "charge", battery, ev, site) is None
+    full_flows, full_end = _segment(5, 7.5, 0, 0, 10, "charge", battery, ev, site)
+    assert len(full_flows) == 1
+    assert full_flows[0].battery_charge_kw == 0 and abs(full_flows[0].battery_discharge_kw - 1.5) < 1e-10
+    assert abs(full_flows[0].grid_import_kw - 6) < 1e-10
+    assert abs(full_end - (10 - 1.5 / 12 / battery.discharge_efficiency)) < 1e-10
+    assert _segment(5, 7.5, 0, 0, 1, "charge", battery, ev, site) is None
     flows, end = _segment(5, 4.5, 0, 0, 9.99, "charge", battery, ev, site)
     assert len(flows) == 2 and abs(end - 10) < 1e-10 and all(flow.grid_import_kw <= 6 for flow in flows)
     for value in (True, float("nan"), -1, 7):
@@ -366,8 +372,8 @@ def test_grid_support_replay_rejects_hidden_reserve_tail(base):
     assert abs(check["peak_import_w"] - 6500) < 1e-6 and check["checked_minutes"] == 5
 
 
-def test_grid_support_capped_plan_fails_closed_without_pv_and_accepts_solar(base):
-    """A solver-derived ceiling cannot bypass the cap; PV can make the same EV block safe."""
+def test_grid_support_capped_plan_replays_without_pv_and_with_solar(base):
+    """Battery support can make a no-PV EV schedule safe; both full native traces enforce the cap."""
     safe_solar_plan = None
     for sunny in (False, True):
         _support_fixture(base)
@@ -383,9 +389,13 @@ def test_grid_support_capped_plan_fails_closed_without_pv_and_accepts_solar(base
             options = _options(base)
         chosen, attempts = _continuous_grid_support_shadow(base, options)
         if not sunny:
-            assert chosen is None
-            assert attempts and all(not attempt["native_passed"] for attempt in attempts)
-            assert any("site_import_exceeded" in reasons for attempt in attempts for reasons in attempt["native_reasons"].values())
+            assert chosen is not None
+            result, slots, windows, checks = chosen
+            assert all(check["passed"] and check["checked_minutes"] == 360 and check["peak_import_w"] <= 6000 for check in checks.values())
+            assert all(check["final_ev_kwh"] >= 3 and check["minimum_battery_kwh"] >= base.reserve - 0.002 for check in checks.values())
+            assert all(limit < base.soc_max for limit in windows[2])
+            assert any(action.ev_action == "on" for action in result.actions)
+            assert any(attempt.get("selected") and attempt.get("native_passed") for attempt in attempts)
             continue
 
         assert chosen is not None
@@ -1439,11 +1449,11 @@ def test_household_direct_demand_replay_runs_when_solver_finds_no_candidate(base
 
 
 def test_household_failed_economic_gate_resumes_paired_safe_native_plan(base):
-    """With no prior domestic authority, a rejected candidate leaves the native executor in control."""
+    """Zero-price paired replay has no positive savings, so native execution remains in control."""
     from inverter_service_control import dispatch_template
 
     _household_template_fixture(base)
-    reset_rates(base, 40, 0)
+    reset_rates(base, 0, 0)
     base.soc_kw = 20
     with patch("car_charging_plan._observation_clock", return_value=base.now_utc):
         report = evaluate_car_charging(base, publish=False)
@@ -1472,7 +1482,7 @@ def test_household_rejected_candidate_reports_conflict_when_native_replay_fails(
     from inverter_service_control import dispatch_template
 
     _household_template_fixture(base)
-    reset_rates(base, 40, 0)
+    reset_rates(base, 0, 0)
     base.soc_kw = 20
     with patch("car_charging_plan._observation_clock", return_value=base.now_utc):
         report = evaluate_car_charging(base, publish=False)
@@ -1497,7 +1507,7 @@ def test_household_prior_temporary_authority_is_cancelled_before_native_handoff(
     from inverter_service_control import dispatch_template
 
     _household_template_fixture(base)
-    reset_rates(base, 40, 0)
+    reset_rates(base, 0, 0)
     base.soc_kw = 20
     with patch("car_charging_plan._observation_clock", return_value=base.now_utc):
         report = evaluate_car_charging(base, publish=False)
@@ -1789,9 +1799,9 @@ def test_domestic_economic_fallback_remains_default_false(base):
 
 
 def test_household_fallback_keeps_demand_when_arbitrage_does_not_save(base):
-    """A household candidate must improve componentwise on the ordinary native baseline."""
+    """Zero-price paired outcomes cannot manufacture a positive improvement over native."""
     _household_template_fixture(base)
-    reset_rates(base, 40, 0)
+    reset_rates(base, 0, 0)
     base.soc_kw = 20
     with patch("car_charging_plan._observation_clock", return_value=base.now_utc):
         report = evaluate_car_charging(base, publish=False)
@@ -1852,7 +1862,7 @@ def run_car_planning_grid_support_tests(base):
     test_cost_priority_compares_safe_initial_demand_with_ordinary_candidate()
     test_apply_cost_refines_representative_starts_even_after_a_feasible_result()
     test_grid_support_replay_rejects_hidden_reserve_tail(base)
-    test_grid_support_capped_plan_fails_closed_without_pv_and_accepts_solar(base)
+    test_grid_support_capped_plan_replays_without_pv_and_with_solar(base)
     test_incident_shaped_early_100_at_19_1_is_rejected_for_native_88_at_8_1(base)
     test_unsafe_configured_battery_candidate_can_select_safe_native_reference(base)
     test_failed_continuous_battery_replay_is_retained_for_native_alternative_only(base)

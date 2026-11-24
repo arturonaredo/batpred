@@ -7,7 +7,24 @@ from prediction import Prediction
 from tests.test_car_planning_native import _fixture
 
 
-def _prediction(base, load=6.52, pv=0, soc=5, support=6000, charge=3, discharge=8.192, inverter=16, loss=0.96, battery_loss=0.97, hybrid=True, kernel=False, minutes=5):
+def _prediction(
+    base,
+    load=6.52,
+    pv=0,
+    soc=5,
+    support=6000,
+    charge=3,
+    discharge=8.192,
+    inverter=16,
+    loss=0.96,
+    battery_loss=0.97,
+    hybrid=True,
+    kernel=False,
+    minutes=5,
+    ev_slot=False,
+    reserve_enable=False,
+    discharge_during_charge=True,
+):
     """Use real native construction and five-minute forecasts, never patch physics after construction."""
     forecasts = _fixture(base, load=load, pv=pv, minutes=minutes)
     model = copy(base)
@@ -18,10 +35,22 @@ def _prediction(base, load=6.52, pv=0, soc=5, support=6000, charge=3, discharge=
     model.charge_rate_now = model.battery_rate_max_charge = model.battery_rate_max_charge_dc = charge / 60
     model.discharge_rate_now = model.battery_rate_max_discharge = discharge / 60
     model.inverter_limit = inverter / 60
-    model.set_discharge_during_charge = model.set_charge_window = True
-    model.set_reserve_enable = model.set_charge_freeze = False
+    model.set_discharge_during_charge = discharge_during_charge
+    model.set_charge_window = True
+    model.set_reserve_enable = reserve_enable
+    model.set_charge_freeze = False
     model.battery_charge_power_curve = model.battery_discharge_power_curve = {}
     model.prediction_kernel_enable = kernel
+    if ev_slot:
+        model.num_cars = 1
+        model.car_charging_slots = [[{"start": model.minutes_now, "end": model.minutes_now + minutes, "kwh": 7 * minutes / 60, "average": 10, "octopus": False}]]
+        model.car_charging_soc = [0.0]
+        model.car_charging_soc_next = [None]
+        model.car_charging_limit = [100.0]
+        model.car_charging_limit_model = None
+        model.car_charging_loss = 1.0
+        model.car_charging_from_battery = False
+        model.car_energy_reported_load = True
     if support is not None:
         model.plan_grid_charge_support_w = support
     pred = Prediction(model, forecasts.pv_forecast_minute_step, forecasts.pv_forecast_minute10_step, forecasts.load_minutes_step, forecasts.load_minutes_step10)
@@ -116,7 +145,7 @@ def test_grid_support_soc_boundaries_and_reuse(base):
     _run(pred)
     _assert_step(pred, 4.5 + 0.01 * 12 / 0.97 / 0.96, 8)
     assert abs(pred.plan_grid_support_import[0][1] - 6000) < 1e-6
-    for soc, window in ((8, True), (5, False)):
+    for soc, window in ((5, False),):
         pred, _ = _prediction(base, soc=soc)
         other, _ = _prediction(base, soc=soc, support=0)
         assert _run(pred, window=window) == _run(other, window=window)
@@ -128,8 +157,43 @@ def test_grid_support_soc_boundaries_and_reuse(base):
     assert len(pred.plan_grid_support_import) == 1 and pred.plan_grid_support_import != before
 
 
+def test_grid_support_remains_active_at_and_above_charge_target(base):
+    """A reached charge target and its native deadband stop charging, not bounded load support."""
+    for soc in (8.0, 8.05, 8.2):
+        pred, _ = _prediction(
+            base,
+            load=6.5,
+            soc=soc,
+            reserve_enable=soc == 8.05,
+            discharge_during_charge=soc != 8.05,
+        )
+        _run(pred, target=8)
+        _assert_step(pred, 6, soc - 0.5 / 12 / 0.96 / 0.97)
+
+    ordinary, _ = _prediction(base, load=6.5, soc=8, support=0)
+    _run(ordinary, target=8)
+    assert ordinary.final_soc == 8
+    assert max(ordinary.predict_grid_power.values()) > 6
+
+
+def test_grid_support_is_independent_of_an_active_ev_slot(base):
+    """A fixed EV load cannot disable the explicitly enabled shared-support physics."""
+    pred, _ = _prediction(base, load=0.5, soc=8, ev_slot=True)
+    _run(pred, target=8)
+    assert pred.plan_grid_support_import[0] == (6000, 6000)
+    assert pred.final_soc < 8
+    assert pred.final_car_soc[0] > 0
+
+
 def run_prediction_grid_support_tests(base):
     """Run non-vacuous native regressions through the registered test harness."""
-    for test in (test_grid_support_defaults_and_kernel, test_grid_support_signed_flow_and_loss, test_grid_support_pv_and_source_limits, test_grid_support_soc_boundaries_and_reuse):
+    for test in (
+        test_grid_support_defaults_and_kernel,
+        test_grid_support_signed_flow_and_loss,
+        test_grid_support_pv_and_source_limits,
+        test_grid_support_soc_boundaries_and_reuse,
+        test_grid_support_remains_active_at_and_above_charge_target,
+        test_grid_support_is_independent_of_an_active_ev_slot,
+    ):
         test(base)
     return False
