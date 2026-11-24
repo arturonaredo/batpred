@@ -35,7 +35,11 @@ import asyncio
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import json
+import os
 import re
+import shutil
+import subprocess
+import tempfile
 from types import SimpleNamespace
 
 from car_charging_view import (
@@ -765,6 +769,174 @@ def test_html_plan_contains_no_second_table():
     assert "<table" not in clean, clean
 
 
+def test_html_plan_includes_the_scoped_combined_plan_graph():
+    """The /plan page opts into the graph without changing its embedded data contract."""
+    page = _build_page(_good_report())
+    html = asyncio.run(page.html_plan(SimpleNamespace(rel_url=SimpleNamespace(query={})))).text
+    assert "renderPredbatPlanGraph" in html, html
+    assert 'id="planContainer"' in html
+    assert 'id="planGraphRoot"' not in html  # mounted from live rows, not demo markup
+    assert "setInterval(fetchAndRenderPlan, 5000)" in html
+
+
+def _plan_graph_browser_rows():
+    """Return literal forecast rows spanning 48 elapsed hours, with a partial slot and a gap."""
+    start = datetime(2026, 11, 1, 3, 45, tzinfo=timezone.utc)
+    stop = start + timedelta(hours=48)
+    rows = []
+    cursor = start
+    index = 0
+    while cursor < stop:
+        horizon_end = start + timedelta(hours=24 if cursor < start + timedelta(hours=24) else 48)
+        minutes = min(15 if index == 0 else 30, int((horizon_end - cursor).total_seconds() / 60))
+        next_cursor = cursor + timedelta(minutes=minutes)
+        if index != 12:  # An intentional missing interval must stay visibly empty.
+            rows.append(
+                {
+                    "time": cursor.isoformat(),
+                    "plan_interval_end": next_cursor.isoformat(),
+                    "soc_percent": 50 + index / 10,
+                    "soc_end_percent": 50.1 + index / 10,
+                    "pv_forecast": 0.3 if index == 0 else 0.2,
+                    "load_forecast": 0.1 if index == 0 else 0.2,
+                    "car_charging": 0.25 if index == 4 else 0,
+                    "import_rate": 12.5,
+                    "cost_change": 0.02,
+                    "plan_action": "Charge",
+                    "plan_reason": "<img src=x onerror=window.graphXss=true> forecast",
+                }
+            )
+        cursor = next_cursor
+        index += 1
+    return rows
+
+
+def _run_plan_graph_browser(data, exercise_graph):
+    """Execute the real Plan renderer in headless Chrome and return its DOM assertions."""
+    import web_helper
+
+    graph_renderer = getattr(web_helper, "get_plan_graph_js", None)
+    assert callable(graph_renderer), "the scoped /plan graph renderer is missing"
+    chrome = shutil.which("google-chrome") or shutil.which("chromium") or shutil.which("chromium-browser")
+    if not chrome:
+        return None
+    encoded_data = json.dumps(data, allow_nan=False).replace("</", "<\\/")
+    document = """<!doctype html>
+<html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Plan graph browser test</title></head><body>
+<div id="carChargingPreview"></div><div id="staleWarning" style="display:none"></div>
+<div id="planError" style="display:none"></div><input id="debugToggle" type="checkbox"><span id="planTimestamp"></span>
+<div id="planContainer"></div><pre id="graphTestResults"></pre>
+<script>window.planData = DATA;</script>
+""".replace("DATA", encoded_data)
+    document += web_helper.get_plan_renderer_js()
+    document += graph_renderer()
+    document += "<script>" + exercise_graph + "</script></body></html>"
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".html", encoding="utf-8", dir="/tmp/opencode") as page_file:
+        page_file.write(document)
+        page_file.flush()
+        result = subprocess.run(
+            [chrome, "--headless", "--no-sandbox", "--disable-gpu", "--force-time-zone=America/New_York", "--window-size=1280,900", "--virtual-time-budget=1500", "--dump-dom", "file://" + page_file.name],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+            env={**os.environ, "TZ": "America/New_York"},
+        )
+    assert result.returncode == 0, result.stderr
+    match = re.search(r'<pre id="graphTestResults">(.*?)</pre>', result.stdout, flags=re.DOTALL)
+    assert match, result.stdout
+    assert match.group(1).strip(), result.stdout + result.stderr
+    return json.loads(match.group(1))
+
+
+def test_plan_graph_browser_uses_interval_data_and_safe_accessible_details():
+    """The browser plots real partial intervals, leaves gaps blank, and safely opens details."""
+    data = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "plan_simulation": True,
+        "currency_symbols": ["£", "p"],
+        "recorded_cost": 1.25,
+        "rows": _plan_graph_browser_rows(),
+    }
+    exercise = r"""
+window.planData.rows[6].pv_forecast = Number.NaN;
+refreshPlan();
+const root = document.getElementById('planGraphRoot');
+const chart = root.querySelector('svg[role="img"]');
+const range24 = root.querySelector('[data-range="24"]');
+const range48 = root.querySelector('[data-range="48"]');
+const solarTitle = root.querySelector('.plan-graph-solar-segment title');
+const solarSegmentCount = root.querySelectorAll('.plan-graph-solar-segment').length;
+const initialRows = window.planData.rows.length;
+const invalidValueWarning = root.querySelector('#planGraphAlert').textContent;
+const axis = Array.from(root.querySelectorAll('.plan-graph-axis-label')).map(node => node.textContent).join(' ');
+const gapCount = root.querySelectorAll('.plan-graph-gap').length;
+const detailsButton = root.querySelector('#planGraphDetails');
+const dialog = root.querySelector('dialog');
+const initiallyClosed = !dialog.open;
+const drawerLabelled = !!document.getElementById(dialog.getAttribute('aria-labelledby'));
+const timestampHidden = document.getElementById('planTimestamp').style.display === 'none';
+range24.click();
+const range24Pressed = range24.getAttribute('aria-pressed');
+root.querySelector('svg').dispatchEvent(new KeyboardEvent('keydown', {key:'ArrowRight', bubbles:true}));
+detailsButton.focus();
+detailsButton.click();
+const focusOnOpen = document.activeElement.id;
+const hostileTextStayedText = root.textContent.includes('<img src=x onerror=window.graphXss=true>') && !root.querySelector('img');
+const drawerText = dialog.textContent;
+const drawerHasCostAndTimestamp = drawerText.includes('Coste estimado del intervalo') && drawerText.includes('2026');
+const drawerHasPublishedTimestamp = dialog.querySelector('#planGraphSummary').textContent.includes('Datos actualizados');
+refreshPlan();
+const updatedDialog = document.querySelector('#planGraphDialog');
+const drawerSurvivesRefresh = updatedDialog.open && document.activeElement.id === 'planGraphClose';
+updatedDialog.addEventListener('close', () => setTimeout(() => {
+  const focusRestored = document.activeElement === document.querySelector('#planGraphDetails');
+  const shortRows = window.planData.rows.slice(0, 4);
+  window.planData = {...window.planData, rows: shortRows};
+  refreshPlan();
+  const unsupportedRangeHidden = document.querySelectorAll('#planGraphRoot [data-range]').length === 0;
+  window.planData = {...window.planData, plan_unavailable:true};
+  refreshPlan();
+  const unavailableCleared = !document.querySelector('#planGraphRoot .plan-graph-battery-line') && /no hay|no se puede/i.test(document.querySelector('#planGraphRoot').textContent);
+  window.planData = {...window.planData, plan_unavailable:false, plan_simulation:false, plan_execution:true, execution_blocked:'receipt invalid'};
+  refreshPlan();
+  const blockedCleared = !document.querySelector('#planGraphRoot .plan-graph-battery-line') && /bloqueado/i.test(document.querySelector('#planGraphRoot').textContent);
+  window.planData = {...window.planData, execution_blocked:false};
+  window.planData = {...window.planData, plan_unavailable:false, timestamp:new Date(Date.now() - 3600000).toISOString()};
+  refreshPlan();
+  const staleCleared = !document.querySelector('#planGraphRoot .plan-graph-battery-line') && document.getElementById('staleWarning').style.display === 'block';
+  const timestampVisibleWhenStale = document.getElementById('planTimestamp').style.display !== 'none';
+  document.getElementById('graphTestResults').textContent = JSON.stringify({
+    range24:!!range24, range48:!!range48, range24Pressed, solarTitle:solarTitle && solarTitle.textContent,
+    solarSegmentCount, inputRows:initialRows, invalidValueWarning, gapCount, axis, initiallyClosed, drawerLabelled,
+    timestampHidden, focusOnOpen, focusRestored, drawerSurvivesRefresh, drawerHasCostAndTimestamp,
+    drawerHasPublishedTimestamp, hostileTextStayedText, xss:window.graphXss === true,
+    unsupportedRangeHidden, unavailableCleared, blockedCleared, staleCleared, timestampVisibleWhenStale
+  });
+}, 0), {once:true});
+document.querySelector('#planGraphClose').click();
+"""
+    result = _run_plan_graph_browser(data, exercise)
+    if result is None:
+        return
+    assert result["range24"] and result["range48"], result
+    assert result["range24Pressed"] == "true", result
+    assert "1,20 kW" in result["solarTitle"], result
+    assert result["solarSegmentCount"] < result["inputRows"], result
+    assert "valor" in result["invalidValueWarning"].lower(), result
+    assert result["gapCount"] > 0, result
+    assert "GMT-4" in result["axis"] and "GMT-5" in result["axis"], result
+    assert result["initiallyClosed"] and result["focusOnOpen"] == "planGraphClose", result
+    assert result["drawerLabelled"], result
+    assert result["timestampHidden"] and result["drawerHasPublishedTimestamp"], result
+    assert result["drawerHasCostAndTimestamp"] and result["drawerSurvivesRefresh"], result
+    assert result["focusRestored"] and result["hostileTextStayedText"] and not result["xss"], result
+    assert result["unsupportedRangeHidden"], result
+    assert result["unavailableCleared"] and result["blockedCleared"] and result["staleCleared"], result
+    assert result["timestampVisibleWhenStale"], result
+
+
 def test_html_plan_embeds_car_planning_plan_data_with_car_planning_simulation_flag():
     """window.planData is the combined display, with plan_simulation=true and rows from the preview."""
     page = _build_page(_good_report())
@@ -1142,6 +1314,8 @@ def run_car_planning_single_table_tests(base):
         test_get_car_planning_preview_update_js_returns_empty,
         test_get_car_planning_preview_update_js_never_contains_fetch,
         test_html_plan_contains_no_second_table,
+        test_html_plan_includes_the_scoped_combined_plan_graph,
+        test_plan_graph_browser_uses_interval_data_and_safe_accessible_details,
         test_html_plan_embeds_car_planning_plan_data_with_car_planning_simulation_flag,
         test_html_plan_plan_data_timestamp_is_report_generated_at,
         test_html_plan_car_planning_banner_appears_above_container,
