@@ -15,7 +15,9 @@ table without changing the native executable schedule:
   instead of the simulated candidate. A stale / missing / future / false
   authority receipt clears the rows and surfaces a compact
   execution-blocked reason without ever falling back to the unrelated
-  native plan and without claiming success.
+  native plan and without claiming success. A narrowly validated domestic
+  power-readiness observation may have no chart preview; it remains observed
+  but unavailable, with no fabricated trajectory or hardware-confirmation claim.
 
 No inputs are mutated; the module never calls a HA service, never writes to
 the inverter and never acquires the executable plan.
@@ -362,21 +364,8 @@ def _applied_receipt_fresh(report, now):
     return True
 
 
-def _applied_display_allowed(report, now, paired):
-    """The full gate for rendering the applied-plan banner.
-
-    A "valid applied display" requires every one of:
-    * ``paired`` is not ``None`` (preview rows must be available);
-    * the receipt authority is fresh (see :func:`_applied_receipt_fresh`);
-    * the report is *not* a stale-SoC hypothesis;
-    * the report is *not* marked ``counterfactual_controls``.
-
-    Anything else collapses to the execution-blocked branch — never the
-    read-only simulation branch and never a fall-through to the unrelated
-    native plan.
-    """
-    if paired is None:
-        return False
+def _applied_display_evidence_valid(report, now):
+    """Validate applied authority and timestamps independently of chart rows."""
     if not isinstance(report, dict):
         return False
     if not _applied_receipt_fresh(report, now):
@@ -395,6 +384,53 @@ def _applied_display_allowed(report, now, paired):
     if generated_at > observed or generated_at > now or now - generated_at >= timedelta(minutes=10):
         return False
     return True
+
+
+def _applied_display_allowed(report, now, paired):
+    """Require both a valid applied receipt and paired rows for the active chart."""
+    return paired is not None and _applied_display_evidence_valid(report, now)
+
+
+def _domestic_readiness_without_preview_allowed(report, now):
+    """Recognise only fresh, paired-safe domestic execution with no EV chart."""
+    if not isinstance(report, dict) or report.get("status") != "applied":
+        return False
+    if report.get("preview") not in (None, {}):
+        return False
+    if not _applied_display_evidence_valid(report, now):
+        return False
+    if (
+        report.get("domestic_only") is not True
+        or report.get("power_readiness_service") is not True
+        or report.get("household_executor") != "grid_charge_support"
+        or report.get("ev_available") is not False
+        or report.get("ev_soc_not_required") is not True
+        or report.get("proposed_ev_windows") != []
+        or report.get("execution_blockers") != []
+        or report.get("execution_reason") != "inverter_observed_not_hardware_confirmed"
+        or report.get("hardware_confirmed") is not False
+    ):
+        return False
+    readiness = report.get("power_readiness")
+    checks = report.get("native_checks")
+    if not isinstance(readiness, dict) or readiness.get("active") is not True:
+        return False
+    if not isinstance(checks, dict) or set(checks) != {"nominal", "pv10"}:
+        return False
+    plan_hours = report.get("forecast_plan_hours")
+    if not _is_finite(plan_hours) or not 8 <= plan_hours <= 96 or plan_hours % 1:
+        return False
+    expected_minutes = int(plan_hours * 60)
+    checked_minutes = []
+    for scenario in ("nominal", "pv10"):
+        check = checks.get(scenario)
+        if not isinstance(check, dict) or check.get("passed") is not True:
+            return False
+        minutes = check.get("checked_minutes")
+        if type(minutes) is not int or minutes <= 0:
+            return False
+        checked_minutes.append(minutes)
+    return checked_minutes[0] == checked_minutes[1] == expected_minutes
 
 
 def _paired_preview(report, now):
@@ -510,10 +546,11 @@ def build_car_charging_plan_view(native_plan, report, now=None):
     ``view['plan_execution']`` is ``True`` and ``view['plan_simulation']``
     is ``False`` — this is the actual applied plan, not a simulation. When
     the applied display is invalid (expired / missing / future / false
-    authority / blocked / missing preview / stale ``generated_at``) the rows
-    are cleared and ``view['execution_blocked']`` carries a bounded
-    reason. Parent ``status='apply_blocked'`` reports also land here and
-    preserve the shadow candidate behaviour for shadow statuses.
+    authority / blocked / invalid paired preview / stale ``generated_at``)
+    the rows are cleared and ``view['execution_blocked']`` carries a bounded
+    reason. A narrowly validated domestic power-readiness observation with
+    no chart preview is marked unavailable without being called blocked.
+    Parent ``status='apply_blocked'`` reports still land in the blocked path.
     """
     if not isinstance(report, dict) or report.get("status") in ("disabled", "household_fallback"):
         return native_plan
@@ -526,6 +563,7 @@ def build_car_charging_plan_view(native_plan, report, now=None):
     is_applied = status == "applied"
     is_blocked = status == "apply_blocked"
     paired = _paired_preview(report, now) if status not in (None, "disabled") else None
+    domestic_without_preview = is_applied and paired is None and _domestic_readiness_without_preview_allowed(report, now)
     # Validate the complete paired replay before limiting the visible horizon.
     # The preview builder splits at this exact boundary, preserving real SOC,
     # energy and cost endpoints instead of interpolating a partial row.
@@ -545,6 +583,16 @@ def build_car_charging_plan_view(native_plan, report, now=None):
         view["plan_execution"] = True
         view["execution_observed_at"] = report.get("execution_observed_at")
         view["execution_valid_until"] = report.get("execution_valid_until")
+    elif domestic_without_preview:
+        # Preserve the fresh command observation, but never invent chart rows
+        # from the native forecast or imply that hardware state was confirmed.
+        view["plan_simulation"] = False
+        view["plan_execution"] = True
+        view["plan_unavailable"] = True
+        view["num_cars"] = 0
+        view["execution_observed_at"] = report.get("execution_observed_at")
+        view["execution_valid_until"] = report.get("execution_valid_until")
+        return view
     elif is_applied or is_blocked:
         # Applied or apply_blocked: surface the execution-blocked view with a
         # bounded reason. Never fall back to the native plan, never claim
@@ -920,12 +968,14 @@ def render_car_charging_preview(report, native_diagnostic, now=None):
     block; the graph's initially closed details drawer carries it. An
     explicitly authorized partial target remains visible. For an
     applied-but-invalid receipt
-    (expired / missing / future / false authority / blocked / missing
+    (expired / missing / future / false authority / blocked / invalid paired
     preview / stale ``generated_at``) the compact carries a bounded
-    execution-blocked reason. Parent ``status='apply_blocked'`` reports
-    take the same execution-blocked branch. The native-grid-limit diagnostic
-    remains visible only when no applied receipt is in force; once applied,
-    the obsolete counterfactual is moved into the Show-Debug detail span.
+    execution-blocked reason. A fresh domestic power-readiness observation
+    with passing paired safety checks but no chart rows is reported as
+    observed, with no trajectory or EV schedule fabricated. Parent
+    ``status='apply_blocked'`` reports take the execution-blocked branch.
+    A native import-limit diagnostic is labelled as a baseline forecast and
+    remains visible when the applied report has no chart preview.
     """
     if not isinstance(report, dict) and not isinstance(native_diagnostic, dict):
         return ""
@@ -937,6 +987,7 @@ def render_car_charging_preview(report, native_diagnostic, now=None):
     is_applied = status == "applied"
     is_blocked = status == "apply_blocked"
     paired = _paired_preview(report, now) if active else None
+    domestic_without_preview = is_applied and paired is None and _domestic_readiness_without_preview_allowed(report, now)
     applied_fresh = _applied_display_allowed(report, now, paired)
     compact = []
     debug_parts = []
@@ -957,6 +1008,9 @@ def render_car_charging_preview(report, native_diagnostic, now=None):
             if _is_exceeded(*_parse_native_diag(native_diagnostic)):
                 compact.append("native grid limit exceeded")
             compact.append("Details: Show Debug")
+    elif domestic_without_preview:
+        compact.append("Domestic power-readiness command observed")
+        compact.append("paired chart preview unavailable")
     elif (is_applied or is_blocked) and active:
         compact.append("execution blocked: {}".format(_applied_block_reason(report, now)))
     if applied_fresh:
@@ -964,6 +1018,12 @@ def render_car_charging_preview(report, native_diagnostic, now=None):
         # applied-plan context. Keep the preview root and its debug evidence,
         # but do not put a second explanatory headline above the graph.
         banner = ""
+    elif domestic_without_preview:
+        banner = (
+            '<div class="car-charging-preview-banner"><strong>Domestic power-readiness command observed:</strong> '
+            "paired chart preview unavailable; no battery trajectory or EV schedule is shown. "
+            "Home Assistant/inverter observation is not hardware-confirmed.</div>"
+        )
     elif (is_applied or is_blocked) and active:
         banner = (
             '<div class="car-charging-preview-banner" role="alert"><strong>Execution blocked:</strong> '
@@ -979,7 +1039,8 @@ def render_car_charging_preview(report, native_diagnostic, now=None):
             '<div class="car-charging-preview-banner"><strong>EV candidate — read-only simulation:</strong> '
             '<span class="car-charging-preview-debug" style="display:none;">'
             "the existing Plan table displays this candidate and its own native-replay SOC, not the native control schedule. "
-            "No inverter or EV commands are issued. The table keeps its original SOC/arrow format. Replay endpoints, PV10 and grid peaks are available in Dev (car_charging_report); EV kWh is a full-power reservation, not measured delivery.</span></div>"
+            "No inverter or EV commands are issued. The table keeps its original SOC/arrow format. Replay endpoints, PV10 and grid peaks are available in Dev (car_charging_report); "
+            "EV kWh is a full-power reservation, not measured delivery.</span></div>"
             if active
             else '<div class="car-charging-preview-banner"><strong>Native plan view:</strong> the existing table shows the native schedule, not a combined candidate.</div>'
         )
@@ -993,7 +1054,12 @@ def render_car_charging_preview(report, native_diagnostic, now=None):
         if applied_fresh:
             debug_parts.append("Observed: {}".format(_safe_iso(report.get("execution_observed_at"))))
             debug_parts.append("Valid until: {}".format(_safe_iso(report.get("execution_valid_until"))))
-        if (is_applied or is_blocked) and not applied_fresh:
+        if domestic_without_preview:
+            debug_parts.append("Display: paired chart preview unavailable")
+            debug_parts.append("Command observed: {}".format(_safe_iso(report.get("execution_observed_at"))))
+            debug_parts.append("Valid until: {}".format(_safe_iso(report.get("execution_valid_until"))))
+            debug_parts.append("Hardware confirmed: no")
+        elif (is_applied or is_blocked) and not applied_fresh:
             debug_parts.append("Reason: {}".format(escape(_applied_block_reason(report, now))))
         debug_parts.append("Status: {}".format(escape(str(status))))
         debug_parts.append("Generated: {}".format(_safe_iso(report.get("generated_at"))))
@@ -1017,12 +1083,11 @@ def render_car_charging_preview(report, native_diagnostic, now=None):
                 if compact and not (is_applied or is_blocked)
                 else '<div class="car-charging-preview-warning" role="alert" style="padding:10px;background:#fee;color:#a00;border:1px solid #c00;">'
             )
-            + "<strong>Native import "
-            'limit exceeded:</strong> native control plan, not the displayed simulation. <span class="car-charging-preview-debug" style="display:none;">Peak {peak} W over a {limit} W limit '
-            "for {minutes} minute(s) in the native control plan (not the displayed combined candidate). This is "
-            "a diagnostic indicator of the native plan, not an enforcement "
+            + "<strong>Baseline native import forecast exceeds the configured limit (Native import limit exceeded):</strong> "
+            "Forecast peak {peak} W over a {limit} W configured import limit for {minutes} minute(s) in the baseline native plan; "
+            'this is a forecast diagnostic, not current measured load or the applied plan. <span class="car-charging-preview-debug" style="display:none;">This is not an enforcement '
             "action and not a service outage claim.".format(
-                peak=_format_finite(peak_w, 0),
+                peak=_format_finite(peak_w, 3),
                 limit=_format_finite(limit_w, 0),
                 minutes=_format_finite(minutes_over, 0),
             )
@@ -1031,7 +1096,8 @@ def render_car_charging_preview(report, native_diagnostic, now=None):
     elif native_exceeded and applied_fresh:
         parts.append(
             '<div class="car-charging-preview-warning car-charging-preview-debug" role="alert" style="display:none;padding:10px;background:#fee;color:#a00;border:1px solid #c00;"><strong>Native import '
-            'limit exceeded (obsolete native counterfactual):</strong> shown for diagnostic distinction only; the displayed plan is the active applied receipt. <span class="car-charging-preview-debug" style="display:none;">Peak {peak} W over a {limit} W limit '
+            "limit exceeded (obsolete native counterfactual):</strong> shown for diagnostic distinction only; the displayed plan is the active applied receipt. "
+            '<span class="car-charging-preview-debug" style="display:none;">Peak {peak} W over a {limit} W limit '
             "for {minutes} minute(s) in the native control plan (not the displayed active plan). This is "
             "a diagnostic indicator of the obsolete native plan, not an enforcement "
             "action against the applied receipt.".format(
@@ -1043,6 +1109,12 @@ def render_car_charging_preview(report, native_diagnostic, now=None):
         )
     if not isinstance(report, dict):
         parts.append("<p>No EV/battery planning report is available. No candidate is shown.</p></section>")
+        return "".join(parts)
+    if domestic_without_preview:
+        parts.append('<div class="car-charging-preview-info">Command observation is current; no paired chart preview is available. No trajectory or EV schedule is shown.</div>')
+        if debug_parts:
+            parts.append('<div class="car-charging-preview-debug" style="display:none;">' + "<br>".join(debug_parts) + "</div>")
+        parts.append("</section>")
         return "".join(parts)
     if (is_applied or is_blocked) and not applied_fresh:
         # Stale-SoC and conditional labels are only meaningful for shadow /

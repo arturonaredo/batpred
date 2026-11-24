@@ -95,7 +95,7 @@ def test_web_preview_entry_points(base):
     assert "conditional" in data["car_charging_view"].lower()
     html = asyncio.run(page.html_plan(request)).text
     assert 'id="carChargingPreview"' in html and 'id="planContainer"' in html
-    assert "7716" in html or "7.72" in html
+    assert "7715.771" in html
     assert "window.planData" in html and json.dumps(native) not in html
     assert '<table class="car-charging-preview-table"' not in html
     assert (native, diagnostic, candidate) == before

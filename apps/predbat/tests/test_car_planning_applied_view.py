@@ -133,6 +133,33 @@ def _applied_report(**overrides):
     return _good_report(now=now, **base)
 
 
+def _domestic_readiness_applied_report(now=None, **overrides):
+    """Mirror an applied household power-readiness report without chart rows."""
+    now = now if now is not None else _wall_now()
+    receipt_options = {}
+    for key in ("observed_at", "valid_until", "interval_seconds", "generated_minutes_ago"):
+        if key in overrides:
+            receipt_options[key] = overrides.pop(key)
+    report = _applied_report(now=now, **receipt_options)
+    report.pop("preview")
+    report.update(
+        domestic_only=True,
+        power_readiness_service=True,
+        power_readiness={"active": True, "target_soc_percent": 35},
+        household_executor="grid_charge_support",
+        ev_available=False,
+        ev_soc_not_required=True,
+        proposed_ev_windows=[],
+        execution_blockers=[],
+        execution_reason="inverter_observed_not_hardware_confirmed",
+        hardware_confirmed=False,
+        forecast_plan_hours=48,
+        native_checks={name: {"passed": True, "checked_minutes": 2880} for name in ("nominal", "pv10")},
+    )
+    report.update(overrides)
+    return report
+
+
 def _native_plan():
     """Provide native display metadata without a candidate trajectory."""
     return {
@@ -626,6 +653,76 @@ def test_html_api_plan_data_emits_car_planning_execution_for_fresh_applied():
     assert "execution_blocked" not in data["plan"], data
 
 
+def test_html_api_plan_data_shows_domestic_readiness_without_preview_as_observed():
+    """A fresh domestic command without a paired chart is not reported as blocked or plotted."""
+    now = _wall_now()
+    report = _domestic_readiness_applied_report(now=now)
+    diagnostic = _native_diag("exceeded", peak_w=9969.783, limit_w=6000, minutes_over=130)
+    page = _build_page(report, diag=diagnostic)
+    data = json.loads(asyncio.run(page.html_api_plan_data(SimpleNamespace(rel_url=SimpleNamespace(query={})))).text)
+    plan = data["plan"]
+    assert plan["rows"] == [], plan
+    assert plan["plan_execution"] is True and plan["plan_simulation"] is False, plan
+    assert plan["plan_unavailable"] is True and "execution_blocked" not in plan, plan
+    assert plan["num_cars"] == 0, plan
+    assert report["proposed_ev_windows"] == [] and report["ev_available"] is False, report
+
+    preview = data["car_charging_view"]
+    assert "execution blocked" not in preview.lower(), preview
+    assert "Domestic power-readiness command observed" in preview, preview
+    assert "paired chart preview unavailable" in preview, preview
+    assert "not hardware-confirmed" in preview, preview
+    assert "Baseline native import forecast exceeds the configured limit" in preview, preview
+    warning = re.search(r'<div class="car-charging-preview-warning" role="alert"[^>]*>(.*?)</div>', preview, flags=re.DOTALL)
+    assert warning, preview
+    visible_warning = re.sub(r'<span class="car-charging-preview-debug"[^>]*>.*?</span>', "", warning.group(1), flags=re.DOTALL)
+    assert "9969.783 W" in visible_warning and "6000 W" in visible_warning and "130 minute" in visible_warning, visible_warning
+    assert "not current measured load" in visible_warning, visible_warning
+    assert "830" not in preview, "The view must not invent a current load value"
+    assert "Active plan" not in preview, preview
+
+
+def test_domestic_missing_preview_still_fails_closed_on_stale_or_invalid_evidence():
+    """The no-chart exception must retain receipt, blocker, paired-check and EV gates."""
+    now = _wall_now()
+    cases = {
+        "expired receipt": _domestic_readiness_applied_report(
+            now=now,
+            observed_at=now - timedelta(minutes=6),
+            interval_seconds=300,
+        ),
+        "stale generated report": _domestic_readiness_applied_report(
+            now=now,
+            generated_at=(now - timedelta(minutes=30)).isoformat(),
+        ),
+        "declared blocker": _domestic_readiness_applied_report(now=now, execution_blockers=["native_checks_failed"]),
+        "failed PV10 check": _domestic_readiness_applied_report(
+            now=now,
+            native_checks={
+                "nominal": {"passed": True, "checked_minutes": 2880},
+                "pv10": {"passed": False, "checked_minutes": 2880},
+            },
+        ),
+        "incomplete paired-check horizon": _domestic_readiness_applied_report(
+            now=now,
+            native_checks={
+                "nominal": {"passed": True, "checked_minutes": 60},
+                "pv10": {"passed": True, "checked_minutes": 60},
+            },
+        ),
+        "invalid chart payload": _domestic_readiness_applied_report(now=now, preview={"nominal": [], "pv10": []}),
+        "unexpected EV window": _domestic_readiness_applied_report(now=now, proposed_ev_windows=[{"start": 720, "end": 780}]),
+        "hardware confirmation claim": _domestic_readiness_applied_report(now=now, hardware_confirmed=True),
+    }
+    for label, report in cases.items():
+        view = build_car_charging_plan_view(_native_plan(), report, now=now)
+        assert view["rows"] == [], (label, view)
+        assert view.get("execution_blocked"), (label, view)
+        assert view.get("plan_unavailable") is not True, (label, view)
+        html = render_car_charging_preview(report, _native_diag("ok"), now=now)
+        assert "execution blocked" in html.lower(), (label, html)
+
+
 def test_html_plan_keeps_healthy_applied_explanation_out_of_the_default_page():
     """The default /plan page keeps the preview root but omits healthy boilerplate."""
     page = _build_page(_applied_report(now=_wall_now()))
@@ -744,6 +841,8 @@ def run_car_planning_applied_view_tests(base):
         test_invalid_applied_clears_rows_and_no_native_fallback,
         test_original_table_columns_styles_totals_preserved_for_valid_applied,
         test_html_api_plan_data_emits_car_planning_execution_for_fresh_applied,
+        test_html_api_plan_data_shows_domestic_readiness_without_preview_as_observed,
+        test_domestic_missing_preview_still_fails_closed_on_stale_or_invalid_evidence,
         test_html_plan_keeps_healthy_applied_explanation_out_of_the_default_page,
         test_html_plan_emits_execution_blocked_banner_for_invalid_applied,
         test_js_renderer_forces_editable_false_for_car_planning_execution,
