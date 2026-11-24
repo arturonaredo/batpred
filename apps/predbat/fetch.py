@@ -396,13 +396,28 @@ class Fetch:
             # one raises - the antiphase the legacy model got from a 1:1 alternation, generalised
             # to an uneven duty cycle.
             phase = n_up if flip else 0
-            for window_start in range(0, self.forecast_minutes, CLOUD_WINDOW_MINUTES):
-                offsets = [minute for minute in range(window_start, min(window_start + CLOUD_WINDOW_MINUTES, self.forecast_minutes), step)]
+            # Forecast offset zero is not necessarily a tariff boundary. Group each complete
+            # prediction bucket by its absolute minute axis so a partial first window ends at the
+            # next half-hour boundary instead of borrowing from the following rate slot. Floor
+            # division also keeps negative historical axes correctly aligned; do not wrap by day,
+            # since the axis can continue across midnight or a DST-length day.
+            windows = {}
+            for minute in range(0, self.forecast_minutes, step):
+                minute_absolute = minute + minutes_now
+                window_index = minute_absolute // CLOUD_WINDOW_MINUTES
+                window_end = (window_index + 1) * CLOUD_WINDOW_MINUTES
+                # A bucket straddling a rate boundary cannot be split without inventing minute-level
+                # forecast precision, so leave it unchanged rather than move energy between slots.
+                if minute_absolute + step > window_end:
+                    continue
+                windows.setdefault(window_index, []).append(minute)
+
+            for offsets in windows.values():
                 ups = [minute for minute in offsets if (((minute + minutes_now) // step) + phase) % period < n_up]
                 downs = [minute for minute in offsets if minute not in ups]
                 if not ups or not downs:
                     continue
-                window_total = sum(values[minute] for minute in offsets)
+                original_values = {minute: values[minute] for minute in offsets}
                 headroom = {minute: max(sum(cloud_ceiling.get(minute + minutes_now + offset, 0.0) for offset in range(step)) - values[minute], 0.0) for minute in ups}
                 want = sum(headroom.values())
                 # Each down step can give back at most what it holds, so the window can never be
@@ -416,18 +431,37 @@ class Fetch:
                 for minute in downs:
                     floor = load_baseline.get(minute + minutes_now, 0.0) if load_baseline else 0.0
                     values[minute] = dp4(values[minute] - borrow * max(values[minute] - floor, 0.0) / room)
-                # dp4 on each step leaves up to half a milliwatt-hour per step unaccounted for.
-                # Push that residual onto the roomiest down step, which recovers the window total on
-                # any window holding meaningful energy - the scenarios are compared against each
-                # other, so a systematic drift in one of them is a bias in the plan, not a rounding
-                # detail. It is not guaranteed: the correction is floored at zero, so a window whose
-                # roomiest down step holds less than the residual keeps the remainder. In practice
-                # that is confined to near-empty dawn and dusk windows and measures around 0.001 kWh
-                # over a 48 hour horizon.
-                drift = sum(values[minute] for minute in offsets) - window_total
-                if drift:
-                    roomiest = max(downs, key=lambda minute: values[minute])
-                    values[roomiest] = dp4(max(values[roomiest] - drift, 0.0))
+                # dp4 rounds each bucket to 0.1 Wh. Correct the signed residual in those same
+                # quanta against the modulation excursion, not by pushing a saturated down-step
+                # below zero (or above its baseline). This makes each absolute rate window exactly
+                # conservative while retaining the original positivity, baseline and ceiling rails.
+                drift_units = sum(round(values[minute] * 10000) - round(original_values[minute] * 10000) for minute in offsets)
+                if drift_units > 0:
+                    candidates = sorted(
+                        (minute for minute in offsets if values[minute] > original_values[minute]),
+                        key=lambda minute: values[minute] - original_values[minute],
+                        reverse=True,
+                    )
+                    for minute in candidates:
+                        available_units = round((values[minute] - original_values[minute]) * 10000)
+                        correction_units = min(drift_units, available_units)
+                        values[minute] = dp4(values[minute] - correction_units / 10000.0)
+                        drift_units -= correction_units
+                        if not drift_units:
+                            break
+                elif drift_units < 0:
+                    candidates = sorted(
+                        (minute for minute in offsets if values[minute] < original_values[minute]),
+                        key=lambda minute: original_values[minute] - values[minute],
+                        reverse=True,
+                    )
+                    for minute in candidates:
+                        available_units = round((original_values[minute] - values[minute]) * 10000)
+                        correction_units = min(-drift_units, available_units)
+                        values[minute] = dp4(values[minute] + correction_units / 10000.0)
+                        drift_units += correction_units
+                        if not drift_units:
+                            break
 
         # Simple divergence model that raises and lowers alternate steps so the planner stops
         # assuming PV exactly blankets load. It is approximately - not exactly - total-preserving:

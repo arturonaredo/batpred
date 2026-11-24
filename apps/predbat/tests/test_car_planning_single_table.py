@@ -159,6 +159,16 @@ def _native_diagnostic(state, peak_w=None, limit_w=None, minutes_over=None):
 # ----------------------------------------------------------------------
 
 
+def test_pv_colour_matches_displayed_energy():
+    """Equal displayed solar amounts must not straddle hidden-precision colour thresholds."""
+    for value, displayed, colour in ((0.1985, 0.20, "#FFAAAA"), (0.201, 0.20, "#FFAAAA"), (0.0985, 0.10, "#FFFF00"), (0.094, 0.09, "#FFFFFF")):
+        report = _good_report()
+        report["preview"]["nominal"][0]["pv_kwh"] = value
+        view = build_car_charging_plan_view(_native_plan(), report)
+        assert view["rows"][0]["pv_forecast"] == displayed
+        assert view["rows"][0]["pv_color"] == colour
+
+
 def test_build_car_planning_plan_view_marks_car_planning_simulation():
     """Output is always flagged plan_simulation=true so the renderer treats it read-only."""
     view = build_car_charging_plan_view(_native_plan(), _good_report())
@@ -1079,6 +1089,7 @@ def test_original_table_colours_and_totals():
 def run_car_planning_single_table_tests(base):
     """Run all single-table integration regressions against the live web stack."""
     tests = [
+        test_pv_colour_matches_displayed_energy,
         test_build_car_planning_plan_view_marks_car_planning_simulation,
         test_native_soc_rounding_at_full_battery,
         test_original_table_colours_and_totals,
